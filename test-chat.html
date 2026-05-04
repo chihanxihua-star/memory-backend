@@ -1,0 +1,3185 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="聊天">
+<meta name="theme-color" content="#0a0a0f">
+<link rel="manifest" href="/manifest.json">
+<title>聊天</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
+<style>
+  /* ===== CSS VARIABLES ===== */
+  :root, [data-theme="light"] {
+    /* Backgrounds */
+    --bg-primary: #FBFAF6;
+    --bg-sidebar: #FAFAF8;
+
+    /* Message action icons (reverse colors) */
+    --msg-icon-color: #888;
+    --bg-sidebar-hover: #F5F0EA;
+    --bg-sidebar-active: #E6D2D5;
+    --bg-bubble-user: #F2DCE0;
+    --bg-bubble-bot: #FFFFFF;
+    --bg-input: #FFFFFF;
+    --bg-search: #EFEBE4;
+    --bg-thinking-toggle: #EFEBE4;
+    --bg-thinking-content: #F5F0EA;
+    --bg-panel: #FFFFFF;
+    --bg-card: #F8F5F0;
+    --bg-button: #E6D2D5;
+    --bg-button-hover: #D5C1C4;
+
+    /* Text */
+    --text-primary: #333;
+    --text-secondary: #666;
+    --text-tertiary: #999;
+    --text-placeholder: #BBB;
+    --text-bubble-user: #333;
+    --text-bubble-bot: #333;
+    --text-thinking: #888;
+    --text-button: #333;
+
+    /* Borders */
+    --border-primary: #E0D8CE;
+    --border-input: #DDD6CC;
+    --border-input-focus: #C9A8AD;
+    --border-bubble: #E8E2DA;
+    --border-card: #E8E2DA;
+    --border-thinking: #DDD6CC;
+    --border-search: #DDD6CC;
+
+    /* Translucent bar (top + bottom) */
+    --bg-bar-translucent: rgba(251, 250, 246, 0.38);
+  }
+
+  [data-theme="dark"] {
+    /* Backgrounds */
+    --bg-primary: #2A2A2C;
+    --bg-sidebar: #232325;
+
+    /* Message action icons (reverse colors) */
+    --msg-icon-color: #CCC;
+    --bg-sidebar-hover: #2E2E30;
+    --bg-sidebar-active: #3A3035;
+    --bg-bubble-user: #F8F5F0;
+    --bg-bubble-bot: #3A3A3C;
+    --bg-input: #333335;
+    --bg-search: #333335;
+    --bg-thinking-toggle: #333335;
+    --bg-thinking-content: #2E2E30;
+    --bg-panel: #2E2E30;
+    --bg-card: #3A3A3C;
+    --bg-button: #3A3035;
+    --bg-button-hover: #4A3F45;
+
+    /* Text */
+    --text-primary: #CCC;
+    --text-secondary: #999;
+    --text-tertiary: #777;
+    --text-placeholder: #666;
+    --text-bubble-user: #333;
+    --text-bubble-bot: #E8E4E0;
+    --text-thinking: #888;
+    --text-button: #E0D0D5;
+
+    /* Borders */
+    --border-primary: #3A3A3C;
+    --border-input: #444;
+    --border-input-focus: #8A6A70;
+    --border-bubble: #4A4A4C;
+    --border-card: #4A4A4C;
+    --border-thinking: #555;
+    --border-search: #444;
+
+    /* Translucent bar (top + bottom) */
+    --bg-bar-translucent: rgba(42, 42, 44, 0.38);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  button, input, textarea, select { font-family: inherit; }
+  html, body {
+    background: var(--bg-primary);
+    height: 100dvh;
+    min-height: 100dvh;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  body {
+    color: var(--text-primary);
+    font-family: 'Noto Serif SC', serif;
+    display: flex;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  /* ===== SIDEBAR ===== */
+  #sidebar {
+    width: 260px; background: var(--bg-sidebar); border-right: 1px solid var(--border-primary);
+    display: flex; flex-direction: column; flex-shrink: 0;
+    transition: transform 0.28s cubic-bezier(.4,0,.2,1);
+    z-index: 100;
+  }
+  #sidebar.collapsed { transform: translateX(-260px); position: absolute; height: 100%; }
+  #sidebar-scroll {
+    flex: 1; overflow-y: auto; overflow-x: hidden;
+    padding: 8px 12px 24px;
+  }
+  .sidebar-title { font-size: 15px; font-weight: 500; color: var(--text-primary); }
+  .sidebar-newchat {
+    width: 100%; padding: 10px 12px; margin-bottom: 12px;
+    background: var(--bg-sidebar); border: 1px solid var(--border-primary);
+    color: var(--text-secondary); border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-family: inherit;
+  }
+  .sidebar-newchat:hover { background: var(--bg-sidebar-hover); color: var(--text-primary); }
+  .ps-sub-title {
+    font-size: 13px; color: var(--text-primary); font-weight: 500;
+    padding: 8px 0 12px; display: flex; align-items: center; gap: 8px;
+  }
+  .ps-back {
+    background: none; border: none; color: var(--text-secondary);
+    cursor: pointer; font-size: 12px; padding: 2px 6px; border-radius: 4px;
+    font-family: inherit;
+  }
+  .ps-back:hover { color: var(--text-primary); background: var(--bg-sidebar-hover); }
+  #sidebar-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 99; animation: fadeIn 0.2s ease;
+  }
+  #sidebar-overlay.show { display: block; }
+  #sidebar-header { padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; }
+  #sidebar-close { background: none; border: none; color: var(--text-secondary); font-size: 18px; cursor: pointer; padding: 4px 8px; border-radius: 4px; display: none; }
+  #sidebar-close:hover { color: var(--text-primary); background: var(--bg-sidebar-hover); }
+
+  /* Nav sections */
+  .nav-section {
+    padding: 10px 16px; display: flex; align-items: center; justify-content: space-between;
+    cursor: pointer; border-bottom: 1px solid var(--border-primary);
+  }
+  .nav-section:hover { background: var(--bg-sidebar-hover); }
+  .nav-section-title { font-size: 14px; font-weight: 400; color: var(--text-primary); }
+  .nav-section-subtitle { font-size: 12px; color: var(--text-tertiary); margin-left: 8px; }
+  .nav-section-btn {
+    background: none; border: none; cursor: pointer; padding: 4px;
+    color: var(--text-tertiary); display: flex; align-items: center; justify-content: center;
+  }
+  .nav-section-btn:hover { color: var(--text-primary); }
+  .nav-section-btn svg { width: 18px; height: 18px; }
+  .nav-section-btn svg line, .nav-section-btn svg path {
+    stroke: var(--text-tertiary); stroke-width: 2; stroke-linecap: round;
+  }
+  .nav-section-btn:hover svg line, .nav-section-btn:hover svg path {
+    stroke: var(--text-primary);
+  }
+
+  /* Project Select Dropdown */
+  #project-select-wrapper { position: relative; }
+  #project-select-dropdown {
+    display: none; position: absolute; top: 0; left: 0; right: 0;
+    background: var(--bg-panel); border: 1px solid var(--border-card);
+    border-radius: 8px; margin: 0 8px; z-index: 1000; max-height: 300px; overflow-y: auto;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+  #project-select-dropdown.show { display: block; }
+  .project-option {
+    padding: 10px 12px; cursor: pointer; display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid var(--border-primary);
+  }
+  .project-option:last-child { border-bottom: none; }
+  .project-option:hover { background: var(--bg-sidebar-hover); }
+  .project-option.active { background: var(--bg-sidebar-active); }
+  .project-option-name { font-size: 13px; color: var(--text-primary); flex: 1; }
+  .project-option-edit {
+    background: none; border: none; cursor: pointer; padding: 4px;
+    color: var(--text-tertiary); display: flex; align-items: center; opacity: 0;
+  }
+  .project-option:hover .project-option-edit { opacity: 1; }
+  .project-option-edit:hover { color: var(--text-primary); }
+  .project-option-edit svg { width: 14px; height: 14px; }
+  .project-option-edit svg path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+  #conv-search-box { padding: 4px 12px 8px; }
+  #conv-search {
+    width: 100%; background: var(--bg-search); border: 1px solid var(--border-search); border-radius: 6px;
+    padding: 7px 10px 7px 30px; color: var(--text-primary); font-size: 12px; outline: none; font-family: inherit;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='none' stroke='%23999' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='6' cy='6' r='4.5'/%3E%3Cline x1='9.5' y1='9.5' x2='13' y2='13'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: 9px center;
+  }
+  #conv-search:focus { border-color: var(--border-input-focus); }
+  #conv-search::placeholder { color: var(--text-placeholder); }
+  #conv-list { flex: 1; overflow-y: auto; padding: 0 8px; }
+  #sidebar-settings-btn {
+    margin: 8px 12px 24px 12px; padding: 9px 12px; background: var(--bg-sidebar); border: 1px solid var(--border-primary);
+    color: var(--text-secondary); border-radius: 6px; cursor: pointer; font-size: 13px; display: flex;
+    align-items: center; gap: 8px; justify-content: center;
+  }
+  #sidebar-settings-btn:hover { background: var(--bg-sidebar-hover); color: var(--text-primary); border-color: var(--border-input-focus); }
+  #sidebar-settings-btn svg { width: 16px; height: 16px; }
+  #sidebar-settings-btn svg path { fill: var(--bg-primary); stroke: var(--bg-bubble-user); stroke-width: 2; }
+
+  /* Conv items */
+  .conv-item {
+    padding: 9px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    color: var(--text-secondary); margin-bottom: 2px; display: flex; align-items: center; gap: 6px;
+  }
+  .conv-item:hover { background: var(--bg-sidebar-hover); }
+  .conv-item.active { background: var(--bg-sidebar-active); color: var(--text-primary); }
+  .conv-item .pin-icon { font-size: 10px; color: var(--border-input-focus); flex-shrink: 0; display: flex; align-items: center; }
+  .conv-item .pin-icon svg { width: 12px; height: 12px; }
+  .conv-item .pin-icon svg path { fill: var(--border-input-focus); stroke: var(--border-input-focus); stroke-width: 1; }
+  .conv-item .conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .conv-item .conv-actions { display: none; gap: 2px; flex-shrink: 0; }
+  .conv-item:hover .conv-actions { display: flex; }
+  .conv-item .conv-actions button {
+    background: none; border: none; color: var(--text-tertiary); cursor: pointer;
+    font-size: 12px; padding: 2px 5px; border-radius: 3px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .conv-item .conv-actions button:hover { color: var(--text-primary); background: var(--bg-sidebar-hover); }
+  .conv-item .conv-actions button svg { width: 14px; height: 14px; }
+  .conv-item .conv-actions button svg path, .conv-item .conv-actions button svg polyline {
+    fill: none;
+    stroke: var(--text-tertiary);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .conv-item .conv-actions button:hover svg path, .conv-item .conv-actions button:hover svg polyline {
+    stroke: var(--text-primary);
+  }
+  .conv-item .conv-actions .del-btn:hover { color: #ef4444; }
+  .conv-item .conv-actions .del-btn:hover svg path { stroke: #ef4444; }
+
+  .search-section-title { font-size: 10px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 1px; margin: 12px 12px 6px; }
+  .msg-search-item {
+    padding: 8px 10px; border-radius: 6px; cursor: pointer; font-size: 12px;
+    color: var(--text-secondary); margin: 0 8px 4px; border: 1px solid var(--border-primary);
+  }
+  .msg-search-item:hover { background: var(--bg-sidebar-hover); border-color: var(--border-input-focus); }
+  .msg-search-item .msg-search-title { color: var(--border-input-focus); font-size: 11px; margin-bottom: 3px; }
+  .msg-search-item .msg-search-content { color: var(--text-tertiary); line-height: 1.3; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+  /* ===== MAIN ===== */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #top-bar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+    padding: env(safe-area-inset-top) calc(10px + env(safe-area-inset-right)) 4px calc(10px + env(safe-area-inset-left));
+    font-size: 12px; color: var(--text-secondary);
+    background: var(--bg-primary);
+    display: flex;
+    justify-content: space-between; align-items: center;
+  }
+  #top-bar .left, #top-bar .center, #top-bar .right {
+    flex: 1 1 0; min-width: 0; display: flex; align-items: center;
+  }
+  #top-bar .left { gap: 8px; justify-content: flex-start; }
+  #top-bar .center { justify-content: center; }
+  #top-bar .right { gap: 10px; justify-content: flex-end; }
+  #claude-name {
+    font-family: 'Noto Serif SC', serif;
+    font-size: 18px;
+    font-weight: 500;
+    color: #2A2A2C;
+    letter-spacing: 2px;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    user-select: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  [data-theme="dark"] #claude-name { color: #F5F0EA; }
+  #claude-name:hover { background: var(--bg-sidebar-hover); }
+  .msg-nick { display: none; }
+  #hamburger {
+    background: none; border: none; color: var(--text-secondary); cursor: pointer;
+    font-size: 18px; padding: 4px 8px; border-radius: 4px; display: none;
+  }
+  #hamburger:hover { color: var(--text-primary); background: var(--bg-sidebar-hover); }
+  #attach-btn.connected { color: var(--bg-bubble-user); }
+  #attach-btn.connected:hover { color: var(--bg-bubble-user); opacity: 0.78; }
+  #attach-btn.error { color: var(--text-placeholder); }
+  /* Model Select Dropdown */
+  #model-select-wrapper { position: relative; }
+  #model-select-btn {
+    background: none; border: none; cursor: pointer; padding: 4px 8px;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 2px;
+    border-radius: 6px;
+  }
+  #model-select-btn:hover { background: var(--bg-sidebar-hover); }
+  #model-select-btn .model-name { font-size: 13px; font-weight: 500; color: var(--text-primary); }
+  #model-select-btn .model-status { font-size: 10px; color: var(--text-tertiary); }
+  #model-select-dropdown {
+    display: none; position: absolute; top: 100%; right: 0; margin-top: 4px;
+    background: var(--bg-panel); border: 1px solid var(--border-card);
+    border-radius: 8px; padding: 4px; min-width: 160px; z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+  #model-select-dropdown.show { display: block; }
+  .model-option {
+    padding: 8px 12px; border-radius: 6px; cursor: pointer;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .model-option:hover { background: var(--bg-sidebar-hover); }
+  .model-option.active { background: var(--bg-sidebar-active); }
+  .model-option .opt-name { font-size: 12px; font-weight: 500; color: var(--text-primary); }
+  .model-option .opt-desc { font-size: 9px; color: var(--text-tertiary); }
+  #token-counter { font-size: 11px; color: var(--text-tertiary); }
+  #settings-btn {
+    background: none; border: none; color: var(--text-secondary); cursor: pointer;
+    font-size: 15px; padding: 4px 6px; border-radius: 4px;
+  }
+  #settings-btn:hover { color: var(--text-primary); background: var(--bg-sidebar-hover); }
+  #settings-btn svg { width: 18px; height: 18px; }
+  #settings-btn svg path { fill: var(--bg-primary); stroke: var(--bg-bubble-user); stroke-width: 2; }
+
+  /* ===== MESSAGES ===== */
+  #messages { flex: 1; overflow-y: auto; padding: calc(46px + env(safe-area-inset-top)) 10px 120px 10px; }
+  .date-sep { text-align: center; color: var(--text-tertiary); font-size: 11px; margin: 16px 0 8px; }
+
+  .msg-wrap { display: flex; gap: 10px; margin-bottom: 8px; max-width: 90%; align-items: flex-start; animation: msgIn 0.25s ease-out; }
+  .msg-wrap.user { margin-left: auto; flex-direction: row-reverse; }
+  .msg-wrap.assistant { margin-right: auto; }
+
+  .avatar {
+    width: 36px; height: 36px; border-radius: 6px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 17px; margin-top: 1px; overflow: hidden;
+  }
+  .avatar.user-avatar { background: var(--bg-bubble-user); }
+  .avatar.bot-avatar { background: var(--bg-bubble-bot); border: 1px solid var(--border-bubble); }
+  .avatar img { width: 100%; height: 100%; object-fit: cover; }
+
+  .msg-body { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; }
+  .msg-wrap.user .msg-body { align-items: flex-end; }
+  .msg-nick { font-size: 11px; color: var(--text-tertiary); margin-bottom: 3px; }
+  .msg-wrap.user .msg-nick { text-align: right; }
+
+  .msg-bubble { line-height: 1.6; font-size: 13px; }
+  .msg-bubble.user { background: rgba(242, 220, 224, 0.78); color: var(--text-bubble-user); padding: 10px 14px; border-radius: 12px 12px 4px 12px; }
+  .msg-bubble.assistant { background: rgba(255, 255, 255, 0.68); color: var(--text-bubble-bot); padding: 10px 14px; border-radius: 12px 12px 12px 4px; border: 1px solid var(--border-bubble); }
+  [data-theme="dark"] .msg-bubble.user { background: rgba(248, 245, 240, 0.82); }
+  [data-theme="dark"] .msg-bubble.assistant { background: rgba(58, 58, 60, 0.72); }
+  .msg-images { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; margin-bottom: 8px; }
+  .msg-images img { width: 100%; border-radius: 8px; cursor: pointer; object-fit: cover; aspect-ratio: 1; }
+  .msg-images img:hover { opacity: 0.9; }
+  .msg-bubble.assistant .md-content { line-height: 1.7; }
+  .msg-bubble.assistant .md-content p { margin-bottom: 8px; }
+  .msg-bubble.assistant .md-content p:last-child { margin-bottom: 0; }
+  .msg-bubble.assistant .md-content code { background: var(--bg-thinking-toggle); padding: 2px 5px; border-radius: 3px; font-size: 13px; }
+  .msg-bubble.assistant .md-content pre { background: var(--bg-thinking-content); padding: 10px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
+  .msg-bubble.assistant .md-content pre code { background: none; padding: 0; }
+  .msg-bubble .time { display: none; } /* Hide time inside bubble */
+
+  /* Message action buttons */
+  .msg-actions { display: none; gap: 6px; margin-top: 6px; align-items: center; }
+  .msg-wrap.user .msg-actions { justify-content: flex-end; }
+  .msg-actions .action-time { font-size: 11px; color: var(--msg-icon-color); margin-right: 4px; }
+  @media (hover: hover) {
+    .msg-bubble:hover + .msg-actions,
+    .msg-actions:hover { display: flex; }
+  }
+  .msg-wrap.show-actions .msg-actions { display: flex; }
+  .msg-bubble { cursor: pointer; }
+  .msg-action-btn {
+    background: none; border: none; color: var(--msg-icon-color); cursor: pointer;
+    font-size: 11px; padding: 3px 6px; border-radius: 4px;
+    display: flex; align-items: center; gap: 3px;
+  }
+  .msg-action-btn:hover { background: var(--bg-sidebar-hover); }
+  .msg-action-btn svg { width: 16px; height: 16px; }
+  .msg-action-btn svg path, .msg-action-btn svg polyline, .msg-action-btn svg rect {
+    fill: none;
+    stroke: var(--msg-icon-color);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .msg-edit-area { width: 100%; background: var(--bg-input); border: 1px solid var(--border-input-focus); border-radius: 6px; padding: 8px 10px; color: var(--text-primary); font-size: 13px; outline: none; font-family: inherit; resize: vertical; min-height: 60px; margin-top: 6px; }
+  .msg-edit-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .msg-edit-save, .msg-edit-cancel { padding: 6px 14px; border: none; border-radius: 5px; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .msg-edit-save { background: var(--bg-button); color: var(--text-button); }
+  .msg-edit-save:hover { background: var(--bg-button-hover); }
+  .msg-edit-cancel { background: var(--bg-sidebar-hover); color: var(--text-secondary); }
+  .msg-edit-cancel:hover { background: var(--bg-sidebar-active); color: var(--text-primary); }
+
+  /* Continuation bubbles (multi-bubble reply) */
+  .msg-wrap.continuation { margin-left: 46px; margin-bottom: 6px; max-width: calc(90% - 46px); }
+  .msg-wrap.continuation .avatar { display: none; }
+  .msg-wrap.continuation .msg-nick { display: none; }
+  .msg-wrap.continuation .msg-bubble.assistant { border-radius: 4px 12px 12px 4px; }
+
+  .thinking-block { margin-bottom: 8px; max-width: 100%; animation: fadeIn 0.2s ease; }
+  .thinking-toggle { font-size: 11px; color: var(--text-tertiary); cursor: pointer; padding: 2px 4px 2px 0; background: transparent; border: none; display: inline-flex; align-items: center; gap: 4px; user-select: none; }
+  .thinking-toggle::before { content: '›'; display: inline-block; font-size: 13px; line-height: 1; transition: transform 0.2s ease; }
+  .thinking-block.open .thinking-toggle::before { transform: rotate(90deg); }
+
+  /* Typing indicator */
+  .msg-bubble.typing-bubble { padding: 0; }
+  .typing-indicator {
+    display: flex;
+    gap: 4px;
+    padding: 12px 16px;
+    align-items: center;
+  }
+  .typing-indicator span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #999;
+    animation: bounce 1.4s infinite;
+  }
+  .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+  .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); }
+    30% { transform: translateY(-6px); }
+  }
+  .thinking-toggle:hover { color: var(--text-secondary); }
+  .thinking-content { display: none; background: transparent; border-left: 2px solid var(--border-thinking); padding: 8px 12px; font-size: 12px; color: var(--text-thinking); white-space: pre-wrap; line-height: 1.4; margin-top: 4px; max-height: 200px; overflow-y: auto; }
+  .thinking-content p { margin: 0 0 1.4px 0; }
+  .thinking-block.open .thinking-content { display: block; }
+
+  /* Tool call block — same skeleton as thinking-block, different accent */
+  .tool-block { margin-bottom: 8px; max-width: 100%; animation: fadeIn 0.2s ease; }
+  .tool-toggle { font-size: 11px; color: var(--text-tertiary); cursor: pointer; padding: 2px 4px 2px 0; background: transparent; border: none; display: inline-flex; align-items: center; gap: 4px; user-select: none; font-family: inherit; }
+  .tool-toggle::before { content: '›'; display: inline-block; font-size: 13px; line-height: 1; transition: transform 0.2s ease; }
+  .tool-block.open .tool-toggle::before { transform: rotate(90deg); }
+  .tool-toggle:hover { color: var(--text-secondary); }
+  .tool-toggle .tool-name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+  .tool-toggle .tool-status { color: var(--text-tertiary); }
+  .tool-toggle .tool-status.ok { color: #4a9d6c; }
+  .tool-toggle .tool-status.err { color: #c0392b; }
+  .tool-content { display: none; border-left: 2px solid #7aa9c8; padding: 8px 12px; margin-top: 4px; font-size: 12px; color: var(--text-thinking); }
+  .tool-block.open .tool-content { display: block; }
+  .tool-section + .tool-section { margin-top: 8px; }
+  .tool-section-label { font-size: 10px; color: var(--text-tertiary); letter-spacing: 0.04em; margin-bottom: 3px; text-transform: uppercase; }
+  .tool-section pre { margin: 0; padding: 6px 8px; background: var(--bg-thinking-content); border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; }
+  .tool-section .tool-truncated-note { font-size: 10.5px; color: var(--text-tertiary); margin-top: 3px; font-style: italic; }
+
+  /* ===== INPUT ===== */
+  #input-container {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--bg-primary);
+    z-index: 10;
+    transition: bottom 0.2s ease;
+  }
+  #image-preview-area { padding: 8px 12px; display: none; gap: 6px; flex-wrap: wrap; background: var(--bg-sidebar); border-bottom: 1px solid var(--border-primary); }
+  #image-preview-area.show { display: flex; }
+  .image-preview-item { position: relative; width: 70px; height: 70px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border-primary); }
+  .image-preview-item img { width: 100%; height: 100%; object-fit: cover; }
+  .image-preview-remove { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; background: rgba(0,0,0,0.7); border: none; border-radius: 50%; color: #fff; font-size: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; line-height: 1; }
+  .image-preview-remove:hover { background: #ef4444; }
+
+  #input-area {
+    padding: 12px calc(38px + env(safe-area-inset-right)) calc(30px + env(safe-area-inset-bottom)) calc(14px + env(safe-area-inset-left));
+    display: flex; gap: 8px; align-items: center;
+    width: 100%; max-width: 100vw; overflow: hidden;
+    box-sizing: border-box;
+  }
+  .input-inline-btn { background: none; border: none; color: var(--text-placeholder); cursor: pointer; padding: 0; border-radius: 4px; flex-shrink: 0; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; }
+  .input-inline-btn:hover { color: var(--text-secondary); }
+  .input-inline-btn svg { width: 26px; height: 26px; }
+  .input-inline-btn svg line, .input-inline-btn svg path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  #input-wrapper { flex: 1 1 0; min-width: 0; background: var(--bg-input); border: 1px solid var(--border-input); border-radius: 22px; padding: 4px 5px 4px 16px; min-height: 44px; max-height: 140px; box-sizing: border-box; display: flex; align-items: center; gap: 6px; }
+  #input { flex: 1; min-width: 0; width: 100%; background: transparent; border: none; color: var(--text-primary); font-size: 14px; outline: none; resize: none; font-family: inherit; line-height: 1.5; max-height: 120px; overflow-y: auto; padding: 6px 0; }
+  #input::placeholder { color: var(--text-placeholder); }
+  .input-send-btn { background: var(--bg-bubble-user); color: #fff; border: none; border-radius: 50%; padding: 0; font-size: 14px; cursor: pointer; flex-shrink: 0; height: 34px; width: 34px; display: flex; align-items: center; justify-content: center; }
+  .input-send-btn:hover { opacity: 0.88; }
+  .input-send-btn svg { width: 18px; height: 18px; fill: currentColor; }
+  .input-send-btn.stop-btn { background: var(--bg-bubble-user); color: #fff; font-size: 14px; }
+  .input-send-btn.voice-mode { background: transparent; color: var(--text-tertiary); }
+  .input-send-btn.voice-mode:hover { background: var(--bg-sidebar-hover); color: var(--text-secondary); }
+  .input-send-btn.voice-mode:hover { background: var(--bg-sidebar-hover); color: var(--text-primary); }
+  .input-send-btn.voice-mode svg { width: 20px; height: 20px; }
+  .input-send-btn.voice-mode svg path, .input-send-btn.voice-mode svg line {
+    fill: none;
+    stroke: var(--text-secondary);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .input-send-btn.voice-mode:hover svg path, .input-send-btn.voice-mode:hover svg line {
+    stroke: var(--text-primary);
+  }
+
+
+  .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-tertiary); font-size: 14px; }
+
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  @keyframes msgIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ===== SETTINGS MODAL ===== */
+  #settings-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 200; animation: fadeIn 0.2s ease;
+  }
+  #settings-overlay.show { display: flex; align-items: flex-end; justify-content: center; }
+  #settings-panel {
+    background: var(--bg-panel); border-radius: 14px 14px 0 0; padding: 20px 24px 34px;
+    width: 100%; max-width: 430px; max-height: 80vh; overflow-y: auto;
+    animation: slideUp 0.25s ease; border: 1px solid var(--border-card); border-bottom: none;
+  }
+  #settings-panel h3 {
+    font-size: 15px; font-weight: 500; color: var(--text-primary); margin-bottom: 18px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  #settings-panel h3 button { background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 18px; padding: 4px 8px; }
+  #settings-panel h3 button:hover { color: var(--text-secondary); }
+  .s-section { margin-bottom: 18px; }
+  .s-section-title { font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .s-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .s-row input[type="text"] {
+    flex: 1; background: var(--bg-input); border: 1px solid var(--border-input); border-radius: 6px;
+    padding: 7px 10px; color: var(--text-primary); font-size: 13px; outline: none; font-family: inherit;
+  }
+  .s-row input[type="text"]:focus { border-color: var(--border-input-focus); }
+  .s-avatar-preview {
+    width: 44px; height: 44px; border-radius: 6px; display: flex;
+    align-items: center; justify-content: center; font-size: 22px;
+    overflow: hidden; cursor: pointer; position: relative; flex-shrink: 0;
+  }
+  .s-avatar-preview.user-bg { background: var(--bg-bubble-user); }
+  .s-avatar-preview.bot-bg { background: var(--bg-bubble-bot); border: 1px solid var(--border-bubble); }
+  .s-avatar-preview img { width: 100%; height: 100%; object-fit: cover; }
+  .s-avatar-preview:hover::after {
+    content: '✎'; position: absolute; inset: 0;
+    background: rgba(0,0,0,0.5); display: flex; align-items: center;
+    justify-content: center; font-size: 14px; color: #fff;
+  }
+  .s-emoji-grid {
+    display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px;
+    margin-top: 6px; padding: 6px; background: var(--bg-card); border-radius: 6px; border: 1px solid var(--border-card);
+  }
+  .s-emoji-grid span { text-align: center; font-size: 18px; padding: 4px; cursor: pointer; border-radius: 4px; }
+  .s-emoji-grid span:hover { background: var(--bg-sidebar-hover); }
+  .s-emoji-grid span.active { background: var(--bg-sidebar-active); outline: 1px solid var(--border-input-focus); }
+  .s-upload-row { display: flex; gap: 8px; margin-top: 6px; align-items: center; }
+  .s-upload-btn { background: var(--bg-sidebar-hover); border: 1px solid var(--border-input); color: var(--text-secondary); border-radius: 6px; padding: 5px 12px; font-size: 11px; cursor: pointer; font-family: inherit; }
+  .s-upload-btn:hover { background: var(--bg-sidebar-active); color: var(--text-primary); }
+  .s-clear-btn { background: none; border: none; color: var(--text-tertiary); font-size: 11px; cursor: pointer; }
+  .s-clear-btn:hover { color: #ef4444; }
+  .s-save-btn { width: 100%; padding: 11px; background: var(--bg-button); color: var(--text-button); border: none; border-radius: 8px; font-size: 13px; cursor: pointer; font-family: inherit; margin-top: 6px; }
+  .s-save-btn:hover { background: var(--bg-button-hover); }
+  .s-hint { font-size: 10px; color: var(--text-tertiary); margin-top: 4px; }
+
+  /* ===== RENAME MODAL ===== */
+  #rename-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 200; align-items: center; justify-content: center;
+  }
+  #rename-overlay.show { display: flex; }
+  #rename-panel {
+    background: var(--bg-panel); border-radius: 12px; padding: 20px 24px;
+    width: 90%; max-width: 340px; border: 1px solid var(--border-card);
+  }
+  #rename-panel h3 { font-size: 14px; color: var(--text-primary); margin-bottom: 12px; }
+  #rename-input {
+    width: 100%; background: var(--bg-input); border: 1px solid var(--border-input); border-radius: 6px;
+    padding: 8px 10px; color: var(--text-primary); font-size: 13px; outline: none; font-family: inherit;
+  }
+
+  /* ===== PROJECT SELECT MODAL ===== */
+  #project-select-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 200; align-items: center; justify-content: center;
+  }
+  #project-select-overlay.show { display: flex; }
+  #project-select-panel {
+    background: var(--bg-panel); border-radius: 12px; padding: 20px 24px;
+    width: 90%; max-width: 380px; border: 1px solid var(--border-card);
+    max-height: 70vh; overflow-y: auto;
+  }
+  #project-select-panel h3 { font-size: 14px; color: var(--text-primary); margin-bottom: 16px; }
+  .project-select-item {
+    background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 8px; cursor: pointer;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .project-select-item:hover { background: var(--bg-sidebar-hover); border-color: var(--border-input-focus); }
+  .project-select-avatar {
+    width: 36px; height: 36px; background: var(--bg-bubble-user); border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; flex-shrink: 0;
+  }
+  .project-select-info { flex: 1; min-width: 0; }
+  .project-select-name { font-size: 13px; color: var(--text-primary); font-weight: 500; }
+  .project-select-desc { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+  .project-select-cancel {
+    width: 100%; padding: 10px; background: var(--bg-sidebar-hover); color: var(--text-secondary);
+    border: none; border-radius: 8px; font-size: 13px; cursor: pointer;
+    font-family: inherit; margin-top: 8px;
+  }
+  .project-select-cancel:hover { background: var(--bg-sidebar-active); color: var(--text-primary); }
+
+  /* ===== IMAGE VIEWER ===== */
+  #image-viewer {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.9);
+    z-index: 300; align-items: center; justify-content: center;
+  }
+  #image-viewer.show { display: flex; }
+  #image-viewer img { max-width: 90%; max-height: 90%; border-radius: 8px; }
+  #image-viewer-close {
+    position: absolute; top: 20px; right: 20px; background: rgba(0,0,0,0.5);
+    border: none; color: #fff; font-size: 28px; width: 44px; height: 44px;
+    border-radius: 50%; cursor: pointer; display: flex; align-items: center;
+    justify-content: center; line-height: 1;
+  }
+  #image-viewer-close:hover { background: rgba(0,0,0,0.7); }
+  #rename-input:focus { border-color: var(--border-input-focus); }
+  .rename-btns { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; }
+  .rename-btns button {
+    padding: 7px 16px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: inherit; border: none;
+  }
+  .rename-cancel { background: var(--bg-sidebar-hover); color: var(--text-secondary); }
+  .rename-cancel:hover { background: var(--bg-sidebar-active); color: var(--text-primary); }
+  .rename-ok { background: var(--bg-button); color: var(--text-button); }
+  .rename-ok:hover { background: var(--bg-button-hover); }
+
+  /* ===== PROJECT SETTINGS ===== */
+  #project-settings-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 300; align-items: flex-end; justify-content: center;
+  }
+  #project-settings-overlay.show { display: flex; }
+  #project-settings-panel {
+    background: var(--bg-panel); border-radius: 14px 14px 0 0; padding: 20px 24px 34px;
+    width: 100%; max-width: 430px; max-height: 85vh; overflow-y: auto;
+    animation: slideUp 0.25s ease; border: 1px solid var(--border-card); border-bottom: none;
+  }
+  #project-settings-panel h3 {
+    font-size: 16px; font-weight: 500; color: var(--text-primary); margin-bottom: 20px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  #project-settings-panel h3 button { background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 18px; padding: 4px 8px; }
+  #project-settings-panel h3 button:hover { color: var(--text-secondary); }
+
+  .ps-screen { display: none; }
+  .ps-screen.active { display: block; }
+
+  .ps-header { display: none; } /* 隐藏项目头部 */
+
+  .ps-section-title { font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 10px; }
+
+  .ps-list { display: flex; flex-direction: column; gap: 0; }
+  .ps-item {
+    background: var(--bg-panel); border-bottom: 1px solid var(--border-card);
+    padding: 11px 12px; cursor: pointer; display: flex; align-items: center; justify-content: space-between;
+  }
+  .ps-item:hover { background: var(--bg-sidebar-hover); }
+  .ps-item:first-child { border-top: 1px solid var(--border-card); }
+  .ps-item-title { font-size: 13px; color: var(--text-primary); font-weight: 400; }
+  .ps-item-arrow { font-size: 15px; color: var(--text-tertiary); }
+
+  .ps-form-group { margin-bottom: 16px; }
+  .ps-form-group label { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+  .ps-form-group input, .ps-form-group textarea, .ps-form-group select {
+    width: 100%; background: var(--bg-input); border: 1px solid var(--border-input); border-radius: 6px;
+    padding: 8px 10px; color: var(--text-primary); font-size: 13px; outline: none; font-family: inherit;
+  }
+  .ps-form-group textarea { min-height: 100px; resize: vertical; line-height: 1.5; }
+  .ps-form-group input:focus, .ps-form-group textarea:focus, .ps-form-group select:focus { border-color: var(--border-input-focus); }
+
+  .ps-btn { width: 100%; padding: 10px; background: var(--bg-button); color: var(--text-button); border: none; border-radius: 8px; font-size: 13px; cursor: pointer; font-family: inherit; margin-top: 10px; }
+  .ps-btn:hover { background: var(--bg-button-hover); }
+  .ps-btn-secondary { background: var(--bg-sidebar-hover); color: var(--text-secondary); }
+  .ps-btn-secondary:hover { background: var(--bg-sidebar-active); color: var(--text-primary); }
+
+  .ps-memory-list { max-height: 300px; overflow-y: auto; }
+  .ps-memory-item {
+    background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 6px; padding: 10px 12px;
+    margin-bottom: 8px; font-size: 12px; color: var(--text-primary);
+  }
+  .ps-memory-item:hover { border-color: var(--border-input-focus); }
+  .ps-memory-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .ps-memory-layer { color: var(--border-input-focus); font-size: 10px; text-transform: uppercase; }
+  .ps-memory-author { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-tertiary); }
+  .ps-author-badge {
+    width: 8px; height: 8px; border-radius: 2px; display: inline-block;
+  }
+  .ps-author-badge.source-app { background: #A8D5BA; }
+  .ps-author-badge.source-web { background: #FFB6C1; }
+  .ps-memory-actions button {
+    background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 11px; padding: 2px 6px;
+  }
+  .ps-memory-actions button:hover { color: var(--text-primary); }
+  .ps-memory-content { color: var(--text-secondary); line-height: 1.4; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+  .ps-tabs { display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; }
+  .ps-tab {
+    background: var(--bg-card); border: 1px solid var(--border-card); color: var(--text-secondary); padding: 6px 12px;
+    font-size: 11px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  .ps-tab:hover { background: var(--bg-sidebar-hover); }
+  .ps-tab.active { background: var(--bg-sidebar-active); color: var(--text-primary); border-color: var(--border-input-focus); }
+
+  .ps-stats-cards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+  .ps-stat-card {
+    background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 8px; padding: 14px;
+    text-align: center;
+  }
+  .ps-stat-label { font-size: 11px; color: var(--text-tertiary); margin-bottom: 6px; }
+  .ps-stat-value { font-size: 20px; color: var(--border-input-focus); font-weight: 500; }
+  .ps-stat-unit { font-size: 12px; color: var(--text-secondary); margin-left: 4px; }
+
+  .ps-chart { margin-top: 20px; }
+  .ps-chart-title { font-size: 12px; color: var(--text-secondary); margin-bottom: 10px; }
+  .ps-chart-bars { display: flex; align-items: flex-end; gap: 6px; height: 120px; }
+  .ps-chart-bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; }
+  .ps-chart-bar {
+    width: 100%; background: var(--bg-sidebar-active); border-radius: 4px 4px 0 0;
+    transition: background 0.2s; position: relative;
+  }
+  .ps-chart-bar:hover { background: var(--border-input-focus); }
+  .ps-chart-label { font-size: 10px; color: var(--text-tertiary); margin-top: 4px; }
+
+  /* ===== Toast ===== */
+  #toast-container {
+    position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%);
+    z-index: 2000; display: flex; flex-direction: column; gap: 8px;
+    pointer-events: none; max-width: 90%;
+  }
+  .toast {
+    background: var(--bg-panel); color: var(--text-primary);
+    border: 1px solid var(--border-card); border-radius: 8px;
+    padding: 10px 14px; font-size: 13px; line-height: 1.5;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+    display: flex; align-items: center; gap: 10px;
+    pointer-events: auto;
+    animation: toastIn 0.2s ease;
+  }
+  .toast-msg { flex: 1; }
+  .toast-action {
+    background: var(--bg-button); color: var(--text-button);
+    border: 1px solid var(--border-primary); border-radius: 6px;
+    padding: 5px 10px; font-size: 12px; cursor: pointer; font-family: inherit;
+    white-space: nowrap;
+  }
+  .toast-action:hover { background: var(--bg-button-hover); }
+  .toast-close {
+    background: none; border: none; color: var(--text-tertiary);
+    cursor: pointer; font-size: 16px; padding: 0 2px; line-height: 1;
+  }
+  .toast-close:hover { color: var(--text-primary); }
+  @keyframes toastIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ===== MOBILE ===== */
+  @media (max-width: 640px) {
+    #sidebar { position: fixed; left: 0; top: 0; bottom: 0; height: 100%; transform: translateX(-260px); }
+    #sidebar.open { transform: translateX(0); }
+    #sidebar-close { display: block; }
+    #hamburger { display: block; }
+  }
+</style>
+</head>
+<body>
+
+<div id="sidebar-overlay" onclick="closeSidebar()"></div>
+
+<div id="sidebar" class="collapsed">
+  <div id="sidebar-header">
+    <div class="sidebar-title">设置</div>
+    <button id="sidebar-close" onclick="closeSidebar()">✕</button>
+  </div>
+
+  <div id="sidebar-scroll">
+    <!-- Screen 1: Main Panel -->
+    <div id="ps-screen-main" class="ps-screen active">
+      <div class="ps-section-title">通用</div>
+      <div class="ps-list">
+        <div class="ps-item" onclick="openWindowSettings()">
+          <div class="ps-item-title">窗口设置</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+        <div class="ps-item" onclick="openThemeSettings()">
+          <div class="ps-item-title">颜色模式</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+        <div class="ps-item" onclick="openVoiceSettings()">
+          <div class="ps-item-title">语音服务</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+      </div>
+
+      <div class="ps-section-title">管理</div>
+      <div class="ps-list">
+        <div class="ps-item" onclick="openWorldBook()">
+          <div class="ps-item-title">世界书</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+        <div class="ps-item" onclick="openMemoryManager()">
+          <div class="ps-item-title">记忆管理</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+        <div class="ps-item" onclick="openAssistantConfig()">
+          <div class="ps-item-title">CLAUDE.md</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+        <div class="ps-item" onclick="openParamsSettings()">
+          <div class="ps-item-title">参数设置</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+      </div>
+
+      <div class="ps-section-title">统计</div>
+      <div class="ps-list">
+        <div class="ps-item" onclick="openUsageStats()">
+          <div class="ps-item-title">用量统计</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Screen: World Book -->
+    <div id="ps-screen-worldbook" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>世界书</div>
+      <div class="ps-form-group">
+        <label>项目人设（system_prompt）</label>
+        <textarea id="ps-worldbook-content" placeholder="输入项目人设..."></textarea>
+      </div>
+      <button class="ps-btn" onclick="saveWorldBook()">保存</button>
+    </div>
+
+    <!-- Screen: Memory Manager -->
+    <div id="ps-screen-memory" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>记忆管理</div>
+      <div class="ps-tabs" id="ps-memory-tabs">
+        <div class="ps-tab active" onclick="switchMemoryTab('锚')">锚</div>
+        <div class="ps-tab" onclick="switchMemoryTab('枕边')">枕边</div>
+        <div class="ps-tab" onclick="switchMemoryTab('呢喃')">呢喃</div>
+        <div class="ps-tab" onclick="switchMemoryTab('暗礁')">暗礁</div>
+        <div class="ps-tab" onclick="switchMemoryTab('灵感')">灵感</div>
+        <div class="ps-tab" onclick="switchMemoryTab('朝夕录')">朝夕录</div>
+        <div class="ps-tab" onclick="switchMemoryTab('潮')">潮</div>
+      </div>
+      <div class="ps-memory-list" id="ps-memory-list"></div>
+    </div>
+
+    <!-- Screen: Assistant Config (CLAUDE.md) -->
+    <div id="ps-screen-assistant" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>CLAUDE.md</div>
+      <div class="ps-form-group">
+        <label>CLAUDE.md 内容</label>
+        <textarea id="ps-assistant-content" placeholder="编辑 CLAUDE.md..." style="min-height: 300px;"></textarea>
+      </div>
+      <button class="ps-btn" onclick="saveAssistantConfig()">保存</button>
+    </div>
+
+    <!-- Screen: Params Settings -->
+    <div id="ps-screen-params" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>参数设置</div>
+
+      <div class="ps-section-title">短消息模式</div>
+      <div class="ps-form-group">
+        <label>缓冲时间（秒）</label>
+        <input type="number" id="ps-buffer-time" value="10" min="0" />
+      </div>
+      <div class="ps-form-group">
+        <label>短消息条数</label>
+        <input type="number" id="ps-short-msg-count" value="5" min="1" />
+      </div>
+
+      <div class="ps-section-title">对话自动压缩</div>
+      <div class="ps-form-group">
+        <label>压缩阈值（字数）</label>
+        <input type="number" id="ps-compress-threshold" value="50000" min="10000" step="5000" />
+        <small style="font-size: 10px; color: var(--text-tertiary);">对话超过此字数时提示重启并生成摘要</small>
+      </div>
+      <div class="ps-form-group">
+        <label>摘要长度（字）</label>
+        <input type="number" id="ps-summary-length" value="500" min="200" max="2000" step="100" />
+        <small style="font-size: 10px; color: var(--text-tertiary);">自动生成的摘要目标字数</small>
+      </div>
+
+      <div class="ps-section-title">模型预设</div>
+      <div class="ps-form-group">
+        <label>默认模型</label>
+        <select id="ps-default-model">
+          <option value="">默认（跟随 CC 配置）</option>
+          <option value="opus">Opus 4.7</option>
+          <option value="claude-opus-4-6">Opus 4.6</option>
+          <option value="sonnet">Sonnet 4.6</option>
+          <option value="haiku">Haiku 4.5</option>
+          <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
+        </select>
+      </div>
+
+      <button class="ps-btn" onclick="saveParamsSettings()">保存设置</button>
+    </div>
+
+    <!-- Screen: Usage Stats -->
+    <div id="ps-screen-stats" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>用量统计</div>
+      <div class="ps-stats-cards">
+        <div class="ps-stat-card">
+          <div class="ps-stat-label">今日</div>
+          <div class="ps-stat-value" id="ps-stat-today">-<span class="ps-stat-unit">tokens</span></div>
+        </div>
+        <div class="ps-stat-card">
+          <div class="ps-stat-label">本周</div>
+          <div class="ps-stat-value" id="ps-stat-week">-<span class="ps-stat-unit">tokens</span></div>
+        </div>
+        <div class="ps-stat-card">
+          <div class="ps-stat-label">本月</div>
+          <div class="ps-stat-value" id="ps-stat-month">-<span class="ps-stat-unit">tokens</span></div>
+        </div>
+      </div>
+      <div class="ps-chart">
+        <div class="ps-chart-title">最近 7 天</div>
+        <div class="ps-chart-bars" id="ps-chart-bars"></div>
+      </div>
+    </div>
+
+    <!-- Screen: Window Settings -->
+    <div id="ps-screen-window" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>窗口设置</div>
+      <div class="ps-list">
+        <div class="ps-item" onclick="newChat()">
+          <div class="ps-item-title">新对话（清屏）</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+        <div class="ps-item" onclick="restartCC()">
+          <div class="ps-item-title">重启 CC 进程</div>
+          <div class="ps-item-arrow">›</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Screen: Theme -->
+    <div id="ps-screen-theme" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>颜色模式</div>
+      <div class="ps-form-group">
+        <label>主题</label>
+        <select id="ps-theme-select" onchange="onThemeChange()">
+          <option value="light">浅色</option>
+          <option value="dark">深色</option>
+          <option value="system">跟随系统</option>
+        </select>
+      </div>
+      <div class="ps-form-group">
+        <label style="margin-bottom: 10px;">预览</label>
+        <div style="display: flex; gap: 10px;">
+          <div style="flex: 1; padding: 12px; background: var(--bg-bubble-user); color: var(--text-bubble-user); border-radius: 8px; font-size: 12px;">你好！</div>
+          <div style="flex: 1; padding: 12px; background: var(--bg-bubble-bot); color: var(--text-bubble-bot); border: 1px solid var(--border-bubble); border-radius: 8px; font-size: 12px;">Claude 回复</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Screen: Voice -->
+    <div id="ps-screen-voice" class="ps-screen">
+      <div class="ps-sub-title"><button class="ps-back" onclick="showPSScreen('main')">← 返回</button>语音服务</div>
+      <div class="ps-form-group">
+        <p style="color: var(--text-tertiary); font-size: 12px; line-height: 1.6;">语音输入和语音合成功能正在开发中，敬请期待。</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="main">
+  <div id="top-bar">
+    <div class="left">
+      <button id="hamburger" onclick="openSidebar()" aria-label="菜单">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="3" y1="5" x2="21" y2="5"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="19" x2="12" y2="19"/>
+        </svg>
+      </button>
+    </div>
+    <div class="center">
+      <span id="claude-name" onclick="openSettings()" title="点击编辑">Claude</span>
+    </div>
+    <div class="right">
+      <div id="model-select-wrapper">
+        <button id="model-select-btn" onclick="toggleModelDropdown()">
+          <span class="model-name">默认</span>
+          <span class="model-status" id="char-counter">0</span>
+        </button>
+        <div id="model-select-dropdown">
+          <div class="model-option active" data-value="" onclick="selectModel('', '默认', '跟随 CC')">
+            <span class="opt-name">默认</span>
+            <span class="opt-desc">跟随 CC 配置</span>
+          </div>
+          <div class="model-option" data-value="opus" onclick="selectModel('opus', 'Opus 4.7', 'Extended · 思考不可见')">
+            <span class="opt-name">Opus 4.7</span>
+            <span class="opt-desc">Extended · 思考不可见</span>
+          </div>
+          <div class="model-option" data-value="claude-opus-4-6" onclick="selectModel('claude-opus-4-6', 'Opus 4.6', 'Extended')">
+            <span class="opt-name">Opus 4.6</span>
+            <span class="opt-desc">Extended</span>
+          </div>
+          <div class="model-option" data-value="sonnet" onclick="selectModel('sonnet', 'Sonnet 4.6', 'Fast & Smart')">
+            <span class="opt-name">Sonnet 4.6</span>
+            <span class="opt-desc">Fast & Smart · 可见思考</span>
+          </div>
+          <div class="model-option" data-value="haiku" onclick="selectModel('haiku', 'Haiku 4.5', 'Ultra Fast')">
+            <span class="opt-name">Haiku 4.5</span>
+            <span class="opt-desc">Ultra Fast</span>
+          </div>
+          <div class="model-option" data-value="claude-sonnet-4-5-20250929" onclick="selectModel('claude-sonnet-4-5-20250929', 'Sonnet 4.5', 'Classic')">
+            <span class="opt-name">Sonnet 4.5</span>
+            <span class="opt-desc">Classic</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="messages"><div class="empty-state">开始一段新对话</div></div>
+  <div id="input-container">
+    <div id="image-preview-area"></div>
+    <div id="input-area">
+      <button class="input-inline-btn" id="attach-btn" title="附件">
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+      </button>
+      <div id="input-wrapper">
+        <textarea id="input" rows="1" placeholder="说点什么..."></textarea>
+        <button class="input-send-btn" id="send-btn" onclick="send()"></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<input type="file" id="image-input" accept="image/*" multiple style="display:none" />
+
+<!-- Image Viewer -->
+<div id="image-viewer" onclick="closeImageViewer()">
+  <img id="image-viewer-img" src="" />
+  <button id="image-viewer-close">✕</button>
+</div>
+
+<!-- Settings Modal -->
+<div id="settings-overlay" onclick="if(event.target===this)closeSettings()">
+  <div id="settings-panel">
+    <h3>头像与昵称 <button onclick="closeSettings()">✕</button></h3>
+    <div class="s-hint" id="s-scope-hint" style="margin-bottom:14px;color:#666;"></div>
+    <div class="s-section">
+      <div class="s-section-title">你</div>
+      <div class="s-row">
+        <div class="s-avatar-preview user-bg" id="s-user-avatar-preview" onclick="toggleEmojiPicker('user')"></div>
+        <input type="text" id="s-user-nick" placeholder="昵称" />
+      </div>
+      <div id="s-user-emoji-picker" style="display:none;"></div>
+      <div class="s-upload-row">
+        <button class="s-upload-btn" onclick="document.getElementById('s-user-file').click()">上传图片</button>
+        <button class="s-clear-btn" id="s-user-clear" onclick="clearAvatar('user')" style="display:none;">清除图片</button>
+        <input type="file" id="s-user-file" accept="image/*" style="display:none;" onchange="handleAvatarUpload('user',this)" />
+      </div>
+    </div>
+    <div class="s-section">
+      <div class="s-section-title">AI</div>
+      <div class="s-row">
+        <div class="s-avatar-preview bot-bg" id="s-bot-avatar-preview" onclick="toggleEmojiPicker('bot')"></div>
+        <input type="text" id="s-bot-nick" placeholder="昵称" />
+      </div>
+      <div id="s-bot-emoji-picker" style="display:none;"></div>
+      <div class="s-upload-row">
+        <button class="s-upload-btn" onclick="document.getElementById('s-bot-file').click()">上传图片</button>
+        <button class="s-clear-btn" id="s-bot-clear" onclick="clearAvatar('bot')" style="display:none;">清除图片</button>
+        <input type="file" id="s-bot-file" accept="image/*" style="display:none;" onchange="handleAvatarUpload('bot',this)" />
+      </div>
+    </div>
+    <div class="s-hint">配置按项目保存，切换项目自动加载对应设置</div>
+    <button class="s-save-btn" onclick="saveSettings()">保存</button>
+  </div>
+</div>
+
+<!-- Rename Modal -->
+<div id="rename-overlay" onclick="if(event.target===this)closeRename()">
+  <div id="rename-panel">
+    <h3>重命名对话</h3>
+    <input type="text" id="rename-input" placeholder="对话名称" />
+    <div class="rename-btns">
+      <button class="rename-cancel" onclick="closeRename()">取消</button>
+      <button class="rename-ok" onclick="confirmRename()">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- Project Select Dialog -->
+<div id="project-select-overlay" onclick="if(event.target===this)closeProjectSelect()">
+  <div id="project-select-panel">
+    <h3>选择项目</h3>
+    <div id="project-select-list"></div>
+    <button class="project-select-cancel" onclick="closeProjectSelect()">取消</button>
+  </div>
+</div>
+
+<!-- Settings moved into #sidebar above -->
+
+
+<script>
+// ===== Theme System =====
+function initTheme() {
+  var theme = localStorage.getItem('chat-theme') || 'light';
+  if (theme === 'system') {
+    theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', theme);
+}
+
+function setTheme(theme) {
+  localStorage.setItem('chat-theme', theme);
+  var actualTheme = theme;
+  if (theme === 'system') {
+    actualTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', actualTheme);
+}
+
+function getTheme() {
+  return localStorage.getItem('chat-theme') || 'light';
+}
+
+// Initialize theme on page load
+initTheme();
+
+// Listen for system theme changes
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
+  if (getTheme() === 'system') {
+    document.documentElement.setAttribute('data-theme', e.matches ? 'dark' : 'light');
+  }
+});
+
+var API = 'http://' + location.hostname + ':3001/api';
+var WS_URL = 'ws://' + location.hostname + ':3001';
+var messagesEl = document.getElementById('messages'), inputEl = document.getElementById('input');
+var wsStatus = document.getElementById('attach-btn'), sendBtn = document.getElementById('send-btn');
+var stopBtn = document.getElementById('stop-btn');
+var currentModel = ''; // 当前选中的模型值（CC 继承自 /root/chat-sandbox 默认模型，这里仅 UI 用）
+var tokenCounter = document.getElementById('char-counter');
+var sidebar = document.getElementById('sidebar'), sidebarOverlay = document.getElementById('sidebar-overlay');
+var hamburger = document.getElementById('hamburger');
+// 单对话模式：一个固定的 conversation_id 存 localStorage
+var CONV_KEY = 'memhome-conv-id';
+
+var ws, currentConvId = null, currentProjectId = null, currentAssistantEl = null, isGenerating = false;
+var currentThinkingEl = null;
+var currentAssistantWrap = null; // 当前turn的 assistant wrap（含 avatar + 思考链 + 气泡）
+var generatingConvId = null; // track which conv is generating
+var totalOutputTokens = 0, lastMessageDate = null;
+var allConversations = [];
+var renameTargetId = null;
+var streamFullText = '', streamBubbleCount = 1, streamIsMultiBubble = false;
+
+// ===== Profile System =====
+var EMOJI_OPTIONS = ['🦊','🐙','🐱','🐰','🐻','🐼','🦝','🐨','🐯','🦁','🐸','🐧','🦉','🐝','🌸','🌙','⭐','🔥','💎','🎭','🎵','👻','🤖','🧸'];
+var DEFAULT_PROFILE = { userNick: '宝', userEmoji: '🦊', userImg: null, botNick: 'Claude', botEmoji: '🐙', botImg: null };
+
+function profileKey() { return 'chat-profile-' + (currentProjectId || 'default'); }
+function loadProfile() {
+  try { var r = localStorage.getItem(profileKey()); if (r) return Object.assign({}, DEFAULT_PROFILE, JSON.parse(r)); } catch(e) {}
+  return Object.assign({}, DEFAULT_PROFILE);
+}
+function saveProfile(p) { localStorage.setItem(profileKey(), JSON.stringify(p)); }
+function getProfile() { return loadProfile(); }
+
+// ===== Pin System (localStorage) =====
+function getPinned() {
+  try { return JSON.parse(localStorage.getItem('chat-pinned') || '[]'); } catch(e) { return []; }
+}
+function setPinned(arr) { localStorage.setItem('chat-pinned', JSON.stringify(arr)); }
+function togglePin(id) {
+  var pins = getPinned();
+  var idx = pins.indexOf(id);
+  if (idx === -1) pins.unshift(id); else pins.splice(idx, 1);
+  setPinned(pins);
+  renderConversations(allConversations);
+}
+
+// ===== Settings Panel =====
+var settingsTemp = {};
+function openSettings() {
+  var p = loadProfile(); settingsTemp = Object.assign({}, p);
+  document.getElementById('s-user-nick').value = p.userNick;
+  document.getElementById('s-bot-nick').value = p.botNick;
+  renderAvatarPreview('user'); renderAvatarPreview('bot');
+  document.getElementById('s-user-emoji-picker').style.display = 'none';
+  document.getElementById('s-bot-emoji-picker').style.display = 'none';
+  document.getElementById('s-user-clear').style.display = p.userImg ? 'inline' : 'none';
+  document.getElementById('s-bot-clear').style.display = p.botImg ? 'inline' : 'none';
+  var projName = '全部对话';
+  if (currentProjectId) {
+    var project = allProjects.find(function(p) { return p.id === currentProjectId; });
+    if (project) projName = project.name;
+  }
+  document.getElementById('s-scope-hint').textContent = '当前项目: ' + projName;
+  document.getElementById('settings-overlay').classList.add('show');
+}
+function closeSettings() { document.getElementById('settings-overlay').classList.remove('show'); }
+function renderAvatarPreview(who) {
+  var el = document.getElementById('s-' + who + '-avatar-preview');
+  var img = who === 'user' ? settingsTemp.userImg : settingsTemp.botImg;
+  var emoji = who === 'user' ? settingsTemp.userEmoji : settingsTemp.botEmoji;
+  if (img) { el.innerHTML = '<img src="' + img + '" />'; } else { el.innerHTML = ''; el.textContent = emoji; }
+}
+function toggleEmojiPicker(who) {
+  var el = document.getElementById('s-' + who + '-emoji-picker');
+  if (el.style.display === 'none') {
+    var cur = who === 'user' ? settingsTemp.userEmoji : settingsTemp.botEmoji;
+    var html = '<div class="s-emoji-grid">';
+    for (var i = 0; i < EMOJI_OPTIONS.length; i++) {
+      var e = EMOJI_OPTIONS[i];
+      html += '<span class="' + (e === cur ? 'active' : '') + '" onclick="pickEmoji(\'' + who + '\',\'' + e + '\')">' + e + '</span>';
+    }
+    el.innerHTML = html + '</div>'; el.style.display = 'block';
+  } else { el.style.display = 'none'; }
+}
+function pickEmoji(who, emoji) {
+  if (who === 'user') { settingsTemp.userEmoji = emoji; settingsTemp.userImg = null; }
+  else { settingsTemp.botEmoji = emoji; settingsTemp.botImg = null; }
+  renderAvatarPreview(who);
+  document.getElementById('s-' + who + '-emoji-picker').style.display = 'none';
+  document.getElementById('s-' + who + '-clear').style.display = 'none';
+}
+function handleAvatarUpload(who, input) {
+  var file = input.files && input.files[0]; if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var img = new Image();
+    img.onload = function() {
+      var canvas = document.createElement('canvas'); canvas.width = 80; canvas.height = 80;
+      var ctx = canvas.getContext('2d');
+      var s = Math.min(img.width, img.height);
+      ctx.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, 80, 80);
+      var dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      if (who === 'user') settingsTemp.userImg = dataUrl; else settingsTemp.botImg = dataUrl;
+      renderAvatarPreview(who);
+      document.getElementById('s-' + who + '-clear').style.display = 'inline';
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file); input.value = '';
+}
+function clearAvatar(who) {
+  if (who === 'user') settingsTemp.userImg = null; else settingsTemp.botImg = null;
+  renderAvatarPreview(who); document.getElementById('s-' + who + '-clear').style.display = 'none';
+}
+function saveSettings() {
+  settingsTemp.userNick = document.getElementById('s-user-nick').value.trim() || DEFAULT_PROFILE.userNick;
+  settingsTemp.botNick = document.getElementById('s-bot-nick').value.trim() || DEFAULT_PROFILE.botNick;
+  saveProfile(settingsTemp); updateClaudeName(); closeSettings();
+}
+
+// ===== Rename =====
+function openRename(id, currentTitle) {
+  renameTargetId = id;
+  document.getElementById('rename-input').value = currentTitle || '';
+  document.getElementById('rename-overlay').classList.add('show');
+  setTimeout(function() { document.getElementById('rename-input').focus(); }, 100);
+}
+function closeRename() { document.getElementById('rename-overlay').classList.remove('show'); renameTargetId = null; }
+async function confirmRename() {
+  var title = document.getElementById('rename-input').value.trim();
+  if (!title || !renameTargetId) return;
+  await fetch(API + '/conversations/' + renameTargetId, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: title })
+  });
+  closeRename(); loadConversations();
+}
+document.getElementById('rename-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); confirmRename(); }
+});
+
+// ===== Sidebar =====
+var isMobile = function() { return window.innerWidth <= 640; };
+function initSidebar() {
+  if (isMobile()) { sidebar.classList.remove('collapsed'); sidebar.classList.remove('open'); }
+  else { sidebar.classList.remove('collapsed'); sidebar.classList.add('open'); hamburger.style.display = 'none'; }
+}
+function openSidebar() {
+  if (isMobile()) { sidebar.classList.add('open'); sidebarOverlay.classList.add('show'); }
+  else { sidebar.classList.remove('collapsed'); }
+}
+function closeSidebar() {
+  if (isMobile()) { sidebar.classList.remove('open'); sidebarOverlay.classList.remove('show'); }
+  else { sidebar.classList.add('collapsed'); }
+}
+window.addEventListener('resize', function() {
+  if (!isMobile()) { sidebar.classList.remove('collapsed'); sidebarOverlay.classList.remove('show'); hamburger.style.display = 'none'; }
+  else { hamburger.style.display = 'block'; }
+});
+
+// ===== WebSocket =====
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = function() { wsStatus.classList.remove('error'); wsStatus.classList.add('connected'); };
+  ws.onclose = function() { wsStatus.classList.remove('connected'); wsStatus.classList.add('error'); setTimeout(connect, 3000); };
+  ws.onerror = function() { wsStatus.classList.remove('connected'); wsStatus.classList.add('error'); };
+  ws.onmessage = function(e) {
+    var msg = JSON.parse(e.data);
+
+    if (msg.type === 'start') {
+      isGenerating = true; generatingConvId = currentConvId;
+      updateModeButton();
+      updateSendButton();
+      streamFullText = '';
+      streamBubbleCount = 0;
+      streamIsMultiBubble = false; // 标记是否为多气泡模式
+      currentAssistantEl = null;
+      currentThinkingEl = null; // 重置thinking元素
+      currentToolBlocks = {}; // 重置工具调用映射
+      if (!currentAssistantWrap && !typingTimer) scheduleTypingIndicator();
+    }
+
+    if (msg.type === 'tool_use') {
+      var wasNearTU = isNearBottom();
+      cancelTypingSchedule();
+      if (!currentAssistantWrap) ensureAssistantWrap();
+      removeTypingBubble();
+      var tb = attachToolUseToWrap(currentAssistantWrap, msg.id, msg.name, msg.input);
+      if (tb) currentToolBlocks[msg.id] = tb;
+      if (wasNearTU) scrollToBottom();
+    }
+
+    if (msg.type === 'tool_result') {
+      applyToolResult(msg.tool_use_id, msg.content, msg.is_error);
+    }
+
+    if (msg.type === 'delta') {
+      streamFullText += msg.text;
+      // 流式阶段不再渲染到可见气泡（避免 ---bubble--- 拆分时的闪烁）
+      // 只在 done 时根据最终文本统一渲染
+    }
+
+    if (msg.type === 'clear') {
+      // 清空流式显示的气泡，准备接收多气泡回复
+      if (currentAssistantEl && currentAssistantEl.parentNode) {
+        currentAssistantEl.parentNode.removeChild(currentAssistantEl);
+      }
+      currentAssistantEl = null;
+      streamBubbleCount = 0;
+      streamFullText = '';
+    }
+
+    if (msg.type === 'bubble') {
+      streamFullText = msg.text || '';
+      if (streamBubbleCount === 0) {
+        currentAssistantEl = addMessage(streamFullText, 'assistant', true);
+      } else {
+        currentAssistantEl = addContinuation(streamFullText, true);
+      }
+      streamBubbleCount++;
+      scrollToBottom();
+    }
+
+    if (msg.type === 'thinking') {
+      var wasNear = isNearBottom();
+      addThinking(msg.text);
+      if (wasNear) scrollToBottom();
+    }
+
+    if (msg.type === 'clean') {
+      // 后端发来清理后的文本（去除记忆标记）；done 之前更新 buffer 即可
+      streamFullText = msg.text || '';
+    }
+
+    if (msg.type === 'done') {
+      if (!isGenerating) return;
+      isGenerating = false; generatingConvId = null;
+      updateModeButton();
+      updateSendButton();
+
+      var outTokens = (msg.usage && (msg.usage.output_tokens || msg.usage.output)) || 0;
+
+      function attachTokenFooter(bubbleEl) {
+        var t = document.createElement('div'); t.className = 'time';
+        var timeText = document.createElement('span');
+        timeText.textContent = formatTime(new Date());
+        if (outTokens) {
+          timeText.textContent += ' · ' + outTokens + ' tokens';
+          totalOutputTokens += outTokens;
+        }
+        t.appendChild(timeText);
+        bubbleEl.querySelector('.msg-bubble').appendChild(t);
+      }
+
+      cancelTypingSchedule();
+      removeTypingBubble();
+      var wrapForFirst = currentAssistantWrap;
+      currentAssistantWrap = null;
+
+      var hasMulti = streamFullText.indexOf('---bubble---') !== -1;
+      if (hasMulti) {
+        var bubbles = streamFullText.split('---bubble---').map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+        bubbles.forEach(function(text, i) {
+          setTimeout(function() {
+            var bubbleEl;
+            if (i === 0 && wrapForFirst) bubbleEl = fillAssistantWrapWithBubble(wrapForFirst, text);
+            else if (i === 0) bubbleEl = addMessage(text, 'assistant', true);
+            else bubbleEl = addContinuation(text, true);
+            if (i === bubbles.length - 1) attachTokenFooter(bubbleEl);
+          }, i * 1500);
+        });
+      } else if (streamFullText) {
+        var el = wrapForFirst ? fillAssistantWrapWithBubble(wrapForFirst, streamFullText) : addMessage(streamFullText, 'assistant', true);
+        attachTokenFooter(el);
+      } else if (wrapForFirst) {
+        // 无文本：若 wrap 里只有 typing（已被 remove），清掉空 wrap
+        var body = wrapForFirst.querySelector('.msg-body');
+        if (body && !body.querySelector('.msg-bubble') && !body.querySelector('.thinking-block') && !body.querySelector('.tool-block')) {
+          wrapForFirst.remove();
+        }
+      }
+      currentAssistantEl = null;
+    }
+
+    if (msg.type === 'cc_status') {
+      if (wsStatus) {
+        wsStatus.classList.remove('connected', 'error');
+        if (msg.status === 'ready') wsStatus.classList.add('connected');
+        else if (msg.status === 'down') wsStatus.classList.add('error');
+      }
+    }
+
+    if (msg.type === 'stopped') {
+      cancelTypingSchedule();
+      isGenerating = false; generatingConvId = null;
+      updateModeButton();
+      updateSendButton();
+      if (currentAssistantWrap) {
+        removeTypingBubble();
+        var b = currentAssistantWrap.querySelector('.msg-body');
+        if (b && !b.querySelector('.msg-bubble') && !b.querySelector('.thinking-block') && !b.querySelector('.tool-block')) {
+          currentAssistantWrap.remove();
+        }
+        currentAssistantWrap = null;
+      }
+      if (currentAssistantEl) {
+        var md2 = currentAssistantEl.querySelector('.md-content');
+        if (md2) { md2._raw += ' [已停止]'; md2.innerHTML = marked.parse(md2._raw); }
+      }
+      currentAssistantEl = null;
+      // 重新加载对话以获取最新的messageId
+      loadConversations();
+    }
+
+    if (msg.type === 'error') {
+      cancelTypingSchedule();
+      if (currentAssistantWrap) {
+        currentAssistantWrap.remove();
+        currentAssistantWrap = null;
+      }
+      addMessage('错误: ' + msg.message, 'assistant');
+      isGenerating = false; generatingConvId = null;
+      updateModeButton();
+      updateSendButton();
+    }
+
+    if (msg.type === 'system') {
+      // 显示系统提示
+      var empty = messagesEl.querySelector('.empty-state');
+      if (empty) empty.remove();
+      var sys = document.createElement('div');
+      sys.className = 'date-sep';
+      sys.textContent = msg.message;
+      sys.style.color = '#888';
+      messagesEl.appendChild(sys);
+      scrollToBottom();
+    }
+
+    if (msg.type === 'char_count') {
+      if (!currentConvId || msg.conversation_id === currentConvId) {
+        updateCharCounter(msg.total || 0);
+      }
+    }
+
+    if (msg.type === 'toast') {
+      var toastOpts = { duration: 15000 };
+      if (msg.action === 'restart_cc') {
+        toastOpts.action = { label: '立即重启', onClick: function() { restartCC(); } };
+      }
+      showToast(msg.message || '', toastOpts);
+    }
+  };
+}
+
+// ===== Helpers =====
+function formatTime(d) { return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); }
+var TIME_SEP_GAP_MS = 10 * 60 * 1000; // 间隔超过此值才插入时间分隔
+function formatDateTime(d) {
+  return d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + String(d.getDate()).padStart(2, '0') + ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+function maybeAddDateSep(date) {
+  var t = date.getTime();
+  if (!lastMessageDate || (t - lastMessageDate) >= TIME_SEP_GAP_MS) {
+    var el = document.createElement('div');
+    el.className = 'date-sep';
+    el.textContent = formatDateTime(date);
+    messagesEl.appendChild(el);
+  }
+  lastMessageDate = t;
+}
+
+// ===== Projects (已废弃，保留空函数避免老代码崩溃) =====
+var allProjects = [];
+
+async function loadProjects() { /* 已废弃 */ return; }
+async function _loadProjectsOld() {
+  var res = await fetch(API + '/projects');
+  allProjects = await res.json();
+
+  // 填充自定义下拉菜单
+  var dropdown = document.getElementById('project-select-dropdown');
+  dropdown.innerHTML = '';
+
+  // 添加"全部对话"选项
+  var allOption = document.createElement('div');
+  allOption.className = 'project-option' + (currentProjectId === null ? ' active' : '');
+  allOption.innerHTML = '<span class="project-option-name">全部对话</span>';
+  allOption.onclick = function() { selectProject(null, '全部对话'); };
+  dropdown.appendChild(allOption);
+
+  // 添加各个项目
+  for (var i = 0; i < allProjects.length; i++) {
+    var p = allProjects[i];
+    var opt = document.createElement('div');
+    opt.className = 'project-option' + (p.id === currentProjectId ? ' active' : '');
+    opt.innerHTML =
+      '<span class="project-option-name">' + p.name + '</span>' +
+      '<button class="project-option-edit" onclick="renameProject(\'' + p.id + '\', \'' + p.name.replace(/'/g, "\\'") + '\'); event.stopPropagation();" title="重命名">' +
+        '<svg viewBox="0 0 24 24" fill="none"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>' +
+      '</button>';
+    opt.onclick = function(pid, pname) {
+      return function() { selectProject(pid, pname); };
+    }(p.id, p.name);
+    dropdown.appendChild(opt);
+  }
+
+  updateProjectName();
+}
+
+function selectProject(projectId, projectName) {
+  if (isGenerating) { stop(); }
+  currentProjectId = projectId;
+  currentConvId = null;
+  messagesEl.innerHTML = '<div class="empty-state">开始一段新对话</div>';
+  lastMessageDate = null;
+  totalOutputTokens = 0;
+  tokenCounter.textContent = 'tokens: -';
+
+  // 更新UI
+  updateProjectName();
+  loadConversations();
+
+  // 关闭下拉菜单
+  document.getElementById('project-select-dropdown').classList.remove('show');
+  document.removeEventListener('click', closeProjectDropdown);
+}
+
+function updateProjectName() {
+  var nameEl = document.getElementById('current-project-name');
+  if (nameEl) {
+    if (currentProjectId === null) {
+      nameEl.textContent = '全部对话';
+    } else {
+      var project = allProjects.find(function(p) { return p.id === currentProjectId; });
+      nameEl.textContent = project ? project.name : '全部对话';
+    }
+  }
+
+  // 更新active状态
+  var options = document.querySelectorAll('.project-option');
+  options.forEach(function(opt) {
+    opt.classList.remove('active');
+  });
+  // 找到当前项目的选项并标记为active
+  var dropdown = document.getElementById('project-select-dropdown');
+  var children = dropdown.children;
+  if (currentProjectId === null) {
+    children[0].classList.add('active');
+  } else {
+    for (var i = 1; i < children.length; i++) {
+      var project = allProjects[i - 1];
+      if (project && project.id === currentProjectId) {
+        children[i].classList.add('active');
+        break;
+      }
+    }
+  }
+}
+
+function toggleProjectSelect() {
+  var dropdown = document.getElementById('project-select-dropdown');
+  dropdown.classList.toggle('show');
+
+  // 点击外部关闭
+  if (dropdown.classList.contains('show')) {
+    setTimeout(function() {
+      document.addEventListener('click', closeProjectDropdown);
+    }, 0);
+  }
+}
+
+function closeProjectDropdown(e) {
+  var dropdown = document.getElementById('project-select-dropdown');
+  var wrapper = document.getElementById('project-select-wrapper');
+
+  if (!wrapper.contains(e.target)) {
+    dropdown.classList.remove('show');
+    document.removeEventListener('click', closeProjectDropdown);
+  }
+}
+
+function renameProject(projectId, oldName) {
+  var newName = prompt('重命名项目', oldName);
+  if (!newName || newName === oldName) return;
+
+  fetch(API + '/projects/' + projectId, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: newName })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function() {
+    loadProjects();
+  })
+  .catch(function(err) {
+    alert('重命名失败: ' + err.message);
+  });
+}
+async function newProject() {
+  var n = prompt('项目名称:'); if (!n) return;
+  var s = prompt('项目人设 (可留空):') || '';
+  var res = await fetch(API + '/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: n, system_prompt: s }) });
+  var newProj = await res.json();
+  await loadProjects();
+  selectProject(newProj.id, newProj.name);
+}
+
+// ===== Conversations (单对话模式下为 no-op) =====
+async function loadConversations() { /* 已废弃 */ return; }
+function renderConversations() { /* 已废弃 */ return; }
+function filterConversations() { /* 已废弃 */ return; }
+function searchMessages() { /* 已废弃 */ return; }
+
+async function _renderConversationsOld(list) {
+  var convListEl = null;
+  var pins = getPinned();
+
+  // Sort: pinned first, then by original order
+  var sorted = list.slice().sort(function(a, b) {
+    var pa = pins.indexOf(a.id), pb = pins.indexOf(b.id);
+    if (pa !== -1 && pb !== -1) return pa - pb;
+    if (pa !== -1) return -1;
+    if (pb !== -1) return 1;
+    return 0;
+  });
+
+  for (var i = 0; i < sorted.length; i++) {
+    (function(c) {
+      var isPinned = pins.indexOf(c.id) !== -1;
+      var el = document.createElement('div');
+      el.className = 'conv-item' + (c.id === currentConvId ? ' active' : '');
+
+      if (isPinned) {
+        var pin = document.createElement('span');
+        pin.className = 'pin-icon';
+        pin.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>';
+        el.appendChild(pin);
+      }
+
+      var title = document.createElement('span');
+      title.className = 'conv-title';
+      title.textContent = c.title;
+      title.onclick = function() { switchConvSafe(c.id); if (isMobile()) closeSidebar(); };
+      el.appendChild(title);
+
+      var actions = document.createElement('span');
+      actions.className = 'conv-actions';
+
+      var pinBtn = document.createElement('button');
+      pinBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>';
+      pinBtn.title = isPinned ? '取消置顶' : '置顶';
+      pinBtn.onclick = function(e) { e.stopPropagation(); togglePin(c.id); };
+      if (isPinned) pinBtn.style.opacity = '1';
+      actions.appendChild(pinBtn);
+
+      var renameBtn = document.createElement('button');
+      renameBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
+      renameBtn.title = '重命名';
+      renameBtn.onclick = function(e) { e.stopPropagation(); openRename(c.id, c.title); };
+      actions.appendChild(renameBtn);
+
+      var delBtn = document.createElement('button');
+      delBtn.className = 'del-btn';
+      delBtn.textContent = '✕';
+      delBtn.title = '删除';
+      delBtn.onclick = async function(e) {
+        e.stopPropagation();
+        if (!confirm('删除这个对话？')) return;
+        await fetch(API + '/conversations/' + c.id, { method: 'DELETE' });
+        if (currentConvId === c.id) {
+          currentConvId = null;
+          messagesEl.innerHTML = '<div class="empty-state">开始一段新对话</div>';
+          lastMessageDate = null;
+        }
+        loadConversations();
+      };
+      actions.appendChild(delBtn);
+
+      el.appendChild(actions);
+      convListEl.appendChild(el);
+    })(sorted[i]);
+  }
+}
+
+var searchTimeout = null;
+
+function filterConversations() {
+  var q = convSearch.value.trim();
+  if (!q) {
+    renderConversations(allConversations);
+    return;
+  }
+
+  // 先搜对话标题
+  var filtered = allConversations.filter(function(c) {
+    return c.title && c.title.toLowerCase().indexOf(q.toLowerCase()) !== -1;
+  });
+  renderConversations(filtered);
+
+  // 防抖：1秒后搜索消息内容
+  if (searchTimeout) clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(function() {
+    searchMessages(q);
+  }, 1000);
+}
+
+async function searchMessages(q) {
+  var url = API + '/messages/search?q=' + encodeURIComponent(q);
+  if (currentProjectId) url += '&project_id=' + currentProjectId;
+
+  var res = await fetch(url);
+  var results = await res.json();
+
+  if (results.length === 0) return;
+
+  // 在对话列表后面追加消息搜索结果
+  var section = document.createElement('div');
+  section.className = 'search-section-title';
+  section.textContent = '消息内容';
+  convListEl.appendChild(section);
+
+  for (var i = 0; i < results.length; i++) {
+    (function(r) {
+      var item = document.createElement('div');
+      item.className = 'msg-search-item';
+      item.onclick = function() {
+        switchConvSafe(r.conversation_id);
+        if (isMobile()) closeSidebar();
+      };
+
+      var title = document.createElement('div');
+      title.className = 'msg-search-title';
+      title.textContent = r.conversation_title;
+
+      var content = document.createElement('div');
+      content.className = 'msg-search-content';
+      content.textContent = r.content;
+
+      item.appendChild(title);
+      item.appendChild(content);
+      convListEl.appendChild(item);
+    })(results[i]);
+  }
+}
+
+async function newChat() {
+  if (isGenerating) stop();
+  var body = { title: '新对话' };
+  if (currentProjectId) body.project_id = currentProjectId;
+  var res = await fetch(API + '/conversations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  var conv = await res.json();
+  currentConvId = conv.id; messagesEl.innerHTML = '';
+  lastMessageDate = null; totalOutputTokens = 0;
+  tokenCounter.textContent = 'tokens: -';
+  await loadConversations(); inputEl.focus();
+  if (isMobile()) closeSidebar();
+}
+
+// FIX #1: Auto-stop generation when switching conversations
+function switchConvSafe(id) {
+  if (id === currentConvId) return;
+  if (isGenerating) {
+    stop(); // send stop signal
+    // Small delay to let stop process, then switch
+    setTimeout(function() { switchConv(id); }, 200);
+  } else {
+    switchConv(id);
+  }
+}
+
+async function switchConv(id) {
+  // 单对话模式：仅重新加载当前对话
+  if (id && id === currentConvId) {
+    await loadCurrentConversation();
+  }
+}
+async function _switchConvOld(id) {
+  currentConvId = id; messagesEl.innerHTML = '';
+  lastMessageDate = null; totalOutputTokens = 0;
+  currentThinkingEl = null;
+  var res = await fetch(API + '/conversations/' + id + '/messages');
+  var ms = await res.json();
+
+  // 找到最后一条 assistant 消息的索引
+  var lastAssistantIdx = -1;
+  for (var i = ms.length - 1; i >= 0; i--) {
+    if (ms[i].role === 'assistant') {
+      lastAssistantIdx = i;
+      break;
+    }
+  }
+
+  for (var i = 0; i < ms.length; i++) {
+    var m = ms[i];
+    var d = new Date(m.created_at); maybeAddDateSep(d);
+
+    // 每条消息的thinking应该独立显示，所以先重置currentThinkingEl
+    currentThinkingEl = null;
+    if (m.thinking) addThinking(m.thinking);
+
+    // Split assistant messages by ---bubble--- for multi-bubble display
+    var lastWrap;
+    var msgImages = m.images || [];
+    if (m.role === 'assistant' && m.content && m.content.indexOf('---bubble---') !== -1) {
+      var parts = m.content.split('---bubble---').map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+      lastWrap = addMessage(parts[0], m.role, true, m.id, msgImages, m.created_at);
+      for (var k = 1; k < parts.length; k++) {
+        lastWrap = addContinuation(parts[k], true, m.created_at);
+      }
+    } else {
+      lastWrap = addMessage(m.content, m.role, true, m.id, msgImages, m.created_at);
+    }
+
+    // 只累计 output tokens（只对 assistant 消息）
+    if (m.role === 'assistant' && m.token_output) {
+      totalOutputTokens += m.token_output || 0;
+    }
+  }
+  tokenCounter.textContent = totalOutputTokens
+    ? '输出: ' + totalOutputTokens.toLocaleString() + ' tokens'
+    : 'tokens: -';
+  await loadConversations(); scrollToBottom();
+}
+
+// ===== Messages =====
+function addMessage(text, role, renderMd, messageId, images, timestamp) {
+  var empty = messagesEl.querySelector('.empty-state');
+  if (empty) empty.remove();
+  var msgDate = timestamp ? new Date(timestamp) : new Date();
+  maybeAddDateSep(msgDate);
+  var p = getProfile();
+  var wrap = document.createElement('div');
+  wrap.className = 'msg-wrap ' + role;
+  if (messageId) wrap.dataset.messageId = messageId;
+
+  var av = document.createElement('div');
+  av.className = 'avatar ' + (role === 'user' ? 'user-avatar' : 'bot-avatar');
+  var avatarImg = role === 'user' ? p.userImg : p.botImg;
+  var avatarEmoji = role === 'user' ? p.userEmoji : p.botEmoji;
+  if (avatarImg) { av.innerHTML = '<img src="' + avatarImg + '" />'; }
+  else { av.textContent = avatarEmoji; }
+
+  var body = document.createElement('div'); body.className = 'msg-body';
+  var nick = document.createElement('div'); nick.className = 'msg-nick';
+  nick.textContent = role === 'user' ? p.userNick : p.botNick;
+
+  var bubble = document.createElement('div');
+  bubble.className = 'msg-bubble ' + role;
+
+  // 添加图片（如果有）
+  if (images && images.length > 0) {
+    var imgContainer = document.createElement('div');
+    imgContainer.className = 'msg-images';
+    images.forEach(function(imgData) {
+      var img = document.createElement('img');
+      img.src = imgData;
+      img.onclick = function() { openImageViewer(imgData); };
+      imgContainer.appendChild(img);
+    });
+    bubble.appendChild(imgContainer);
+  }
+
+  if (role === 'assistant') {
+    var md = document.createElement('div'); md.className = 'md-content'; md._raw = text;
+    md.innerHTML = (renderMd || text) ? marked.parse(text) : '';
+    bubble.appendChild(md);
+  } else {
+    if (text) {
+      var s = document.createElement('span'); s.className = 'text'; s.textContent = text;
+      s.dataset.originalText = text;
+      bubble.appendChild(s);
+    }
+  }
+
+  // 添加操作按钮
+  var actions = document.createElement('div');
+  actions.className = 'msg-actions';
+
+  // 添加时间
+  var actionTime = document.createElement('span');
+  actionTime.className = 'action-time';
+  actionTime.textContent = formatTime(msgDate);
+  actions.appendChild(actionTime);
+
+  // 复制按钮
+  var copyBtn = document.createElement('button');
+  copyBtn.className = 'msg-action-btn';
+  copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  copyBtn.title = '复制';
+  copyBtn.onclick = function() { copyMessageText(text); };
+  actions.appendChild(copyBtn);
+
+  body.appendChild(nick);
+  body.appendChild(bubble);
+  body.appendChild(actions);
+  wrap.appendChild(av); wrap.appendChild(body);
+
+  // 点击气泡切换时间戳 + 复制按钮
+  bubble.addEventListener('click', function(e) {
+    if (e.target.tagName === 'IMG' || e.target.tagName === 'A') return;
+    wrap.classList.toggle('show-actions');
+  });
+
+  messagesEl.appendChild(wrap); scrollToBottom();
+  return wrap;
+}
+
+// Continuation bubble (no avatar, no nick — for multi-bubble replies)
+function addContinuation(text, renderMd, timestamp) {
+  var p = getProfile();
+  var wrap = document.createElement('div');
+  wrap.className = 'msg-wrap assistant continuation';
+
+  var body = document.createElement('div'); body.className = 'msg-body';
+  var bubble = document.createElement('div');
+  bubble.className = 'msg-bubble assistant';
+  var md = document.createElement('div'); md.className = 'md-content';
+  md._raw = text || '';
+  md.innerHTML = (renderMd && text) ? marked.parse(text) : '';
+  bubble.appendChild(md);
+
+  // 添加操作按钮
+  var actions = document.createElement('div');
+  actions.className = 'msg-actions';
+
+  // 添加时间
+  var msgDate = timestamp ? new Date(timestamp) : new Date();
+  var actionTime = document.createElement('span');
+  actionTime.className = 'action-time';
+  actionTime.textContent = formatTime(msgDate);
+  actions.appendChild(actionTime);
+
+  // 复制按钮
+  var copyBtn = document.createElement('button');
+  copyBtn.className = 'msg-action-btn';
+  copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  copyBtn.title = '复制';
+  copyBtn.onclick = function() { copyMessageText(text); };
+  actions.appendChild(copyBtn);
+
+  body.appendChild(bubble);
+  body.appendChild(actions);
+  wrap.appendChild(body);
+
+  // 点击气泡切换时间戳 + 复制按钮
+  bubble.addEventListener('click', function(e) {
+    if (e.target.tagName === 'IMG' || e.target.tagName === 'A') return;
+    wrap.classList.toggle('show-actions');
+  });
+
+  messagesEl.appendChild(wrap); scrollToBottom();
+  return wrap;
+}
+
+function createThinkingBlock(text) {
+  var b = document.createElement('div'); b.className = 'thinking-block';
+  var tg = document.createElement('div'); tg.className = 'thinking-toggle';
+  tg.textContent = '思考中…';
+  tg.onclick = function() { b.classList.toggle('open'); };
+  var c = document.createElement('div'); c.className = 'thinking-content'; c.textContent = text || '';
+  b.appendChild(tg); b.appendChild(c);
+  return b;
+}
+
+function attachThinkingToWrap(wrap, text) {
+  if (!wrap) return null;
+  var body = wrap.querySelector('.msg-body');
+  if (!body) return null;
+  var existing = body.querySelector('.thinking-block');
+  if (existing) {
+    var content = existing.querySelector('.thinking-content');
+    if (content) content.textContent += text;
+    return existing;
+  }
+  var tb = createThinkingBlock(text);
+  var bubble = body.querySelector('.msg-bubble');
+  if (bubble) body.insertBefore(tb, bubble);
+  else body.appendChild(tb);
+  return tb;
+}
+
+// ===== Tool call blocks =====
+var currentToolBlocks = {}; // tool_use_id -> DOM element (reset per turn)
+var TOOL_RESULT_MAX_CHARS = 2000;
+
+function prettyJSON(v) {
+  try { return JSON.stringify(v, null, 2); }
+  catch (e) { return String(v); }
+}
+
+function setToolStatus(toolBlock, statusText, kind) {
+  var el = toolBlock.querySelector('.tool-status');
+  if (!el) return;
+  el.textContent = statusText;
+  el.classList.remove('ok', 'err');
+  if (kind === 'ok') el.classList.add('ok');
+  else if (kind === 'err') el.classList.add('err');
+}
+
+function createToolBlock(id, name, input) {
+  var b = document.createElement('div');
+  b.className = 'tool-block';
+  b.dataset.toolUseId = id;
+
+  var tg = document.createElement('button');
+  tg.type = 'button';
+  tg.className = 'tool-toggle';
+  var icon = document.createElement('span'); icon.textContent = '🔧';
+  var nm = document.createElement('span'); nm.className = 'tool-name'; nm.textContent = name || 'tool';
+  var sep = document.createElement('span'); sep.textContent = '·'; sep.style.opacity = '0.5';
+  var st = document.createElement('span'); st.className = 'tool-status'; st.textContent = '⋯ 执行中';
+  tg.appendChild(icon); tg.appendChild(nm); tg.appendChild(sep); tg.appendChild(st);
+  tg.onclick = function() { b.classList.toggle('open'); };
+
+  var c = document.createElement('div'); c.className = 'tool-content';
+
+  var inSec = document.createElement('div'); inSec.className = 'tool-section';
+  var inLab = document.createElement('div'); inLab.className = 'tool-section-label'; inLab.textContent = '参数';
+  var inPre = document.createElement('pre'); inPre.textContent = prettyJSON(input || {});
+  inSec.appendChild(inLab); inSec.appendChild(inPre);
+  c.appendChild(inSec);
+
+  var resSec = document.createElement('div'); resSec.className = 'tool-section tool-result-section';
+  var resLab = document.createElement('div'); resLab.className = 'tool-section-label'; resLab.textContent = '结果';
+  var resPre = document.createElement('pre'); resPre.textContent = '（等待结果…）';
+  resSec.appendChild(resLab); resSec.appendChild(resPre);
+  c.appendChild(resSec);
+
+  b.appendChild(tg); b.appendChild(c);
+  return b;
+}
+
+function attachToolUseToWrap(wrap, id, name, input) {
+  if (!wrap) return null;
+  var body = wrap.querySelector('.msg-body');
+  if (!body) return null;
+  var tb = createToolBlock(id, name, input);
+  var bubble = body.querySelector('.msg-bubble');
+  if (bubble) body.insertBefore(tb, bubble);
+  else body.appendChild(tb);
+  return tb;
+}
+
+function applyToolResult(toolUseId, content, isError) {
+  var block = currentToolBlocks[toolUseId];
+  if (!block) return;
+  var resSec = block.querySelector('.tool-result-section');
+  if (!resSec) return;
+  var pre = resSec.querySelector('pre');
+  var note = resSec.querySelector('.tool-truncated-note');
+  var raw = (content == null) ? '' : String(content);
+  if (raw.length > TOOL_RESULT_MAX_CHARS) {
+    pre.textContent = raw.slice(0, TOOL_RESULT_MAX_CHARS);
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'tool-truncated-note';
+      resSec.appendChild(note);
+    }
+    note.textContent = '…已截断，省略 ' + (raw.length - TOOL_RESULT_MAX_CHARS) + ' 字符';
+  } else {
+    pre.textContent = raw;
+    if (note) note.remove();
+  }
+  setToolStatus(block, isError ? '✗ 出错' : '✓ 完成', isError ? 'err' : 'ok');
+}
+
+var typingTimer = null;
+var TYPING_DELAY_MS = 1000;
+
+function scheduleTypingIndicator() {
+  if (typingTimer) clearTimeout(typingTimer);
+  typingTimer = setTimeout(function() {
+    typingTimer = null;
+    if (!currentAssistantWrap) showTypingIndicator();
+  }, TYPING_DELAY_MS);
+}
+function cancelTypingSchedule() {
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
+}
+
+function ensureAssistantWrap() {
+  if (currentAssistantWrap) return currentAssistantWrap;
+  var empty = messagesEl.querySelector('.empty-state');
+  if (empty) empty.remove();
+  var p = getProfile();
+
+  var wrap = document.createElement('div');
+  wrap.className = 'msg-wrap assistant';
+
+  var av = document.createElement('div');
+  av.className = 'avatar bot-avatar';
+  if (p.botImg) av.innerHTML = '<img src="' + p.botImg + '" />';
+  else av.textContent = p.botEmoji;
+
+  var body = document.createElement('div'); body.className = 'msg-body';
+  var nick = document.createElement('div'); nick.className = 'msg-nick';
+  nick.textContent = p.botNick;
+  body.appendChild(nick);
+
+  wrap.appendChild(av); wrap.appendChild(body);
+  messagesEl.appendChild(wrap);
+  currentAssistantWrap = wrap;
+  scrollToBottom();
+  return wrap;
+}
+
+function showTypingIndicator() {
+  cancelTypingSchedule();
+  if (currentAssistantWrap && currentAssistantWrap.querySelector('.typing-bubble')) return currentAssistantWrap;
+  var wrap = ensureAssistantWrap();
+  var body = wrap.querySelector('.msg-body');
+  var typing = document.createElement('div');
+  typing.className = 'msg-bubble assistant typing-bubble';
+  typing.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+  body.appendChild(typing);
+  scrollToBottom();
+  return wrap;
+}
+
+function removeTypingBubble() {
+  if (!currentAssistantWrap) return;
+  var tb = currentAssistantWrap.querySelector('.typing-bubble');
+  if (tb) tb.remove();
+}
+
+function fillAssistantWrapWithBubble(wrap, text) {
+  removeTypingBubble();
+  var body = wrap.querySelector('.msg-body');
+
+  var bubble = document.createElement('div');
+  bubble.className = 'msg-bubble assistant';
+  var md = document.createElement('div');
+  md.className = 'md-content'; md._raw = text;
+  md.innerHTML = text ? marked.parse(text) : '';
+  bubble.appendChild(md);
+
+  var actions = document.createElement('div');
+  actions.className = 'msg-actions';
+  var actionTime = document.createElement('span');
+  actionTime.className = 'action-time';
+  actionTime.textContent = formatTime(new Date());
+  actions.appendChild(actionTime);
+  var copyBtn = document.createElement('button');
+  copyBtn.className = 'msg-action-btn';
+  copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  copyBtn.title = '复制';
+  copyBtn.onclick = function() { copyMessageText(text); };
+  actions.appendChild(copyBtn);
+
+  body.appendChild(bubble);
+  body.appendChild(actions);
+
+  bubble.addEventListener('click', function(e) {
+    if (e.target.tagName === 'IMG' || e.target.tagName === 'A') return;
+    wrap.classList.toggle('show-actions');
+  });
+
+  scrollToBottom();
+  return wrap;
+}
+
+function addThinking(text) {
+  cancelTypingSchedule();
+  if (!currentAssistantWrap) ensureAssistantWrap();
+  removeTypingBubble();
+  attachThinkingToWrap(currentAssistantWrap, text);
+  currentThinkingEl = currentAssistantWrap ? currentAssistantWrap.querySelector('.thinking-block') : null;
+  // 滚动交给调用方按 isNearBottom 决定
+}
+
+// ===== Image Handling =====
+var selectedImages = [];
+var imagePreviewArea = document.getElementById('image-preview-area');
+var imageInput = document.getElementById('image-input');
+var attachBtnEl = document.getElementById('attach-btn');
+
+// 直接触发文件选择器
+attachBtnEl.onclick = function(e) {
+  e.stopPropagation();
+  imageInput.click();
+};
+
+imageInput.onchange = function(e) {
+  var files = Array.from(e.target.files);
+  if (files.length + selectedImages.length > 4) {
+    alert('最多只能选择4张图片');
+    files = files.slice(0, 4 - selectedImages.length);
+  }
+
+  files.forEach(function(file) {
+    if (!file.type.startsWith('image/')) return;
+
+    var reader = new FileReader();
+    reader.onload = function(event) {
+      compressImage(event.target.result, function(compressed) {
+        selectedImages.push(compressed);
+        updateImagePreview();
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+
+  imageInput.value = '';
+};
+
+function compressImage(dataUrl, callback) {
+  var img = new Image();
+  img.onload = function() {
+    var canvas = document.createElement('canvas');
+    var ctx = canvas.getContext('2d');
+
+    var maxSize = 1024;
+    var width = img.width;
+    var height = img.height;
+
+    if (width > height && width > maxSize) {
+      height = (height * maxSize) / width;
+      width = maxSize;
+    } else if (height > maxSize) {
+      width = (width * maxSize) / height;
+      height = maxSize;
+    }
+
+    canvas.width = width;
+    canvas.height = height;
+    ctx.drawImage(img, 0, 0, width, height);
+
+    callback(canvas.toDataURL('image/jpeg', 0.8));
+  };
+  img.src = dataUrl;
+}
+
+function updateImagePreview() {
+  if (selectedImages.length === 0) {
+    imagePreviewArea.classList.remove('show');
+    imagePreviewArea.innerHTML = '';
+    return;
+  }
+
+  imagePreviewArea.classList.add('show');
+  var html = '';
+  selectedImages.forEach(function(img, index) {
+    html += '<div class="image-preview-item">';
+    html += '<img src="' + img + '" />';
+    html += '<button class="image-preview-remove" onclick="removeImage(' + index + ')">✕</button>';
+    html += '</div>';
+  });
+  imagePreviewArea.innerHTML = html;
+  updateSendButton();
+}
+
+function removeImage(index) {
+  selectedImages.splice(index, 1);
+  updateImagePreview();
+}
+
+// Update send button based on input
+var ICON_SEND = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M3.4 20.4 20.85 12.9c.81-.35.81-1.45 0-1.8L3.4 3.6c-.66-.29-1.39.2-1.39.92L2 9.12c0 .5.37.93.87 1l10.13 1.38-10.13 1.38c-.5.07-.87.5-.87 1l.01 4.6c0 .72.73 1.21 1.39.92z"/></svg>';
+var ICON_MIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
+var ICON_STOP = '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+
+function updateSendButton() {
+  // 生成中：发送按钮变停止按钮
+  if (isGenerating) {
+    sendBtn.innerHTML = ICON_STOP;
+    sendBtn.className = 'input-send-btn stop-btn';
+    sendBtn.title = '停止生成';
+    sendBtn.onclick = stop;
+    return;
+  }
+
+  var hasText = inputEl.value.trim().length > 0;
+  var hasImages = selectedImages.length > 0;
+
+  if (hasText || hasImages) {
+    sendBtn.innerHTML = ICON_SEND;
+    sendBtn.className = 'input-send-btn';
+    sendBtn.title = '发送';
+    sendBtn.onclick = send;
+  } else {
+    sendBtn.innerHTML = ICON_MIC;
+    sendBtn.className = 'input-send-btn voice-mode';
+    sendBtn.title = '';
+    sendBtn.onclick = function() { alert('语音功能开发中'); };
+  }
+}
+
+// ===== Send =====
+function getCurrentSettings() {
+  var key = 'chat-settings-' + (currentProjectId || 'global');
+  var settings = JSON.parse(localStorage.getItem(key) || '{}');
+  return {
+    bufferTime: settings.bufferTime || 10,
+    shortMsgCount: settings.shortMsgCount || 5,
+    compressThreshold: settings.compressThreshold || 50000,
+    summaryLength: settings.summaryLength || 500,
+    defaultModel: settings.defaultModel || ''
+  };
+}
+
+function formatK(n) {
+  n = n || 0;
+  if (n < 1000) return String(n);
+  var k = n / 1000;
+  return (k === Math.floor(k) ? k : (Math.round(k * 10) / 10)) + 'k';
+}
+function updateCharCounter(total) {
+  var threshold = getCurrentSettings().compressThreshold || 50000;
+  if (tokenCounter) tokenCounter.textContent = formatK(total) + ' / ' + formatK(threshold);
+}
+function updateClaudeName() {
+  var p = getProfile();
+  var el = document.getElementById('claude-name');
+  if (el) el.textContent = p.botNick || 'Claude';
+}
+
+async function send() {
+  var text = inputEl.value.trim();
+  var images = selectedImages.slice();
+
+  if (!text && images.length === 0) return;
+  if (isGenerating) return;
+
+  if (!currentConvId) {
+    try {
+      var res = await fetch(API + '/conversations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: (text || '对话').slice(0, 40) }) });
+      var conv = await res.json();
+      currentConvId = conv.id;
+      localStorage.setItem(CONV_KEY, currentConvId);
+    } catch (e) { console.warn('创建对话失败，消息不会入库:', e); }
+  }
+
+  addMessage(text, 'user', false, null, images);
+  scheduleTypingIndicator();
+
+  var payload = {
+    type: 'chat',
+    content: text,
+    conversation_id: currentConvId,
+    settings: getCurrentSettings(),
+  };
+  if (images.length > 0) payload.images = images;
+
+  ws.send(JSON.stringify(payload));
+
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  selectedImages = [];
+  updateImagePreview();
+  updateSendButton();
+}
+
+// Toast 提示
+function showToast(message, opts) {
+  opts = opts || {};
+  var container = document.getElementById('toast-container');
+  if (!container) return;
+  var toast = document.createElement('div');
+  toast.className = 'toast';
+
+  var msg = document.createElement('span');
+  msg.className = 'toast-msg';
+  msg.textContent = message;
+  toast.appendChild(msg);
+
+  if (opts.action) {
+    var btn = document.createElement('button');
+    btn.className = 'toast-action';
+    btn.textContent = opts.action.label;
+    btn.onclick = function() {
+      try { opts.action.onClick(); } catch (e) {}
+      toast.remove();
+    };
+    toast.appendChild(btn);
+  }
+
+  var close = document.createElement('button');
+  close.className = 'toast-close';
+  close.textContent = '✕';
+  close.onclick = function() { toast.remove(); };
+  toast.appendChild(close);
+
+  container.appendChild(toast);
+  var ttl = opts.duration == null ? 8000 : opts.duration;
+  if (ttl > 0) setTimeout(function() { if (toast.parentNode) toast.remove(); }, ttl);
+  return toast;
+}
+
+function showCCDriftToast() {
+  showToast('上下文可能不同步，建议重启 CC', {
+    action: { label: '立即重启', onClick: restartCC },
+    duration: 10000,
+  });
+}
+
+// 重启 CC 进程。opts.model 会传给后端，重启后带上新模型
+async function restartCC(opts) {
+  opts = opts || {};
+  if (isGenerating && !opts.silent) {
+    if (!confirm('CC 正在回复，强制重启会中断当前回复。继续？')) return;
+  }
+  try {
+    var body = {};
+    if (opts.model !== undefined) body.model = opts.model;
+    var res = await fetch(API + '/cc/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    var data = await res.json();
+    isGenerating = false; generatingConvId = null;
+    currentAssistantEl = null;
+    updateModeButton();
+    updateSendButton();
+    // 重启即新会话：清屏 + 新建 conversation_id（字数计数自动归零）
+    await newChat();
+    if (opts.toastMessage) showToast(opts.toastMessage);
+    else if (!opts.silent) showToast('CC 已重启');
+    return data;
+  } catch (e) {
+    showToast('重启失败: ' + e.message);
+  }
+}
+
+// 新对话：只清屏，同时新建 conversation 条目
+async function newChat() {
+  if (isGenerating) stop();
+  try {
+    var res = await fetch(API + '/conversations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: '新对话' }) });
+    var conv = await res.json();
+    currentConvId = conv.id;
+    localStorage.setItem(CONV_KEY, currentConvId);
+  } catch (e) {}
+  messagesEl.innerHTML = '<div class="empty-state">开始一段新对话</div>';
+  lastMessageDate = null;
+  totalOutputTokens = 0;
+  currentAssistantWrap = null;
+  currentThinkingEl = null;
+  updateCharCounter(0);
+  if (isMobile()) closeSidebar();
+  // 注意：CC 侧上下文仍在。如需同时清空 CC 上下文，请点「重启 CC」
+}
+
+// 加载当前对话历史
+async function loadCurrentConversation() {
+  var saved = localStorage.getItem(CONV_KEY);
+  if (!saved) { currentConvId = null; return; }
+  currentConvId = saved;
+  messagesEl.innerHTML = '';
+  lastMessageDate = null;
+  totalOutputTokens = 0;
+  currentThinkingEl = null;
+  currentAssistantWrap = null;
+  try {
+    var res = await fetch(API + '/conversations/' + saved + '/messages');
+    if (!res.ok) { currentConvId = null; localStorage.removeItem(CONV_KEY); return; }
+    var ms = await res.json();
+    if (!Array.isArray(ms)) return;
+    for (var i = 0; i < ms.length; i++) {
+      var m = ms[i];
+      var d = new Date(m.created_at); maybeAddDateSep(d);
+      var msgImages = m.images || [];
+      var firstWrap = null;
+      if (m.role === 'assistant' && m.content && m.content.indexOf('---bubble---') !== -1) {
+        var parts = m.content.split('---bubble---').map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+        firstWrap = addMessage(parts[0], m.role, true, m.id, msgImages, m.created_at);
+        for (var k = 1; k < parts.length; k++) addContinuation(parts[k], true, m.created_at);
+      } else {
+        firstWrap = addMessage(m.content, m.role, true, m.id, msgImages, m.created_at);
+      }
+      if (m.role === 'assistant' && m.thinking && firstWrap) {
+        attachThinkingToWrap(firstWrap, m.thinking);
+      }
+      if (m.role === 'assistant' && m.token_output) totalOutputTokens += m.token_output || 0;
+    }
+    var totalChars = ms.reduce(function(s, m) { return s + ((m.content || '').length || 0); }, 0);
+    updateCharCounter(totalChars);
+    scrollToBottom();
+  } catch (e) { console.warn('加载历史失败:', e); }
+}
+
+function stop() {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'stop' }));
+}
+function scrollToBottom() {
+  messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: 'smooth' });
+}
+function isNearBottom() {
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 100;
+}
+
+inputEl.addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = this.scrollHeight + 'px';
+  updateSendButton();
+});
+
+// 移动端键盘弹出：用 visualViewport 把输入栏顶到键盘上方，并把消息区滚到底
+if (window.visualViewport) {
+  var inputContainer = document.getElementById('input-container');
+  var keyboardResize = function() {
+    var offset = Math.max(0, window.innerHeight - window.visualViewport.height);
+    if (inputContainer) inputContainer.style.bottom = offset + 'px';
+    scrollToBottom();
+  };
+  window.visualViewport.addEventListener('resize', keyboardResize);
+  window.visualViewport.addEventListener('scroll', keyboardResize);
+}
+// 键盘收起时兜底：滚回顶部防止页面错位
+inputEl.addEventListener('blur', function() {
+  setTimeout(function() { window.scrollTo(0, 0); }, 100);
+});
+inputEl.addEventListener('focus', function() {
+  setTimeout(scrollToBottom, 300);
+});
+
+inputEl.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (inputEl.value.trim() || selectedImages.length > 0) {
+      send();
+    }
+  }
+});
+
+// ===== Image Viewer =====
+function openImageViewer(imgSrc) {
+  document.getElementById('image-viewer-img').src = imgSrc;
+  document.getElementById('image-viewer').classList.add('show');
+}
+
+function closeImageViewer() {
+  document.getElementById('image-viewer').classList.remove('show');
+}
+
+// ===== Mode/Stop Button =====
+var sendBtn = document.getElementById('send-btn');
+
+function updateModeButton() {
+  // + 始终可见，发送按钮在生成中会由 updateSendButton 变成停止按钮
+  attachBtnEl.style.display = 'flex';
+}
+
+// ===== Message Actions =====
+
+function copyMessageText(text) {
+  // 支持HTTP环境的复制方案
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(function() {
+      // 复制成功
+    }).catch(function(err) {
+      console.error('复制失败:', err);
+    });
+  } else {
+    // 降级方案：使用 textarea + execCommand
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      document.execCommand('copy');
+    } catch (err) {
+      console.error('复制失败:', err);
+    }
+    document.body.removeChild(ta);
+  }
+}
+
+async function startEditMessage(wrap, messageId) {
+  if (!messageId || !currentConvId) return;
+
+  var bubble = wrap.querySelector('.msg-bubble');
+  var textSpan = bubble.querySelector('.text');
+  if (!textSpan) return;
+
+  var originalText = textSpan.dataset.originalText || textSpan.textContent;
+
+  // 隐藏原文本和操作按钮
+  textSpan.style.display = 'none';
+  var actions = wrap.querySelector('.msg-actions');
+  if (actions) actions.style.display = 'none';
+
+  // 创建编辑区
+  var editArea = document.createElement('textarea');
+  editArea.className = 'msg-edit-area';
+  editArea.value = originalText;
+  bubble.appendChild(editArea);
+
+  // 创建操作按钮
+  var editActions = document.createElement('div');
+  editActions.className = 'msg-edit-actions';
+
+  var saveBtn = document.createElement('button');
+  saveBtn.className = 'msg-edit-save';
+  saveBtn.textContent = '✓ 保存';
+
+  var cancelBtn = document.createElement('button');
+  cancelBtn.className = 'msg-edit-cancel';
+  cancelBtn.textContent = '✕ 取消';
+
+  editActions.appendChild(saveBtn);
+  editActions.appendChild(cancelBtn);
+  bubble.appendChild(editActions);
+
+  editArea.focus();
+  editArea.select();
+
+  // 保存编辑
+  var saveEdit = async function() {
+    var newText = editArea.value.trim();
+    if (!newText) {
+      cancelEdit();
+      return;
+    }
+
+    // 更新数据库
+    await fetch(API + '/messages/' + messageId, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: newText })
+    });
+
+    // 删除这条消息之后的所有消息
+    var res = await fetch(API + '/conversations/' + currentConvId + '/messages');
+    var allMessages = await res.json();
+    var editedIdx = allMessages.findIndex(function(m) { return m.id === messageId; });
+    if (editedIdx !== -1) {
+      // 删除后面的所有消息
+      for (var i = editedIdx + 1; i < allMessages.length; i++) {
+        await fetch(API + '/messages/' + allMessages[i].id, { method: 'DELETE' });
+      }
+    }
+
+    // 重新加载对话
+    await switchConv(currentConvId);
+
+    // 重新发送编辑后的消息给 Claude
+    if (ws && ws.readyState === 1) {
+      var model = currentModel;
+      var settings = getCurrentSettings();
+      scheduleTypingIndicator();
+      ws.send(JSON.stringify({ type: 'chat', content: newText, conversation_id: currentConvId, model: model, settings: settings }));
+    }
+    showCCDriftToast();
+  };
+
+  var cancelEdit = function() {
+    editArea.remove();
+    editActions.remove();
+    textSpan.style.display = '';
+    if (actions) actions.style.display = '';
+  };
+
+  // 按钮点击事件
+  saveBtn.onclick = saveEdit;
+  cancelBtn.onclick = cancelEdit;
+
+  // 键盘快捷键（Ctrl+Enter保存，Esc取消）
+  editArea.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      saveEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelEdit();
+    }
+  });
+}
+
+// ===== Regenerate Message =====
+async function regenerateLastMessage() {
+  if (!currentConvId) return;
+
+  // 获取历史消息
+  var res = await fetch(API + '/conversations/' + currentConvId + '/messages');
+  var ms = await res.json();
+
+  // 找到最后一条 assistant 和最后一条 user 消息
+  var lastAssistant = null, lastUser = null;
+  for (var i = ms.length - 1; i >= 0; i--) {
+    if (!lastAssistant && ms[i].role === 'assistant') lastAssistant = ms[i];
+    if (!lastUser && ms[i].role === 'user') lastUser = ms[i];
+    if (lastAssistant && lastUser) break;
+  }
+
+  if (!lastAssistant || !lastUser) {
+    alert('无法重新生成');
+    return;
+  }
+
+  // 删除最后一条 assistant 消息
+  await fetch(API + '/messages/' + lastAssistant.id, { method: 'DELETE' });
+
+  // 重新加载对话并发送
+  await switchConv(currentConvId);
+
+  // 重新发送最后一条用户消息
+  if (ws && ws.readyState === 1) {
+    var model = currentModel;
+    var settings = getCurrentSettings();
+    scheduleTypingIndicator();
+    ws.send(JSON.stringify({ type: 'chat', content: lastUser.content, conversation_id: currentConvId, model: model, settings: settings }));
+  }
+  showCCDriftToast();
+}
+
+async function regenerateMessage(messageId) {
+  if (!currentConvId || !messageId) return;
+
+  // 获取历史消息
+  var res = await fetch(API + '/conversations/' + currentConvId + '/messages');
+  var ms = await res.json();
+
+  // 找到要重新生成的消息和它前面的 user 消息
+  var targetMsg = null, prevUser = null;
+  for (var i = 0; i < ms.length; i++) {
+    if (ms[i].id === messageId) {
+      targetMsg = ms[i];
+      // 往前找最近的 user 消息
+      for (var j = i - 1; j >= 0; j--) {
+        if (ms[j].role === 'user') {
+          prevUser = ms[j];
+          break;
+        }
+      }
+      break;
+    }
+  }
+
+  if (!targetMsg || !prevUser) {
+    alert('无法重新生成');
+    return;
+  }
+
+  // 删除这条 assistant 消息
+  await fetch(API + '/messages/' + messageId, { method: 'DELETE' });
+
+  // 重新加载对话
+  await switchConv(currentConvId);
+
+  // 重新发送对应的用户消息
+  if (ws && ws.readyState === 1) {
+    var model = currentModel;
+    var settings = getCurrentSettings();
+    scheduleTypingIndicator();
+    ws.send(JSON.stringify({ type: 'chat', content: prevUser.content, conversation_id: currentConvId, model: model, settings: settings }));
+  }
+  showCCDriftToast();
+}
+
+// ===== Settings (inline in sidebar) =====
+var psCurrentLayer = '锚';
+
+// 兼容旧调用：已废弃（设置面板现在就是侧栏本身）
+function openProjectSettings() { showPSScreen('main'); }
+function closeProjectSettings() { showPSScreen('main'); }
+
+function showPSScreen(screenName) {
+  var screens = document.querySelectorAll('.ps-screen');
+  for (var i = 0; i < screens.length; i++) screens[i].classList.remove('active');
+  var target = document.getElementById('ps-screen-' + screenName);
+  if (target) target.classList.add('active');
+  // 切换子屏时把 sidebar 滚动回顶
+  var s = document.getElementById('sidebar-scroll');
+  if (s) s.scrollTop = 0;
+}
+
+function updatePSHeader() { /* 单对话模式不再需要 */ }
+
+// ===== Project Select Dialog =====
+var projectSelectTarget = null;
+
+async function showProjectSelectDialog(target) {
+  projectSelectTarget = target;
+  var res = await fetch(API + '/projects');
+  var projects = await res.json();
+
+  // 如果只有一个项目，直接选择并进入
+  if (projects.length === 1) {
+    currentProjectId = projects[0].id;
+    if (target === 'worldbook') {
+      openWorldBook();
+    } else if (target === 'memory') {
+      openMemoryManager();
+    }
+    return;
+  }
+
+  // 否则显示项目列表
+  var list = document.getElementById('project-select-list');
+  var html = '';
+  for (var i = 0; i < projects.length; i++) {
+    var p = projects[i];
+    var avatar = p.avatar || '📁';
+    html += '<div class="project-select-item" onclick="selectProjectForDialog(\'' + p.id + '\')">';
+    html += '<div class="project-select-avatar">' + avatar + '</div>';
+    html += '<div class="project-select-info">';
+    html += '<div class="project-select-name">' + (p.name || '未命名项目') + '</div>';
+    html += '<div class="project-select-desc">' + (p.description || '') + '</div>';
+    html += '</div></div>';
+  }
+  list.innerHTML = html;
+  document.getElementById('project-select-overlay').classList.add('show');
+}
+
+function closeProjectSelect() {
+  document.getElementById('project-select-overlay').classList.remove('show');
+  projectSelectTarget = null;
+}
+
+async function selectProjectForDialog(projectId) {
+  currentProjectId = projectId;
+  closeProjectSelect();
+
+  // 根据目标打开对应界面
+  if (projectSelectTarget === 'worldbook') {
+    await openWorldBook();
+  } else if (projectSelectTarget === 'memory') {
+    await openMemoryManager();
+  }
+}
+
+// ===== World Book（单例：后端默认 project 的 system_prompt）=====
+async function openWorldBook() {
+  showPSScreen('worldbook');
+  try {
+    var res = await fetch(API + '/worldbook');
+    var data = await res.json();
+    document.getElementById('ps-worldbook-content').value = data.system_prompt || '';
+  } catch (e) { showToast('加载失败: ' + e.message); }
+}
+
+async function saveWorldBook() {
+  var content = document.getElementById('ps-worldbook-content').value;
+  try {
+    await fetch(API + '/worldbook', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ system_prompt: content })
+    });
+    showToast('世界书已保存');
+  } catch (e) { showToast('保存失败: ' + e.message); }
+}
+
+async function openMemoryManager() {
+  showPSScreen('memory');
+  await loadMemories(psCurrentLayer);
+}
+
+async function loadMemories(layer) {
+  psCurrentLayer = layer;
+  var res = await fetch(API + '/memory/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layer: layer, limit: 50 })
+  });
+  var memories = await res.json();
+  var list = document.getElementById('ps-memory-list');
+  if (!memories || memories.length === 0) {
+    list.innerHTML = '<div style="text-align:center;color:#555;padding:40px 0;">暂无记忆</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < memories.length; i++) {
+    var m = memories[i];
+    html += '<div class="ps-memory-item">';
+    html += '<div class="ps-memory-header">';
+    html += '<div style="display: flex; align-items: center; gap: 8px;">';
+    html += '<span class="ps-memory-layer">' + (m.layer || '未分类') + '</span>';
+    // 显示作者和来源色块
+    if (m.author) {
+      html += '<span class="ps-memory-author">';
+      if (m.source) {
+        html += '<span class="ps-author-badge source-' + m.source + '"></span>';
+      }
+      html += m.author;
+      html += '</span>';
+    }
+    html += '</div>';
+    html += '<span class="ps-memory-actions">';
+    html += '<button onclick="editMemory(\'' + m.id + '\')">编辑</button>';
+    html += '<button onclick="deleteMemory(\'' + m.id + '\')">删除</button>';
+    html += '</span></div>';
+    html += '<div class="ps-memory-content">' + (m.content || '').substring(0, 100) + '</div>';
+    html += '</div>';
+  }
+  list.innerHTML = html;
+}
+
+function switchMemoryTab(layer) {
+  var tabs = document.querySelectorAll('.ps-tab');
+  for (var i = 0; i < tabs.length; i++) {
+    if (tabs[i].textContent === layer) tabs[i].classList.add('active');
+    else tabs[i].classList.remove('active');
+  }
+  loadMemories(layer);
+}
+
+async function editMemory(id) {
+  var content = prompt('编辑记忆内容:');
+  if (!content) return;
+  await fetch(API + '/memory/' + id, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: content })
+  });
+  loadMemories(psCurrentLayer);
+}
+
+async function deleteMemory(id) {
+  if (!confirm('确定删除？')) return;
+  await fetch(API + '/memory/' + id, { method: 'DELETE' });
+  loadMemories(psCurrentLayer);
+}
+
+async function openAssistantConfig() {
+  showPSScreen('assistant');
+  var res = await fetch(API + '/claude-md');
+  var data = await res.json();
+  document.getElementById('ps-assistant-content').value = data.content || '';
+}
+
+async function saveAssistantConfig() {
+  var content = document.getElementById('ps-assistant-content').value;
+  try {
+    await fetch(API + '/claude-md', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: content })
+    });
+    showToast('已保存，重启 CC 后生效', {
+      action: { label: '立即重启', onClick: restartCC },
+      duration: 10000,
+    });
+  } catch (e) {
+    showToast('保存失败: ' + e.message);
+  }
+}
+
+function openParamsSettings() {
+  showPSScreen('params');
+  loadParamsSettings();
+}
+
+function loadParamsSettings() {
+  var key = 'chat-settings-' + (currentProjectId || 'global');
+  var settings = JSON.parse(localStorage.getItem(key) || '{}');
+  document.getElementById('ps-buffer-time').value = settings.bufferTime || 10;
+  document.getElementById('ps-short-msg-count').value = settings.shortMsgCount || 5;
+  document.getElementById('ps-compress-threshold').value = settings.compressThreshold || 50000;
+  document.getElementById('ps-summary-length').value = settings.summaryLength || 500;
+  document.getElementById('ps-default-model').value = settings.defaultModel || '';
+}
+
+function saveParamsSettings() {
+  var key = 'chat-settings-' + (currentProjectId || 'global');
+  var settings = {
+    bufferTime: parseInt(document.getElementById('ps-buffer-time').value) || 10,
+    shortMsgCount: parseInt(document.getElementById('ps-short-msg-count').value) || 5,
+    compressThreshold: parseInt(document.getElementById('ps-compress-threshold').value) || 50000,
+    summaryLength: parseInt(document.getElementById('ps-summary-length').value) || 500,
+    defaultModel: document.getElementById('ps-default-model').value
+  };
+  localStorage.setItem(key, JSON.stringify(settings));
+  showToast('参数已保存');
+}
+
+async function openUsageStats() {
+  showPSScreen('stats');
+  await loadUsageStats();
+}
+
+async function loadUsageStats() {
+  try {
+    var res = await fetch(API + '/stats/tokens');
+    var stats = await res.json();
+
+    // 更新数字卡片
+    document.getElementById('ps-stat-today').innerHTML =
+      stats.today.toLocaleString() + '<span class="ps-stat-unit">tokens</span>';
+    document.getElementById('ps-stat-week').innerHTML =
+      stats.week.toLocaleString() + '<span class="ps-stat-unit">tokens</span>';
+    document.getElementById('ps-stat-month').innerHTML =
+      stats.month.toLocaleString() + '<span class="ps-stat-unit">tokens</span>';
+
+    // 绘制柱状图
+    var maxValue = Math.max.apply(null, stats.daily.map(function(d) { return d.output; }));
+    if (maxValue === 0) maxValue = 1; // 避免除以0
+
+    var barsHtml = '';
+    for (var i = 0; i < stats.daily.length; i++) {
+      var d = stats.daily[i];
+      var heightPercent;
+      if (d.output === 0) {
+        heightPercent = 0;
+      } else {
+        // 最小高度 12%，确保有数据时一定看得见
+        heightPercent = Math.max(12, (d.output / maxValue) * 100);
+      }
+      var dateLabel = new Date(d.date).getDate() + '日';
+      var isToday = i === stats.daily.length - 1; // 最后一天是今天
+      barsHtml += '<div class="ps-chart-bar-wrap">';
+      if (d.output === 0) {
+        // 没有数据显示占位虚线
+        barsHtml += '<div class="ps-chart-bar" style="height:2px;background:#1a1a2a;opacity:0.3;" title="0 tokens"></div>';
+      } else {
+        var barStyle = isToday ? 'background:#4a9eff;' : '';
+        // 在柱子上方显示数值（超过1000时显示K）
+        var valueLabel = d.output > 999 ? (d.output / 1000).toFixed(1) + 'k' : d.output;
+        barsHtml += '<div style="font-size:9px;color:#666;margin-bottom:2px;min-height:12px;">' + valueLabel + '</div>';
+        barsHtml += '<div class="ps-chart-bar" style="height:' + heightPercent + '%;' + barStyle + '" title="' + d.output.toLocaleString() + ' tokens"></div>';
+      }
+      barsHtml += '<div class="ps-chart-label">' + dateLabel + (isToday ? ' (今)' : '') + '</div>';
+      barsHtml += '</div>';
+    }
+    document.getElementById('ps-chart-bars').innerHTML = barsHtml;
+  } catch (err) {
+    console.error('加载统计失败:', err);
+  }
+}
+
+function openWindowSettings() {
+  showPSScreen('window');
+}
+
+function openThemeSettings() {
+  showPSScreen('theme');
+  loadThemeSettings();
+}
+
+function loadThemeSettings() {
+  var theme = getTheme();
+  document.getElementById('ps-theme-select').value = theme;
+}
+
+function onThemeChange() {
+  var theme = document.getElementById('ps-theme-select').value;
+  setTheme(theme);
+}
+
+function openVoiceSettings() {
+  showPSScreen('voice');
+}
+
+// ===== Model Selector =====
+function toggleModelDropdown() {
+  var dropdown = document.getElementById('model-select-dropdown');
+  dropdown.classList.toggle('show');
+
+  // 点击外部关闭
+  if (dropdown.classList.contains('show')) {
+    setTimeout(function() {
+      document.addEventListener('click', closeModelDropdown);
+    }, 0);
+  }
+}
+
+function closeModelDropdown(e) {
+  var dropdown = document.getElementById('model-select-dropdown');
+  var wrapper = document.getElementById('model-select-wrapper');
+
+  if (!wrapper.contains(e.target)) {
+    dropdown.classList.remove('show');
+    document.removeEventListener('click', closeModelDropdown);
+  }
+}
+
+// 仅更新 UI（按钮文字 + active 状态），不重启 CC
+// status 参数保留兼容，但不再显示（.model-status 现在是字数）
+function syncModelUI(value, name, status) {
+  var nameEl = document.querySelector('#model-select-btn .model-name');
+  var opts = document.querySelectorAll('.model-option');
+  var matched = null;
+  opts.forEach(function(opt) {
+    opt.classList.remove('active');
+    if (opt.getAttribute('data-value') === (value || '')) matched = opt;
+  });
+  if (matched) {
+    matched.classList.add('active');
+    if (!name) name = matched.querySelector('.opt-name')?.textContent || value;
+  }
+  if (nameEl && name) nameEl.textContent = name;
+}
+
+async function selectModel(value, name, status) {
+  // 关闭下拉菜单
+  document.getElementById('model-select-dropdown').classList.remove('show');
+  document.removeEventListener('click', closeModelDropdown);
+
+  if (value === currentModel) { syncModelUI(value, name, status); return; }
+
+  syncModelUI(value, name, status);
+  currentModel = value;
+
+  // 常驻 CC 模式：切换模型需要重启 CC
+  var label = name || (value || '默认');
+  await restartCC({ model: value || null, silent: true, toastMessage: 'CC 已重启，当前模型：' + label });
+}
+
+// ===== Init =====
+initSidebar();
+updateCharCounter(0);
+updateSendButton();
+updateClaudeName();
+connect();
+loadCurrentConversation();
+// 启动时查询 CC 状态 + 同步模型显示
+fetch(API + '/health').then(function(r) { return r.json(); }).then(function(d) {
+  if (wsStatus) {
+    wsStatus.classList.remove('connected', 'error');
+    if (d.cc_running) wsStatus.classList.add('connected');
+    else wsStatus.classList.add('error');
+  }
+  if (d.model) syncModelUI(d.model);
+}).catch(function() {});
+</script>
+</body>
+</html>
