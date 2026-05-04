@@ -5,3 +5,4 @@ node_modules/
 *.save
 .claude/
 index.js.backup
+cc-runtime.json
