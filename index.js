@@ -7,6 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import jwt from 'jsonwebtoken';
+import * as pty from 'node-pty';
 import { supabase, writeMemory, searchMemory, getDefaultProject } from './memory.js';
 import { CCProcessManager } from './cc-manager.js';
 
@@ -35,7 +36,19 @@ dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ noServer: true });          // 聊天 WS（默认路径）
+const wssTerminal = new WebSocketServer({ noServer: true });  // 终端 WS（/terminal）
+
+// 按路径分流 WS upgrade
+server.on('upgrade', (req, socket, head) => {
+  let pathname = '/';
+  try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
+  if (pathname === '/terminal') {
+    wssTerminal.handleUpgrade(req, socket, head, (ws) => wssTerminal.emit('connection', ws, req));
+  } else {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  }
+});
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -623,6 +636,72 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => console.log('客户端断开'));
+});
+
+// ==================== 终端 WS (/terminal) ====================
+wssTerminal.on('connection', (ws, req) => {
+  // 鉴权：?token=xxx，跟聊天 WS 一致
+  let token = null;
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    token = url.searchParams.get('token');
+  } catch {}
+  if (!verifyAuthToken(token)) {
+    try { ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' })); } catch {}
+    ws.close(4001, 'unauthorized');
+    console.log('终端 WS 鉴权失败，已断开');
+    return;
+  }
+
+  let term;
+  try {
+    term = pty.spawn('bash', [], {
+      name: 'xterm-color',
+      cols: 80,
+      rows: 24,
+      cwd: '/root',
+      env: { ...process.env, TERM: 'xterm-256color', LANG: process.env.LANG || 'en_US.UTF-8' },
+    });
+  } catch (e) {
+    console.error('pty.spawn 失败:', e);
+    try { ws.send('\r\n\x1b[31mfailed to spawn pty: ' + (e?.message || e) + '\x1b[0m\r\n'); } catch {}
+    ws.close(1011, 'pty spawn failed');
+    return;
+  }
+
+  console.log('终端 WS 客户端已连接, pty pid =', term.pid);
+
+  term.onData((data) => {
+    try { if (ws.readyState === 1) ws.send(data); } catch {}
+  });
+  term.onExit(({ exitCode, signal }) => {
+    try { ws.send(`\r\n\x1b[33m[pty exited code=${exitCode} signal=${signal}]\x1b[0m\r\n`); } catch {}
+    try { ws.close(); } catch {}
+  });
+
+  ws.on('message', (raw) => {
+    try {
+      const s = raw.toString();
+      // 前端可发 {type:'resize', cols, rows} JSON 控制 pty 尺寸
+      if (s.length < 200 && s.startsWith('{') && s.includes('"type"')) {
+        try {
+          const o = JSON.parse(s);
+          if (o.type === 'resize' && Number(o.cols) > 0 && Number(o.rows) > 0) {
+            term.resize(Number(o.cols), Number(o.rows));
+            return;
+          }
+        } catch { /* 不是 JSON 控制消息，按普通输入处理 */ }
+      }
+      term.write(s);
+    } catch (e) {
+      console.error('终端 WS 写入失败:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    try { term.kill(); } catch {}
+    console.log('终端 WS 客户端断开');
+  });
 });
 
 // 把前端传来的 dataURL 转成 Anthropic content-block 数组里的 image block
