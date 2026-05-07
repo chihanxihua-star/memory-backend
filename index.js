@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import jwt from 'jsonwebtoken';
 import { supabase, writeMemory, searchMemory, getDefaultProject } from './memory.js';
 import { CCProcessManager } from './cc-manager.js';
 
@@ -46,13 +47,113 @@ app.use(express.static(__dirname, {
   },
 }));
 
+// ==================== 鉴权 ====================
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
+const JWT_SECRET = process.env.JWT_SECRET || '';
+const JWT_TTL = process.env.JWT_TTL || '30d';
+
+if (!AUTH_PASSWORD) console.warn('⚠️  AUTH_PASSWORD 未配置，/api/auth 会一直返回 500');
+if (!JWT_SECRET) console.warn('⚠️  JWT_SECRET 未配置，鉴权将拒绝所有请求');
+
+function signAuthToken() {
+  return jwt.sign({ scope: 'app' }, JWT_SECRET, { expiresIn: JWT_TTL });
+}
+function verifyAuthToken(token) {
+  if (!token || !JWT_SECRET) return null;
+  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+}
+
+// 公开：登录换 token
+app.post('/api/auth', (req, res) => {
+  const { password } = req.body || {};
+  if (!AUTH_PASSWORD || !JWT_SECRET) {
+    return res.status(500).json({ error: 'server auth not configured' });
+  }
+  if (typeof password !== 'string' || password !== AUTH_PASSWORD) {
+    return res.status(401).json({ error: 'invalid password' });
+  }
+  res.json({ token: signAuthToken(), expires_in: JWT_TTL });
+});
+
+// 中间件：除了 /api/auth 之外的所有 /api/* 都要 Bearer
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  if (req.path === '/api/auth') return next();
+  const auth = req.headers.authorization || '';
+  const m = /^Bearer\s+(.+)$/.exec(auth);
+  if (!m || !verifyAuthToken(m[1])) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+});
+
 // ==================== CC 常驻进程 ====================
+const SANDBOX_DIR = '/home/claude-user/chat-sandbox';
+const CC_PROJECT_ID = 'b5e5d83a-0c17-4421-a0e2-217519ed62fb';
+
+let _claudeUserIds = null;
+function getClaudeUserIds() {
+  if (_claudeUserIds) return _claudeUserIds;
+  try {
+    const st = fs.statSync(SANDBOX_DIR);
+    _claudeUserIds = [st.uid, st.gid];
+  } catch { _claudeUserIds = null; }
+  return _claudeUserIds;
+}
+
+async function writeAsClaudeUser(filePath, content) {
+  await fs.promises.writeFile(filePath, content ?? '', 'utf8');
+  const ids = getClaudeUserIds();
+  if (ids) { try { fs.chownSync(filePath, ids[0], ids[1]); } catch {} }
+}
+
+// 从 documents_cheng 拉所有 mode='cc' 的文档：
+//  - claude_md  → 写入 CLAUDE.md
+//  - file       → 写入工作目录下同名文件
+//  - system_prompt → 返回内容，由调用方传给 cc.setAppendSystemPrompt
+async function syncCCDocs() {
+  try {
+    const { data, error } = await supabase
+      .from('documents_cheng')
+      .select('doc_type, name, content')
+      .eq('mode', 'cc')
+      .eq('project_id', CC_PROJECT_ID);
+    if (error) throw error;
+
+    let appendSystemPrompt = null;
+    for (const d of data || []) {
+      try {
+        if (d.doc_type === 'claude_md') {
+          await writeAsClaudeUser(path.join(SANDBOX_DIR, 'CLAUDE.md'), d.content || '');
+          console.log('📄 同步 CLAUDE.md');
+        } else if (d.doc_type === 'system_prompt') {
+          appendSystemPrompt = d.content || null;
+          console.log(`📝 加载 system_prompt (${(d.content || '').length} 字)`);
+        } else if (d.doc_type === 'file' && d.name) {
+          const safeName = path.basename(d.name);
+          await writeAsClaudeUser(path.join(SANDBOX_DIR, safeName), d.content || '');
+          console.log(`📁 同步文件 ${safeName}`);
+        }
+      } catch (e) {
+        console.error(`同步 ${d.doc_type}/${d.name || ''} 失败:`, e.message);
+      }
+    }
+    return appendSystemPrompt;
+  } catch (e) {
+    console.error('文档同步失败:', e.message);
+    return null;
+  }
+}
+
 const savedCfg = loadCCConfig();
 const cc = new CCProcessManager({
-  cwd: '/home/claude-user/chat-sandbox',
+  cwd: SANDBOX_DIR,
   effort: savedCfg.effort || 'high',
   model: savedCfg.model || null,
 });
+// 启动前先把 documents_cheng 的内容拉下来落盘 + 注入 system_prompt
+const _initSysPrompt = await syncCCDocs();
+cc.setAppendSystemPrompt(_initSysPrompt);
 cc.start();
 
 let activeTurn = null; // { ws, conversationId, settings, silent }
@@ -112,7 +213,7 @@ function maybeFireSummary() {
   const { conversationId, summaryLength } = pendingSummary;
   pendingSummary = null;
   const prompt = `【系统任务·自动小结】\n请根据我们当前对话已发生的上下文，写一段约 ${summaryLength} 字的中文摘要，概括关键内容、重要决定、情感状态与未完成事项。除记忆标记外不要输出其他任何内容。格式必须是：\n[MEMORY:diary]在此填写摘要正文|tags:小结|importance:0.7[/MEMORY]`;
-  activeTurn = { ws: null, conversationId: null, silent: true, settings: null };
+  activeTurn = { ws: null, conversationId: null, silent: true, settings: null, tools: [] };
   try {
     cc.send(prompt);
     console.log('📝 已触发自动摘要');
@@ -144,11 +245,16 @@ cc.on('thinking_delta', (text) => {
 });
 
 cc.on('tool_use', ({ id, name, input }) => {
-  if (activeTurn) safeSend(activeTurn.ws, { type: 'tool_use', id, name, input });
+  if (!activeTurn) return;
+  activeTurn.tools.push({ id, name, input, result: undefined, isError: false });
+  safeSend(activeTurn.ws, { type: 'tool_use', id, name, input });
 });
 
 cc.on('tool_result', ({ tool_use_id, content, is_error }) => {
-  if (activeTurn) safeSend(activeTurn.ws, { type: 'tool_result', tool_use_id, content, is_error });
+  if (!activeTurn) return;
+  const t = activeTurn.tools.find(t => t.id === tool_use_id);
+  if (t) { t.result = content; t.isError = !!is_error; }
+  safeSend(activeTurn.ws, { type: 'tool_result', tool_use_id, content, is_error });
 });
 
 cc.on('turn_done', async ({ text, thinking, usage, is_error }) => {
@@ -175,6 +281,7 @@ cc.on('turn_done', async ({ text, thinking, usage, is_error }) => {
         role: 'assistant',
         content: clean,
         thinking: thinking || null,
+        tool_calls: turn.tools && turn.tools.length ? turn.tools : null,
         token_input: usage.input_tokens,
         token_output: usage.output_tokens,
       });
@@ -238,6 +345,9 @@ app.post('/api/cc/restart', async (req, res) => {
       opts.effort = req.body.effort;
       patch.effort = req.body.effort || null;
     }
+    // 重启前先把 documents_cheng 拉一遍：CLAUDE.md / 文件落盘，system_prompt 推到下次启动参数
+    const sysPrompt = await syncCCDocs();
+    cc.setAppendSystemPrompt(sysPrompt);
     await cc.restart(opts);
     if (Object.keys(patch).length) saveCCConfig(patch);
     res.json({ ok: true, session: cc.sessionId, model: cc.model, effort: cc.effort });
@@ -258,7 +368,7 @@ app.post('/api/conversations', async (req, res) => {
 app.get('/api/conversations/:id/messages', async (req, res) => {
   const { data, error } = await supabase
     .from('messages')
-    .select('id, role, content, thinking, token_input, token_output, created_at')
+    .select('id, role, content, thinking, tool_calls, images, token_input, token_output, created_at')
     .eq('conversation_id', req.params.id)
     .order('created_at', { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
@@ -430,7 +540,20 @@ function removeMemoryTags(text) {
 
 // ==================== WebSocket ====================
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // 鉴权：?token=xxx，无效就立刻断
+  let token = null;
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    token = url.searchParams.get('token');
+  } catch {}
+  if (!verifyAuthToken(token)) {
+    try { ws.send(JSON.stringify({ type: 'error', message: 'unauthorized' })); } catch {}
+    ws.close(4001, 'unauthorized');
+    console.log('WS 鉴权失败，已断开');
+    return;
+  }
+
   console.log('客户端已连接');
   safeSend(ws, { type: 'cc_status', status: cc.isRunning() ? 'ready' : 'down' });
 
@@ -457,8 +580,16 @@ wss.on('connection', (ws) => {
   ws.on('close', () => console.log('客户端断开'));
 });
 
+// 把前端传来的 dataURL 转成 Anthropic content-block 数组里的 image block
+function dataUrlToImageBlock(dataUrl) {
+  const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl || '');
+  if (!m) return null;
+  return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
+}
+
 async function handleChat(ws, msg) {
-  const { content, conversation_id, settings } = msg;
+  const { content, images, conversation_id, settings } = msg;
+  const imgs = Array.isArray(images) ? images.filter(Boolean) : [];
 
   if (!cc.isRunning()) {
     return safeSend(ws, { type: 'error', message: 'CC进程未运行，请点击重启' });
@@ -471,6 +602,7 @@ async function handleChat(ws, msg) {
     try {
       await supabase.from('messages').insert({
         conversation_id, role: 'user', content,
+        images: imgs.length ? imgs : null,
       });
       await supabase.from('conversations')
         .update({ updated_at: new Date().toISOString() })
@@ -479,10 +611,21 @@ async function handleChat(ws, msg) {
     } catch (e) { console.error('存用户消息失败:', e); }
   }
 
-  activeTurn = { ws, conversationId: conversation_id, settings };
+  activeTurn = { ws, conversationId: conversation_id, settings, tools: [] };
 
   try {
-    cc.send(maybeTimePrefix(content, conversation_id));
+    const prefixed = maybeTimePrefix(content, conversation_id);
+    let payload = prefixed;
+    if (imgs.length > 0) {
+      const blocks = [];
+      if (prefixed && prefixed.length) blocks.push({ type: 'text', text: prefixed });
+      for (const dataUrl of imgs) {
+        const b = dataUrlToImageBlock(dataUrl);
+        if (b) blocks.push(b);
+      }
+      payload = blocks;
+    }
+    cc.send(payload);
   } catch (err) {
     activeTurn = null;
     safeSend(ws, { type: 'error', message: err.message });

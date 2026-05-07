@@ -1163,6 +1163,58 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', fun
 
 var API = 'http://' + location.hostname + ':3001/api';
 var WS_URL = 'ws://' + location.hostname + ':3001';
+
+// ===== AUTH GATE =====
+var AUTH_TOKEN_KEY = 'memhome-auth-token';
+function getAuthToken() { return localStorage.getItem(AUTH_TOKEN_KEY) || ''; }
+function setAuthToken(t) { localStorage.setItem(AUTH_TOKEN_KEY, t); }
+function clearAuthToken() { localStorage.removeItem(AUTH_TOKEN_KEY); }
+
+var _origFetch = window.fetch.bind(window);
+window.fetch = function(url, opts) {
+  var u = typeof url === 'string' ? url : (url && url.url) || '';
+  var isApi = (u.indexOf(API) === 0) || u.indexOf('/api/') >= 0;
+  var isAuth = u.indexOf('/api/auth') >= 0;
+  if (isApi && !isAuth) {
+    opts = opts || {};
+    opts.headers = Object.assign({}, opts.headers || {}, {
+      Authorization: 'Bearer ' + getAuthToken(),
+    });
+  }
+  return _origFetch(url, opts).then(function(r) {
+    if (r.status === 401 && !isAuth) { clearAuthToken(); showAuthGate('登录已过期'); }
+    return r;
+  });
+};
+
+function showAuthGate(msg) {
+  var el = document.getElementById('auth-gate');
+  if (el) { if (msg) document.getElementById('auth-err').textContent = msg; return; }
+  el = document.createElement('div');
+  el.id = 'auth-gate';
+  el.style.cssText = 'position:fixed;inset:0;z-index:99999;background:#FBFAF6;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:"Noto Serif SC",Georgia,serif;color:#333;';
+  el.innerHTML = '<div style="font-size:13px;letter-spacing:0.22em;margin-bottom:20px;color:#666">请输入密码</div>'
+               + '<input id="auth-pwd" type="password" autocomplete="current-password" style="background:transparent;border:none;border-bottom:1px solid #DDD6CC;padding:8px 4px;font-size:14px;width:240px;text-align:center;outline:none;color:#333;font-family:inherit;" />'
+               + '<div id="auth-err" style="font-size:11px;color:#c0392b;height:16px;margin-top:10px;letter-spacing:0.05em">' + (msg || '') + '</div>'
+               + '<button id="auth-submit" style="margin-top:14px;background:#333;color:#FBFAF6;border:none;padding:9px 32px;border-radius:4px;letter-spacing:0.22em;font-size:11px;cursor:pointer;font-family:inherit">解锁</button>';
+  document.body.appendChild(el);
+  var submit = function() {
+    var pwd = document.getElementById('auth-pwd').value;
+    var errEl = document.getElementById('auth-err');
+    errEl.textContent = '';
+    _origFetch(API + '/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pwd }) })
+      .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, body: d }; }); })
+      .then(function(o) {
+        if (!o.ok || !o.body || !o.body.token) throw new Error((o.body && o.body.error) || '密码错误');
+        setAuthToken(o.body.token);
+        location.reload();
+      })
+      .catch(function(e) { errEl.textContent = e.message || '登录失败'; });
+  };
+  setTimeout(function() { var i = document.getElementById('auth-pwd'); if (i) i.focus(); }, 50);
+  document.getElementById('auth-submit').addEventListener('click', submit);
+  document.getElementById('auth-pwd').addEventListener('keydown', function(e) { if (e.key === 'Enter') submit(); });
+}
 var messagesEl = document.getElementById('messages'), inputEl = document.getElementById('input');
 var wsStatus = document.getElementById('attach-btn'), sendBtn = document.getElementById('send-btn');
 var stopBtn = document.getElementById('stop-btn');
@@ -1323,9 +1375,15 @@ window.addEventListener('resize', function() {
 
 // ===== WebSocket =====
 function connect() {
-  ws = new WebSocket(WS_URL);
+  var token = getAuthToken();
+  if (!token) { showAuthGate(); return; }
+  ws = new WebSocket(WS_URL + '?token=' + encodeURIComponent(token));
   ws.onopen = function() { wsStatus.classList.remove('error'); wsStatus.classList.add('connected'); };
-  ws.onclose = function() { wsStatus.classList.remove('connected'); wsStatus.classList.add('error'); setTimeout(connect, 3000); };
+  ws.onclose = function(e) {
+    wsStatus.classList.remove('connected'); wsStatus.classList.add('error');
+    if (e && e.code === 4001) { clearAuthToken(); showAuthGate('登录已过期'); return; }
+    setTimeout(connect, 3000);
+  };
   ws.onerror = function() { wsStatus.classList.remove('connected'); wsStatus.classList.add('error'); };
   ws.onmessage = function(e) {
     var msg = JSON.parse(e.data);
@@ -3167,19 +3225,23 @@ async function selectModel(value, name, status) {
 // ===== Init =====
 initSidebar();
 updateCharCounter(0);
-updateSendButton();
-updateClaudeName();
-connect();
-loadCurrentConversation();
-// 启动时查询 CC 状态 + 同步模型显示
-fetch(API + '/health').then(function(r) { return r.json(); }).then(function(d) {
-  if (wsStatus) {
-    wsStatus.classList.remove('connected', 'error');
-    if (d.cc_running) wsStatus.classList.add('connected');
-    else wsStatus.classList.add('error');
-  }
-  if (d.model) syncModelUI(d.model);
-}).catch(function() {});
+if (!getAuthToken()) {
+  showAuthGate();
+} else {
+  updateSendButton();
+  updateClaudeName();
+  connect();
+  loadCurrentConversation();
+  // 启动时查询 CC 状态 + 同步模型显示
+  fetch(API + '/health').then(function(r) { return r.json(); }).then(function(d) {
+    if (wsStatus) {
+      wsStatus.classList.remove('connected', 'error');
+      if (d.cc_running) wsStatus.classList.add('connected');
+      else wsStatus.classList.add('error');
+    }
+    if (d.model) syncModelUI(d.model);
+  }).catch(function() {});
+}
 </script>
 </body>
 </html>
