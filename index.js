@@ -48,9 +48,10 @@ app.use(express.static(__dirname, {
 }));
 
 // ==================== 鉴权 ====================
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
+let AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const JWT_TTL = process.env.JWT_TTL || '30d';
+const ENV_PATH = path.join(__dirname, '.env');
 
 if (!AUTH_PASSWORD) console.warn('⚠️  AUTH_PASSWORD 未配置，/api/auth 会一直返回 500');
 if (!JWT_SECRET) console.warn('⚠️  JWT_SECRET 未配置，鉴权将拒绝所有请求');
@@ -61,6 +62,25 @@ function signAuthToken() {
 function verifyAuthToken(token) {
   if (!token || !JWT_SECRET) return null;
   try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+}
+
+// 把 .env 里 AUTH_PASSWORD 那一行改写成新值；同时同步进程内变量
+function persistAuthPassword(newPassword) {
+  let raw = '';
+  try { raw = fs.readFileSync(ENV_PATH, 'utf-8'); } catch { raw = ''; }
+  const lines = raw.split(/\r?\n/);
+  let replaced = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^AUTH_PASSWORD\s*=/.test(lines[i])) {
+      lines[i] = `AUTH_PASSWORD=${newPassword}`;
+      replaced = true;
+      break;
+    }
+  }
+  if (!replaced) lines.push(`AUTH_PASSWORD=${newPassword}`);
+  fs.writeFileSync(ENV_PATH, lines.join('\n'), 'utf-8');
+  AUTH_PASSWORD = newPassword;
+  process.env.AUTH_PASSWORD = newPassword;
 }
 
 // 公开：登录换 token
@@ -85,6 +105,31 @@ app.use((req, res, next) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
   next();
+});
+
+// 已登录：改密码（需 Bearer，由上面的中间件保护）
+app.post('/api/auth/change-password', (req, res) => {
+  const { current_password, new_password } = req.body || {};
+  if (!AUTH_PASSWORD || !JWT_SECRET) {
+    return res.status(500).json({ error: 'server auth not configured' });
+  }
+  if (typeof current_password !== 'string' || current_password !== AUTH_PASSWORD) {
+    return res.status(401).json({ error: 'current password incorrect' });
+  }
+  if (typeof new_password !== 'string' || new_password.length < 4) {
+    return res.status(400).json({ error: 'new password too short' });
+  }
+  if (new_password === current_password) {
+    return res.status(400).json({ error: 'new password same as current' });
+  }
+  try {
+    persistAuthPassword(new_password);
+    console.log('🔑 AUTH_PASSWORD 已更新');
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('密码写入 .env 失败:', e);
+    res.status(500).json({ error: 'failed to persist new password: ' + e.message });
+  }
 });
 
 // ==================== CC 常驻进程 ====================
