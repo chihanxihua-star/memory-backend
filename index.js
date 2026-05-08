@@ -682,7 +682,7 @@ wssTerminal.on('connection', (ws, req) => {
   ws.on('message', (raw) => {
     try {
       const s = raw.toString();
-      // 前端可发 {type:'resize', cols, rows} JSON 控制 pty 尺寸
+      // 前端可发 {type:'resize', cols, rows} 控制 pty 尺寸；{type:'ping'} 当心跳
       if (s.length < 200 && s.startsWith('{') && s.includes('"type"')) {
         try {
           const o = JSON.parse(s);
@@ -690,6 +690,7 @@ wssTerminal.on('connection', (ws, req) => {
             term.resize(Number(o.cols), Number(o.rows));
             return;
           }
+          if (o.type === 'ping') return; // 心跳，吞掉别落到 pty
         } catch { /* 不是 JSON 控制消息，按普通输入处理 */ }
       }
       term.write(s);
