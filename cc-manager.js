@@ -38,6 +38,9 @@ export class CCProcessManager extends EventEmitter {
     this.appendSystemPrompt = options.appendSystemPrompt || null;
     this.failedResumeSids = new Set(); // 试过 --resume 但 CC 启不来的 sid，避免死循环
     this.lastResumeAttemptSid = null;  // 本轮 start() 用的 resume sid（成功后清零）
+    // 这一 session 最近一轮的累计 input tokens（input + cache_read + cache_creation）。
+    // 给 sessions_cheng.tokens_total 做实时同步用，restart 时也作为 session 结束前的最终值落地。
+    this.lastInputTokens = 0;
   }
 
   setAppendSystemPrompt(text) {
@@ -51,6 +54,7 @@ export class CCProcessManager extends EventEmitter {
     this.stopping = false;
     this.stdoutBuf = '';
     this.currentTurn = null;
+    this.lastInputTokens = 0;
 
     // 优先接 forge 给的新 session（marker 存在、JSONL 在 claude-user 的项目目录、且未被黑名单）
     const forge = readForgeMarker();
@@ -226,6 +230,11 @@ export class CCProcessManager extends EventEmitter {
           cache_creation_input_tokens: ev.usage?.cache_creation_input_tokens ?? null,
           total_cost_usd: ev.total_cost_usd ?? null,
         };
+        // 跟前端右上角同一个算法（input + cache_read + cache_creation）
+        const inFull = (usage.input_tokens || 0)
+                     + (usage.cache_read_input_tokens || 0)
+                     + (usage.cache_creation_input_tokens || 0);
+        if (inFull > 0) this.lastInputTokens = inFull;
         const turn = this.currentTurn || { text: ev.result || '', thinking: '' };
         this.currentTurn = null;
         this.emit('turn_done', {

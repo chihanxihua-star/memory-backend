@@ -505,9 +505,9 @@ cc.on('turn_done', async ({ text, thinking, usage, is_error }) => {
     safeSend(turn.ws, { type: 'done', usage, is_error });
   }
 
-  // sessions_cheng.turn_count +1（不阻塞主流程；单用户系统不担心并发竞争）
-  bumpSessionTurnCount(cc.sessionId).catch(e =>
-    console.warn('bump turn_count:', e?.message || e)
+  // sessions_cheng.turn_count +1 + 同步当前累计 input tokens（不阻塞主流程；单用户系统不担心并发竞争）
+  bumpSessionTurnAndTokens(cc.sessionId, cc.lastInputTokens).catch(e =>
+    console.warn('bump session row:', e?.message || e)
   );
 
   maybeFireSummary();
@@ -515,7 +515,7 @@ cc.on('turn_done', async ({ text, thinking, usage, is_error }) => {
   tryFireBark();
 });
 
-async function bumpSessionTurnCount(sessionId) {
+async function bumpSessionTurnAndTokens(sessionId, tokensTotal) {
   if (!sessionId) return;
   const { data: row, error: selErr } = await supabase
     .from('sessions_cheng')
@@ -523,9 +523,11 @@ async function bumpSessionTurnCount(sessionId) {
     .eq('session_id', sessionId)
     .maybeSingle();
   if (selErr || !row) return;
+  const patch = { turn_count: (row.turn_count || 0) + 1 };
+  if (typeof tokensTotal === 'number' && tokensTotal > 0) patch.tokens_total = tokensTotal;
   await supabase
     .from('sessions_cheng')
-    .update({ turn_count: (row.turn_count || 0) + 1 })
+    .update(patch)
     .eq('session_id', sessionId);
 }
 
@@ -710,6 +712,8 @@ function runForgeReload(jsonlPath) {
 }
 
 app.post('/api/cc/restart', async (req, res) => {
+  // 提前声明，让外层 catch 也能用 progressId 关掉 forge_pending
+  const progressId = 'forge-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
   try {
     const opts = {};
     const patch = {};
@@ -721,13 +725,15 @@ app.post('/api/cc/restart', async (req, res) => {
       opts.effort = req.body.effort;
       patch.effort = req.body.effort || null;
     }
-    // 模型切换进度通过 WebSocket "system" 消息广播，前端 ChatPanel 渲染为分隔线样式。
-    // 进度态不持久化（只在当前 ws 客户端可见）；最终的"小太阳醒啦"会写 messages 表。
+    // 模型切换进度通过 WebSocket "system" 消息广播。
+    // 同一个 progressId：先发 forge_pending（前端渲染思绪样式动画），
+    // 完成后再发 forge_done 把同一行替换成折叠的"小太阳醒啦"。中间不再切阶段文案。
     const progressBase = req.body?.conversation_id || null;
     const modelLabel = req.body?.model_label || opts.model || cc.model || null;
-    const emitProgress = (content) => {
-      broadcast({ type: 'system', kind: 'progress', content });
-    };
+    broadcast({
+      type: 'system', kind: 'forge_pending',
+      id: progressId, content: '正在唤醒小太阳…',
+    });
     // forge:true → 先让 CC 自己总结将被截掉的部分（CC 静默轮）→ 跑 forge → 写
     // <上次对话总结> 到 sandbox CLAUDE.md + PATCH sessions_cheng.summary → cc.restart()
     // 由 cc-manager.readForgeMarker 读 last_forge.json 用 --resume 接班
@@ -756,10 +762,8 @@ app.post('/api/cc/restart', async (req, res) => {
           console.warn('marker 重命名失败:', e.message);
         }
         console.log(`⏭️  跳过 forge（${skipReason}），直接重启`);
-        emitProgress('正在切换…');
       } else {
       // 1) CC 静默轮生成总结。失败/超时不致命 —— 没总结就继续走 forge，summary 留空
-      emitProgress('正在生成总结…');
       try {
         const summaryLength = req.body?.summaryLength ?? req.body?.summary_length ?? null;
         forgeSummary = await generateForgeSummary({ summaryLength });
@@ -769,13 +773,16 @@ app.post('/api/cc/restart', async (req, res) => {
         forgeSummary = null;
       }
       // 2) 跑 forge_reload.py
-      emitProgress('正在切换…');
       try {
         forgeResult = await runForgeReload(jsonl);
         console.log(`🔨 forge ${curSid} → ${forgeResult.sid}`);
         if (forgeResult.stderr) console.log(`   forge stderr: ${forgeResult.stderr.trim()}`);
       } catch (e) {
         console.error('forge_reload 失败:', e.message);
+        broadcast({
+          type: 'system', kind: 'forge_done',
+          id: progressId, content: '小太阳起床失败', detail: { error: e.message },
+        });
         return res.status(500).json({ error: 'forge 失败: ' + e.message });
       }
       // 3) 只在真截断时把总结落地 —— 整段保留的场景不写，避免误导新 CC
@@ -801,9 +808,16 @@ app.post('/api/cc/restart', async (req, res) => {
       }
       } // end else (forge 实际执行块；JSONL 不存在或 < 10KB 时跳过整段)
     }
+    // 重启前把 active session 的最终 tokens 落库（cc.lastInputTokens 是这一 session 最近一轮的累计）
+    if (cc.sessionId && cc.lastInputTokens > 0) {
+      try {
+        await supabase.from('sessions_cheng')
+          .update({ tokens_total: cc.lastInputTokens })
+          .eq('session_id', cc.sessionId);
+      } catch (e) { console.warn('finalize tokens_total:', e.message); }
+    }
     // 重启前先把 documents_cheng 拉一遍：CLAUDE.md / 文件落盘（&lt;上次对话总结&gt; 已被 syncCCDocs 保留），
     // system_prompt 推到下次启动参数
-    emitProgress('正在启动…');
     const sysPrompt = await syncCCDocs();
     cc.setAppendSystemPrompt(sysPrompt);
     await cc.restart(opts);
@@ -819,7 +833,7 @@ app.post('/api/cc/restart', async (req, res) => {
     };
     broadcast({
       type: 'system', kind: 'forge_done',
-      content: '小太阳醒啦', detail: forgeDoneDetail,
+      id: progressId, content: '小太阳醒啦', detail: forgeDoneDetail,
     });
     if (progressBase) {
       try {
@@ -842,7 +856,55 @@ app.post('/api/cc/restart', async (req, res) => {
       forge_retained_tokens: forgeResult?.retained_tokens ?? null,
       forge_truncated: forgeResult?.truncated ?? null,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    // 兜底关掉 forge_pending —— 否则前端会一直转
+    broadcast({
+      type: 'system', kind: 'forge_done',
+      id: progressId, content: '小太阳起床失败', detail: { error: err.message },
+    });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 失忆：清 forge marker → 用新 random UUID 启动 CC（无 --resume）。不走 forge / 不写总结。
+app.post('/api/cc/amnesia', async (req, res) => {
+  const progressId = 'amnesia-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+  try {
+    broadcast({
+      type: 'system', kind: 'forge_pending',
+      id: progressId, content: '正在失忆…',
+    });
+    // 1) 把 marker 改名失效，避免 cc-manager 接班
+    try {
+      if (fs.existsSync(FORGE_MARKER_PATH)) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        fs.renameSync(FORGE_MARKER_PATH, `${FORGE_MARKER_PATH}.amnesia.${stamp}`);
+      }
+    } catch (e) { console.warn('amnesia marker rename:', e.message); }
+    // 2) 落库当前 session 的 tokens，再走 cc.restart（cc-manager 看不到 marker，会走 randomUUID 分支）
+    if (cc.sessionId && cc.lastInputTokens > 0) {
+      try {
+        await supabase.from('sessions_cheng')
+          .update({ tokens_total: cc.lastInputTokens })
+          .eq('session_id', cc.sessionId);
+      } catch (e) { console.warn('amnesia tokens_total:', e.message); }
+    }
+    const sysPrompt = await syncCCDocs();
+    cc.setAppendSystemPrompt(sysPrompt);
+    await cc.restart();
+    broadcast({
+      type: 'system', kind: 'forge_done',
+      id: progressId, content: '失忆完成 · 干净新 session',
+      detail: { skipped: true, model: cc.model || null },
+    });
+    res.json({ ok: true, session: cc.sessionId });
+  } catch (err) {
+    broadcast({
+      type: 'system', kind: 'forge_done',
+      id: progressId, content: '失忆失败', detail: { error: err.message },
+    });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // forge-reload 配置读写：daemon 每轮 rescan 会热加载 config.json，所以无需 systemctl 重启
