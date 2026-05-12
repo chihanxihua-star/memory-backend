@@ -207,6 +207,45 @@ function extractSummaryBlock(text) {
   return m ? m[0] : null;
 }
 
+// <浮现> 区段：surfacing.js 写入用的同一个文件，失忆时跟着清空
+const FUXIAN_CLAUDE_MD = '/home/claude-user/.claude/CLAUDE.md';
+const FUXIAN_REGEX = /<浮现>[\s\S]*?<\/浮现>/;
+
+async function clearFuxianBlock() {
+  let existing;
+  try { existing = await fs.promises.readFile(FUXIAN_CLAUDE_MD, 'utf8'); }
+  catch { return; } // 文件不存在就什么都不用做
+  if (!FUXIAN_REGEX.test(existing)) return;
+  const next = existing.replace(FUXIAN_REGEX, '<浮现>\n</浮现>');
+  await writeAsClaudeUser(FUXIAN_CLAUDE_MD, next);
+}
+
+// JSONL 是否会被 forge 截断 —— 跟 forge_reload.py 的 estimate_tokens 算法对齐
+// （len(json.dumps(ev))//3，仅累计 user/assistant），返回累计 tokens
+function estimateJsonlTokens(jsonlPath) {
+  let total = 0;
+  try {
+    const raw = fs.readFileSync(jsonlPath, 'utf-8');
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (ev.type === 'user' || ev.type === 'assistant') {
+          total += Math.floor(JSON.stringify(ev).length / 3);
+        }
+      } catch {}
+    }
+  } catch {}
+  return total;
+}
+
+function readRetainTokens() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(FORGE_CONFIG_PATH, 'utf-8'));
+    return parseInt(cfg.retain_tokens) || 100000;
+  } catch { return 100000; }
+}
+
 async function writeForgeSummary(summaryText) {
   const filePath = path.join(SANDBOX_DIR, 'CLAUDE.md');
   let existing = '';
@@ -763,14 +802,23 @@ app.post('/api/cc/restart', async (req, res) => {
         }
         console.log(`⏭️  跳过 forge（${skipReason}），直接重启`);
       } else {
-      // 1) CC 静默轮生成总结。失败/超时不致命 —— 没总结就继续走 forge，summary 留空
-      try {
-        const summaryLength = req.body?.summaryLength ?? req.body?.summary_length ?? null;
-        forgeSummary = await generateForgeSummary({ summaryLength });
-        console.log(`📝 forge 总结生成 (${forgeSummary.length} 字)`);
-      } catch (e) {
-        console.warn('forge 总结跳过:', e.message);
-        forgeSummary = null;
+      // 1) CC 静默轮生成总结。只在 *将要截断* 时才花这一轮 —— 整段保留的话总结也用不上
+      //    （writeForgeSummary 也只在 truncated 时落地）。先估算 tokens 跟 retain 比。
+      const retainTokens = readRetainTokens();
+      const estTokens = estimateJsonlTokens(jsonl);
+      const willTruncate = estTokens > retainTokens;
+      console.log(`📏 forge 估算 ${estTokens} tokens vs retain ${retainTokens} → ${willTruncate ? '会截断' : '不截断'}`);
+      if (willTruncate) {
+        try {
+          const summaryLength = req.body?.summaryLength ?? req.body?.summary_length ?? null;
+          forgeSummary = await generateForgeSummary({ summaryLength });
+          console.log(`📝 forge 总结生成 (${forgeSummary.length} 字)`);
+        } catch (e) {
+          console.warn('forge 总结跳过:', e.message);
+          forgeSummary = null;
+        }
+      } else {
+        console.log('⏭️  整段保留场景，跳过总结生成');
       }
       // 2) 跑 forge_reload.py
       try {
@@ -881,7 +929,12 @@ app.post('/api/cc/amnesia', async (req, res) => {
         fs.renameSync(FORGE_MARKER_PATH, `${FORGE_MARKER_PATH}.amnesia.${stamp}`);
       }
     } catch (e) { console.warn('amnesia marker rename:', e.message); }
-    // 2) 落库当前 session 的 tokens，再走 cc.restart（cc-manager 看不到 marker，会走 randomUUID 分支）
+    // 2) 清空两块注入区，否则新 session 启动后 CC 还是会读到旧上下文：
+    //    - sandbox/CLAUDE.md 的 <上次对话总结>（forge 写进来的）
+    //    - ~/.claude/CLAUDE.md 的 <浮现>（surfacing.js 写进来的）
+    try { await writeForgeSummary(''); } catch (e) { console.warn('amnesia clear 上次对话总结:', e.message); }
+    try { await clearFuxianBlock(); } catch (e) { console.warn('amnesia clear 浮现:', e.message); }
+    // 3) 落库当前 session 的 tokens，再走 cc.restart（cc-manager 看不到 marker，会走 randomUUID 分支）
     if (cc.sessionId && cc.lastInputTokens > 0) {
       try {
         await supabase.from('sessions_cheng')
