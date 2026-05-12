@@ -1,6 +1,26 @@
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
+import fs from 'fs';
+import path from 'path';
+import { supabase } from './memory.js';
+
+const FORGE_MARKER = '/root/forge-reload/last_forge.json';
+// CC 跑在 claude-user 下、cwd=/home/claude-user/chat-sandbox，
+// 所以 session JSONL 必须落在这里 claude-user 才认。
+const EXPECTED_PROJECT_DIR = '/home/claude-user/.claude/projects/-home-claude-user-chat-sandbox';
+
+// 检查 forge 是否给我们准备好接班的 session；返回 {sid, jsonl} 或 null
+// 严格校验 JSONL 在 claude-user 的项目目录下 —— 否则 --resume 注定失败
+function readForgeMarker() {
+  try {
+    const m = JSON.parse(fs.readFileSync(FORGE_MARKER, 'utf8'));
+    if (!m?.new_session) return null;
+    const expected = path.join(EXPECTED_PROJECT_DIR, m.new_session + '.jsonl');
+    if (!fs.existsSync(expected)) return null;
+    return { sid: m.new_session, jsonl: expected };
+  } catch { return null; }
+}
 
 export class CCProcessManager extends EventEmitter {
   constructor(options = {}) {
@@ -15,6 +35,13 @@ export class CCProcessManager extends EventEmitter {
     this.restartTimer = null;
     this.model = options.model || null; // 默认跟随 CC 用户配置
     this.effort = options.effort || null; // low / medium / high / xhigh / max
+    this.appendSystemPrompt = options.appendSystemPrompt || null;
+    this.failedResumeSids = new Set(); // 试过 --resume 但 CC 启不来的 sid，避免死循环
+    this.lastResumeAttemptSid = null;  // 本轮 start() 用的 resume sid（成功后清零）
+  }
+
+  setAppendSystemPrompt(text) {
+    this.appendSystemPrompt = text || null;
   }
 
   start() {
@@ -22,9 +49,21 @@ export class CCProcessManager extends EventEmitter {
     if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
 
     this.stopping = false;
-    this.sessionId = randomUUID();
     this.stdoutBuf = '';
     this.currentTurn = null;
+
+    // 优先接 forge 给的新 session（marker 存在、JSONL 在 claude-user 的项目目录、且未被黑名单）
+    const forge = readForgeMarker();
+    const resuming = forge !== null && !this.failedResumeSids.has(forge.sid);
+    if (resuming) {
+      this.sessionId = forge.sid;
+      this.lastResumeAttemptSid = forge.sid;
+      this.resumedFromForge = true;
+    } else {
+      this.sessionId = randomUUID();
+      this.lastResumeAttemptSid = null;
+      this.resumedFromForge = false;
+    }
 
     const claudeArgs = [
       '--print',
@@ -34,12 +73,25 @@ export class CCProcessManager extends EventEmitter {
       '--include-partial-messages',
       '--dangerously-skip-permissions',
       '--allowedTools', 'mcp__supabase__*',
-      '--session-id', this.sessionId,
     ];
+    if (resuming) {
+      claudeArgs.push('--resume', this.sessionId);
+    } else {
+      claudeArgs.push('--session-id', this.sessionId);
+    }
     if (this.model) claudeArgs.push('--model', this.model);
     if (this.effort) claudeArgs.push('--effort', this.effort);
+    if (this.appendSystemPrompt) claudeArgs.push('--append-system-prompt', this.appendSystemPrompt);
 
-    console.log(`🚀 启动CC (session=${this.sessionId}${this.model ? ', model=' + this.model : ''}${this.effort ? ', effort=' + this.effort : ''})`);
+    console.log(`${resuming ? '🔁 接 forge session' : '🚀 启动CC'} (session=${this.sessionId}${this.model ? ', model=' + this.model : ''}${this.effort ? ', effort=' + this.effort : ''}${this.appendSystemPrompt ? ', sys-prompt=' + this.appendSystemPrompt.length + 'ch' : ''})`);
+
+    // 普通重启：把任何遗留的 active 改成 ended，再插一行新的 active（forged_from_session=null）
+    // forge 接班：forge_reload.py 已经写过表，跳过。
+    if (!resuming) {
+      this.recordSessionStart(this.sessionId).catch(e =>
+        console.error('recordSessionStart failed:', e?.message || e)
+      );
+    }
     const proc = spawn('sudo', ['-u', 'claude-user', '-H', '--preserve-env=PATH', 'claude', ...claudeArgs], {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.cwd,
@@ -67,6 +119,8 @@ export class CCProcessManager extends EventEmitter {
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
+      // CC 吐出第一行 JSON = 进程起来了，--resume 没出问题；清空 attempt 避免后续崩溃误拉黑
+      if (this.lastResumeAttemptSid) this.lastResumeAttemptSid = null;
       try {
         this.handleEvent(JSON.parse(trimmed));
       } catch {
@@ -77,6 +131,12 @@ export class CCProcessManager extends EventEmitter {
 
   handleExit(code, signal) {
     console.log(`CC 退出 code=${code} signal=${signal}`);
+    // 如果这次启动用了 --resume 又异常退出，把该 sid 拉黑，下次 start() 不再试
+    if (code !== 0 && this.lastResumeAttemptSid) {
+      console.warn(`⚠️  --resume ${this.lastResumeAttemptSid} 启动失败，加入黑名单`);
+      this.failedResumeSids.add(this.lastResumeAttemptSid);
+    }
+    this.lastResumeAttemptSid = null;
     this.proc = null;
     if (this.currentTurn) {
       this.emit('turn_error', new Error(`CC 进程中途退出 (code=${code})`));
@@ -186,9 +246,11 @@ export class CCProcessManager extends EventEmitter {
   send(content) {
     if (!this.proc) throw new Error('CC进程未运行');
     if (this.currentTurn) throw new Error('CC 正在处理上一轮请求');
+    // content 可以是字符串，或 Anthropic content-block 数组（用于带图片的消息）
+    const payload = typeof content === 'string' || Array.isArray(content) ? content : String(content);
     const msg = {
       type: 'user',
-      message: { role: 'user', content: String(content) },
+      message: { role: 'user', content: payload },
     };
     this.proc.stdin.write(JSON.stringify(msg) + '\n');
   }
@@ -228,4 +290,26 @@ export class CCProcessManager extends EventEmitter {
 
   isRunning() { return this.proc !== null; }
   isBusy() { return this.currentTurn !== null; }
+
+  // 把所有 active session 改 ended（兜底），再插入一行新 active
+  async recordSessionStart(sessionId) {
+    const nowIso = new Date().toISOString();
+    const { error: upErr } = await supabase
+      .from('sessions_cheng')
+      .update({ status: 'ended', ended_at: nowIso })
+      .eq('status', 'active');
+    if (upErr) console.warn('mark active->ended:', upErr.message);
+
+    const { error: insErr } = await supabase
+      .from('sessions_cheng')
+      .insert({
+        session_id: sessionId,
+        started_at: nowIso,
+        status: 'active',
+        turn_count: 0,
+        forged_from_session: null,
+        model: this.model || null,
+      });
+    if (insErr) console.warn('insert session row:', insErr.message);
+  }
 }
