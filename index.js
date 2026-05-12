@@ -1046,6 +1046,73 @@ app.delete('/api/messages/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// JSONL 全 session 搜索：遍历所有 session 文件，在 user/assistant 文本里找关键词
+function extractSearchableText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const c of content) {
+    if (!c || typeof c !== 'object') continue;
+    if (c.type === 'text' && typeof c.text === 'string') parts.push(c.text);
+    else if (c.type === 'thinking' && typeof c.thinking === 'string') parts.push(c.thinking);
+  }
+  return parts.join('\n');
+}
+
+app.get('/api/search/messages', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) {
+    return res.json({ current_session_id: cc.sessionId || null, total: 0, truncated: false, results: [] });
+  }
+  const qLower = q.toLowerCase();
+  const PREVIEW_PAD = 50;
+  const MAX_RESULTS = 200;
+
+  let files;
+  try {
+    files = (await fs.promises.readdir(CC_JSONL_DIR)).filter(f => f.endsWith('.jsonl'));
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to read jsonl dir: ' + e.message });
+  }
+
+  const results = [];
+  for (const file of files) {
+    const sessionId = file.replace(/\.jsonl$/, '');
+    let raw;
+    try { raw = await fs.promises.readFile(path.join(CC_JSONL_DIR, file), 'utf-8'); }
+    catch { continue; }
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch { continue; }
+      if (ev.type !== 'user' && ev.type !== 'assistant') continue;
+      if (ev.isSidechain) continue;
+      const text = extractSearchableText(ev.message?.content);
+      if (!text) continue;
+      const idx = text.toLowerCase().indexOf(qLower);
+      if (idx === -1) continue;
+      const start = Math.max(0, idx - PREVIEW_PAD);
+      const end = Math.min(text.length, idx + q.length + PREVIEW_PAD);
+      const preview = (start > 0 ? '…' : '') + text.slice(start, end).replace(/\s+/g, ' ') + (end < text.length ? '…' : '');
+      results.push({
+        session_id: sessionId,
+        type: ev.type,
+        timestamp: ev.timestamp || null,
+        preview,
+      });
+    }
+  }
+
+  results.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
+  const total = results.length;
+  res.json({
+    current_session_id: cc.sessionId || null,
+    total,
+    truncated: total > MAX_RESULTS,
+    results: results.slice(0, MAX_RESULTS),
+  });
+});
+
 // Token 统计
 app.get('/api/stats/tokens', async (req, res) => {
   try {
