@@ -7,7 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import jwt from 'jsonwebtoken';
-import { spawn as spawnProc } from 'child_process';
+import { spawn as spawnProc, spawnSync } from 'child_process';
 import * as pty from 'node-pty';
 import { supabase, writeMemory, searchMemory, getDefaultProject } from './memory.js';
 import { CCProcessManager } from './cc-manager.js';
@@ -471,7 +471,7 @@ cc.on('tool_result', ({ tool_use_id, content, is_error }) => {
   safeSend(activeTurn.ws, { type: 'tool_result', tool_use_id, content, is_error });
 });
 
-cc.on('turn_done', async ({ text, thinking, usage, is_error }) => {
+cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, is_error }) => {
   const turn = activeTurn;
   activeTurn = null;
   if (!turn) return;
@@ -526,14 +526,30 @@ cc.on('turn_done', async ({ text, thinking, usage, is_error }) => {
 
   if (turn.conversationId && clean && !turn.silent) {
     try {
+      // token_input 存的是"等效 input"——按缓存类型加权后的费率等价 token 数：
+      //   input_tokens         × 1.0   （未缓存，全价）
+      //   cache_read_input     × 0.1   （命中，省 90%）
+      //   cache_creation_input × 2.0   （写入 1h 缓存，押金 2 倍；若切回 5min 改成 1.25）
+      // 前端 turnIncrement = token_input + token_output 直接反映这轮"等效成本"，
+      // 命中缓存的轮次累计涨得慢，符合实际计费。
+      const equivInput = Math.round(
+        (usage.input_tokens || 0) * 1.0
+        + (usage.cache_read_input_tokens || 0) * 0.1
+        + (usage.cache_creation_input_tokens || 0) * 2.0
+      );
       await supabase.from('messages').insert({
         conversation_id: turn.conversationId,
         role: 'assistant',
         content: clean,
         thinking: thinking || null,
         tool_calls: turn.tools && turn.tools.length ? turn.tools : null,
-        token_input: usage.input_tokens,
+        token_input: equivInput,
         token_output: usage.output_tokens,
+        cache_detail: {
+          input: usage.input_tokens || 0,
+          cache_read: usage.cache_read_input_tokens || 0,
+          cache_creation: usage.cache_creation_input_tokens || 0,
+        },
       });
       await checkContextThreshold(turn.conversationId, turn.settings);
     } catch (e) { console.error('存消息失败:', e); }
@@ -541,11 +557,11 @@ cc.on('turn_done', async ({ text, thinking, usage, is_error }) => {
 
   if (!turn.silent) {
     if (text !== clean) safeSend(turn.ws, { type: 'clean', text: clean });
-    safeSend(turn.ws, { type: 'done', usage, is_error });
+    safeSend(turn.ws, { type: 'done', usage, contextTokens, systemTokens, is_error });
   }
 
-  // sessions_cheng.turn_count +1 + 同步当前累计 input tokens（不阻塞主流程；单用户系统不担心并发竞争）
-  bumpSessionTurnAndTokens(cc.sessionId, cc.lastInputTokens).catch(e =>
+  // sessions_cheng.turn_count +1 + 同步当前实际上下文 tokens（不阻塞主流程；单用户系统不担心并发竞争）
+  bumpSessionTurnAndTokens(cc.sessionId, contextTokens || cc.lastInputTokens).catch(e =>
     console.warn('bump session row:', e?.message || e)
   );
 
@@ -697,6 +713,89 @@ async function generateForgeSummary({ summaryLength }) {
       if (settled) return; settled = true; cleanup();
       activeTurn = null;
       reject(new Error('总结超时 (120s)'));
+    }, 120000);
+    cc.on('turn_done', onDone);
+    cc.on('turn_error', onErr);
+    try {
+      cc.send(prompt);
+    } catch (e) {
+      settled = true; cleanup();
+      activeTurn = null;
+      reject(e);
+    }
+  });
+}
+
+// forge 后把对话原文喂给新 CC（silent turn），让新进程在 API 层面看到完整上下文。
+// < 100k：全部原文；> 100k：最近 ~100k 的原文（被截掉的部分靠 CLAUDE.md 摘要补充）
+async function injectConversationContext(conversationId, { withThinking = true } = {}) {
+  if (!conversationId || !cc.isRunning()) return;
+  if (activeTurn) { console.warn('CC 忙碌，跳过对话注入'); return; }
+
+  const { data: msgs } = await supabase
+    .from('messages')
+    .select('role, content, thinking')
+    .eq('conversation_id', conversationId)
+    .neq('role', 'system')
+    .order('created_at', { ascending: true });
+
+  if (!msgs || msgs.length === 0) return;
+
+  const filtered = msgs.filter(m => m.content);
+  const lines = filtered.map(m => {
+    const label = m.role === 'user' ? '小茉莉' : '澄';
+    let line = `[${label}] ${m.content}`;
+    if (withThinking && m.thinking) line = `[${label}·思考] ${m.thinking}\n[${label}] ${m.content}`;
+    return line;
+  });
+
+  // 从尾部累加，保留 ~100k tokens 以内
+  const TOKEN_CAP = 90000;
+  let acc = 0;
+  let startIdx = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    acc += Math.ceil(lines[i].length / 3);
+    if (acc > TOKEN_CAP) break;
+    startIdx = i;
+  }
+  const transcript = lines.slice(startIdx).join('\n\n');
+  if (!transcript.trim()) return null;
+
+  const kept = filtered.slice(startIdx);
+  const msgCount = kept.length;
+  const estTokens = Math.ceil(transcript.length / 3);
+  const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
+  const thinkingTokens = withThinking
+    ? kept.reduce((s, m) => m.thinking ? s + Math.ceil(m.thinking.length / 3) : s, 0)
+    : 0;
+
+  const prompt = `【系统任务·对话上下文注入】\n` +
+    `以下是你和小茉莉之前的对话原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
+    `仅输出"OK"两个字，不要输出其他任何内容。\n\n` +
+    transcript;
+
+  activeTurn = { ws: null, conversationId: null, silent: true, settings: null, tools: [] };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      cc.off('turn_done', onDone);
+      cc.off('turn_error', onErr);
+      clearTimeout(timer);
+    };
+    const onDone = () => {
+      if (settled) return; settled = true; cleanup();
+      activeTurn = null;
+      resolve({ msgCount, estTokens, thinkingCount, thinkingTokens });
+    };
+    const onErr = (err) => {
+      if (settled) return; settled = true; cleanup();
+      activeTurn = null;
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return; settled = true; cleanup();
+      activeTurn = null;
+      reject(new Error('对话注入超时 (120s)'));
     }, 120000);
     cc.on('turn_done', onDone);
     cc.on('turn_error', onErr);
@@ -872,12 +971,15 @@ app.post('/api/cc/restart', async (req, res) => {
     if (Object.keys(patch).length) saveCCConfig(patch);
 
     // 最终态：广播 "小太阳醒啦" + detail，给前端做折叠展开；同时持久化到 messages 表
+    const injectConvId = req.body?.conversation_id;
     const forgeDoneDetail = {
       model: modelLabel,
       forge_truncated: forgeResult?.truncated ?? false,
       forge_total_tokens: forgeResult?.total_tokens ?? null,
       forge_retained_tokens: forgeResult?.retained_tokens ?? null,
       skipped: !forgeResult && req.body?.forge === true,
+      inject_ready: !!(injectConvId && req.body?.forge),
+      inject_conversation_id: injectConvId || null,
     };
     broadcast({
       type: 'system', kind: 'forge_done',
@@ -889,6 +991,7 @@ app.post('/api/cc/restart', async (req, res) => {
           conversation_id: progressBase,
           role: 'system',
           content: '小太阳醒啦',
+          tool_calls: forgeDoneDetail,
         });
       } catch (e) { console.warn('小太阳醒啦 持久化失败:', e.message); }
     }
@@ -960,6 +1063,344 @@ app.post('/api/cc/amnesia', async (req, res) => {
   }
 });
 
+// 对话注入：forge/模型切换后，用户选择是否带思考链注入旧对话
+app.post('/api/cc/inject', async (req, res) => {
+  try {
+    const { conversation_id, withThinking } = req.body || {};
+    if (!conversation_id) return res.status(400).json({ error: '缺少 conversation_id' });
+    const info = await injectConversationContext(conversation_id, { withThinking: withThinking !== false });
+    if (!info) return res.json({ ok: true, injected: false });
+    console.log(`📋 对话原文已注入新 CC（${info.msgCount} 条, ~${info.estTokens} tokens, ${info.thinkingCount} 思绪, thinking=${withThinking !== false}）`);
+    // 更新 DB 里最近一条"小太阳醒啦"消息的 tool_calls，把注入结果持久化
+    if (conversation_id) {
+      try {
+        const { data: rows } = await supabase.from('messages')
+          .select('id, tool_calls')
+          .eq('conversation_id', conversation_id)
+          .eq('role', 'system')
+          .like('content', '%小太阳醒啦%')
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (rows && rows[0]) {
+          const merged = {
+            ...(rows[0].tool_calls || {}),
+            inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
+            inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+          };
+          await supabase.from('messages').update({ tool_calls: merged }).eq('id', rows[0].id);
+        }
+      } catch (e) { console.warn('inject detail 持久化失败:', e.message); }
+    }
+    const injectSummaryConv = `已浮想 ${info.msgCount} 个回忆` +
+      (info.thinkingCount > 0 ? ` · ${info.thinkingCount} 个思绪` : '');
+    broadcast({
+      type: 'system', kind: 'inject_done',
+      content: injectSummaryConv,
+      detail: {
+        inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
+        inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+        withThinking: withThinking !== false,
+      },
+    });
+    res.json({
+      ok: true, injected: true,
+      msgCount: info.msgCount, estTokens: info.estTokens,
+      thinkingCount: info.thinkingCount, thinkingTokens: info.thinkingTokens,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 从 JSONL 读取某个 session 的 user/assistant 消息
+// 一个 turn 可能有多条 assistant 事件（thinking / text / tool_use 分开），需要合并
+function readSessionMessages(sessionId) {
+  const jsonlPath = path.join(CC_JSONL_DIR, `${sessionId}.jsonl`);
+  if (!fs.existsSync(jsonlPath)) return null;
+  const raw = fs.readFileSync(jsonlPath, 'utf-8');
+  const messages = [];
+  let pendingAssistant = null;
+
+  const flushAssistant = () => {
+    if (!pendingAssistant) return;
+    // 去掉 ---bubble--- 标记
+    pendingAssistant.content = pendingAssistant.content.replace(/---bubble---/g, '').replace(/\n{3,}/g, '\n\n').trim();
+    if (pendingAssistant.content) messages.push(pendingAssistant);
+    pendingAssistant = null;
+  };
+
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const ev = JSON.parse(line);
+      if (ev.type === 'user') {
+        const content = ev.message?.content;
+        // tool_result 是 assistant tool_use 的回应，属于同一 turn，不 flush
+        const isToolResult = Array.isArray(content) && content.some(b => b.type === 'tool_result');
+        if (!isToolResult) {
+          flushAssistant();
+          const text = typeof content === 'string' ? content
+            : Array.isArray(content) ? content.filter(b => b.type === 'text').map(b => b.text || '').join('\n')
+            : '';
+          if (text.trim()) messages.push({ role: 'user', content: text.trim(), thinking: null });
+        }
+      } else if (ev.type === 'assistant') {
+        if (!pendingAssistant) pendingAssistant = { role: 'assistant', content: '', thinking: null };
+        const blocks = ev.message?.content;
+        if (Array.isArray(blocks)) {
+          for (const b of blocks) {
+            if (b.type === 'text' && b.text) pendingAssistant.content += (pendingAssistant.content ? '\n' : '') + b.text;
+            else if (b.type === 'thinking' && b.thinking) {
+              pendingAssistant.thinking = (pendingAssistant.thinking || '') + b.thinking;
+            }
+          }
+        }
+      }
+    } catch { /* skip */ }
+  }
+  flushAssistant();
+  return messages;
+}
+
+// 读取旧 session 的聊天记录（给前端预览用）
+app.get('/api/cc/session-messages/:sid', (req, res) => {
+  try {
+    const msgs = readSessionMessages(req.params.sid);
+    if (!msgs) return res.status(404).json({ error: 'JSONL 不存在' });
+    res.json({ messages: msgs, count: msgs.length, thinkingCount: msgs.filter(m => m.thinking).length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 从旧 session 的 JSONL 注入对话到当前 CC
+async function injectSessionContext(sessionId, { withThinking = true } = {}) {
+  if (!cc.isRunning()) return null;
+  if (activeTurn) { console.warn('CC 忙碌，跳过 session 注入'); return null; }
+  const msgs = readSessionMessages(sessionId);
+  if (!msgs || msgs.length === 0) return null;
+
+  const lines = msgs.map(m => {
+    const label = m.role === 'user' ? '小茉莉' : '澄';
+    let line = `[${label}] ${m.content}`;
+    if (withThinking && m.thinking) line = `[${label}·思考] ${m.thinking}\n[${label}] ${m.content}`;
+    return line;
+  });
+
+  const TOKEN_CAP = 90000;
+  let acc = 0, startIdx = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    acc += Math.ceil(lines[i].length / 3);
+    if (acc > TOKEN_CAP) break;
+    startIdx = i;
+  }
+  const transcript = lines.slice(startIdx).join('\n\n');
+  if (!transcript.trim()) return null;
+
+  const kept = msgs.slice(startIdx);
+  const msgCount = kept.length;
+  const estTokens = Math.ceil(transcript.length / 3);
+  const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
+  const thinkingTokens = withThinking
+    ? kept.reduce((s, m) => m.thinking ? s + Math.ceil(m.thinking.length / 3) : s, 0)
+    : 0;
+
+  const prompt = `【系统任务·对话上下文注入】\n` +
+    `以下是你和小茉莉之前的对话原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
+    `仅输出"OK"两个字，不要输出其他任何内容。\n\n` +
+    transcript;
+
+  activeTurn = { ws: null, conversationId: null, silent: true, settings: null, tools: [] };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => { cc.off('turn_done', onDone); cc.off('turn_error', onErr); clearTimeout(timer); };
+    const onDone = () => { if (settled) return; settled = true; cleanup(); activeTurn = null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens }); };
+    const onErr = (err) => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(err); };
+    const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('session 注入超时')); }, 120000);
+    cc.on('turn_done', onDone);
+    cc.on('turn_error', onErr);
+    try { cc.send(prompt); } catch (e) { if (!settled) { settled = true; cleanup(); activeTurn = null; reject(e); } }
+  });
+}
+
+app.post('/api/cc/inject-session', async (req, res) => {
+  try {
+    const { session_id, withThinking, conversation_id } = req.body || {};
+    if (!session_id) return res.status(400).json({ error: '缺少 session_id' });
+    const info = await injectSessionContext(session_id, { withThinking: withThinking !== false });
+    if (!info) return res.json({ ok: true, injected: false });
+    console.log(`📋 旧 session 已注入（${info.msgCount} 条, ~${info.estTokens} tokens, ${info.thinkingCount} 思绪）`);
+    const injectSummary = `已浮想 ${info.msgCount} 个回忆` +
+      (info.thinkingCount > 0 ? ` · ${info.thinkingCount} 个思绪` : '');
+    const injectDetail = {
+      inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
+      inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+      withThinking: withThinking !== false, from_session: session_id,
+    };
+    broadcast({
+      type: 'system', kind: 'inject_done',
+      content: injectSummary,
+      detail: injectDetail,
+    });
+    if (conversation_id) {
+      try {
+        await supabase.from('messages').insert({
+          conversation_id,
+          role: 'system',
+          content: injectSummary,
+          tool_calls: injectDetail,
+        });
+      } catch (e) { console.warn('inject_done 持久化失败:', e.message); }
+    }
+    res.json({
+      ok: true, injected: true,
+      msgCount: info.msgCount, estTokens: info.estTokens,
+      thinkingCount: info.thinkingCount, thinkingTokens: info.thinkingTokens,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 解析 Claude.ai 导出 JSON（单条对话对象，含 chat_messages）
+function parseClaudeAiExport(data) {
+  const msgs = [];
+  const chatMessages = data.chat_messages || data.messages || [];
+  for (const m of chatMessages) {
+    const role = (m.sender === 'human' || m.role === 'human' || m.role === 'user') ? 'user' : 'assistant';
+    let text = '', thinking = null;
+    const blocks = Array.isArray(m.content) ? m.content : Array.isArray(m.contentBlocks) ? m.contentBlocks : null;
+    if (blocks) {
+      text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('\n').trim();
+      const thinkBlocks = blocks.filter(b => b.type === 'thinking').map(b => b.thinking || '').join('\n').trim();
+      if (thinkBlocks) thinking = thinkBlocks;
+    } else if (typeof m.text === 'string' && m.text.trim()) {
+      text = m.text.trim();
+    } else if (typeof m.content === 'string') {
+      text = m.content.trim();
+    }
+    if (text) msgs.push({ role, content: text, thinking });
+  }
+  return msgs;
+}
+
+// 浮想外部对话（预解析的 messages 数组）到当前 CC
+async function injectExternalContext(messages, { withThinking = true, thinkingPct = 100, tokenCap = 90000, summary = '' } = {}) {
+  if (!cc.isRunning()) return null;
+  if (activeTurn) { console.warn('CC 忙碌，跳过外部浮想'); return null; }
+  if (!messages || messages.length === 0) return null;
+
+  const pct = Math.max(0, Math.min(100, thinkingPct)) / 100;
+  const cap = Math.max(1000, tokenCap || 90000);
+  const estimateTokens = (s) => {
+    let t = 0;
+    for (let i = 0; i < s.length; i++) t += s.charCodeAt(i) > 0x7f ? 1.5 : 0.25;
+    return Math.ceil(t);
+  };
+
+  // Uniform sampling: at pct%, include ~pct fraction of thinking messages
+  const thinkingSet = new Set();
+  if (withThinking && pct > 0) {
+    let thinkingSeen = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].thinking) {
+        thinkingSeen++;
+        if (Math.ceil(thinkingSeen * pct) > Math.ceil((thinkingSeen - 1) * pct)) {
+          thinkingSet.add(i);
+        }
+      }
+    }
+  }
+
+  const lines = messages.map((m, idx) => {
+    const label = m.role === 'user' ? '小茉莉' : '澄';
+    let line = `[${label}] ${m.content}`;
+    if (thinkingSet.has(idx)) {
+      line = `[${label}·思考] ${m.thinking}\n[${label}] ${m.content}`;
+    }
+    return line;
+  });
+
+  let acc = 0, startIdx = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    acc += estimateTokens(lines[i]);
+    if (acc > cap) break;
+    startIdx = i;
+  }
+  const transcript = lines.slice(startIdx).join('\n\n');
+  if (!transcript.trim()) return null;
+
+  const kept = messages.slice(startIdx);
+  const msgCount = kept.length;
+  const estTokens = estimateTokens(transcript);
+  const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
+  const thinkingTokens = withThinking
+    ? kept.reduce((s, m) => m.thinking ? s + Math.ceil(m.thinking.length / 3) : s, 0)
+    : 0;
+
+  const summaryBlock = summary ? `【前情摘要】\n${summary}\n\n【以下是最近的对话原文】\n\n` : '';
+  const prompt = `【系统任务·对话上下文注入】\n` +
+    `以下是你和小茉莉之前在别处的对话${summary ? '摘要与' : ''}原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
+    `仅输出"OK"两个字，不要输出其他任何内容。\n\n` +
+    summaryBlock + transcript;
+
+  activeTurn = { ws: null, conversationId: null, silent: true, settings: null, tools: [] };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => { cc.off('turn_done', onDone); cc.off('turn_error', onErr); clearTimeout(timer); };
+    const onDone = () => { if (settled) return; settled = true; cleanup(); activeTurn = null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens }); };
+    const onErr = (err) => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(err); };
+    const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('外部浮想超时')); }, 120000);
+    cc.on('turn_done', onDone);
+    cc.on('turn_error', onErr);
+    try { cc.send(prompt); } catch (e) { if (!settled) { settled = true; cleanup(); activeTurn = null; reject(e); } }
+  });
+}
+
+app.post('/api/cc/inject-external', async (req, res) => {
+  try {
+    const { data, withThinking, thinkingPct, tokenCap, summary, conversation_id } = req.body || {};
+    if (!data) return res.status(400).json({ error: '缺少 data (Claude.ai JSON)' });
+    const messages = parseClaudeAiExport(data);
+    if (messages.length === 0) return res.status(400).json({ error: '未解析到有效消息' });
+
+    const info = await injectExternalContext(messages, { withThinking: withThinking !== false, thinkingPct: thinkingPct ?? 100, tokenCap: tokenCap || 90000, summary: summary || '' });
+    if (!info) return res.json({ ok: true, injected: false });
+    console.log(`📋 外部对话已浮想（${info.msgCount} 条, ~${info.estTokens} tokens, ${info.thinkingCount} 思绪）`);
+    const injectSummary = `已浮想外部对话 ${info.msgCount} 个回忆` +
+      (info.thinkingCount > 0 ? ` · ${info.thinkingCount} 个思绪` : '');
+    const injectDetail = {
+      inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
+      inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+      withThinking: withThinking !== false,
+      source: 'claude.ai',
+    };
+    broadcast({
+      type: 'system', kind: 'inject_done',
+      content: injectSummary,
+      detail: injectDetail,
+    });
+    if (conversation_id) {
+      try {
+        await supabase.from('messages').insert({
+          conversation_id,
+          role: 'system',
+          content: injectSummary,
+          tool_calls: injectDetail,
+        });
+      } catch (e) { console.warn('inject_done 持久化失败:', e.message); }
+    }
+    res.json({
+      ok: true, injected: true,
+      msgCount: info.msgCount, estTokens: info.estTokens,
+      thinkingCount: info.thinkingCount, thinkingTokens: info.thinkingTokens,
+      parsedTotal: messages.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // forge-reload 配置读写：daemon 每轮 rescan 会热加载 config.json，所以无需 systemctl 重启
 app.get('/api/forge/config', (req, res) => {
   try {
@@ -1003,6 +1444,43 @@ app.put('/api/forge/config', (req, res) => {
   }
 });
 
+// 自动 forge daemon 开关：调 systemctl 启/停 forge-monitor.service
+const FORGE_SERVICE_FILE = path.join(FORGE_RELOAD_DIR, 'forge-monitor.service');
+const FORGE_SERVICE_NAME = 'forge-monitor';
+
+function readForgeDaemonEnabled() {
+  const r = spawnSync('systemctl', ['is-active', FORGE_SERVICE_NAME], { encoding: 'utf-8' });
+  return (r.stdout || '').trim() === 'active';
+}
+
+app.get('/api/forge/daemon', (req, res) => {
+  res.json({ enabled: readForgeDaemonEnabled() });
+});
+
+app.post('/api/forge/daemon', (req, res) => {
+  const enabled = !!req.body?.enabled;
+  if (enabled) {
+    const r = spawnSync('systemctl', ['enable', '--now', FORGE_SERVICE_FILE], { encoding: 'utf-8' });
+    if (r.status !== 0) {
+      const msg = (r.stderr || r.stdout || '').trim() || `exit ${r.status}`;
+      return res.status(500).json({ error: 'systemctl enable failed: ' + msg });
+    }
+  } else {
+    // 已经停了就跳过 disable（unit 不存在时 disable 会报错）
+    if (readForgeDaemonEnabled()) {
+      const r = spawnSync('systemctl', ['disable', '--now', FORGE_SERVICE_NAME], { encoding: 'utf-8' });
+      if (r.status !== 0) {
+        const msg = (r.stderr || r.stdout || '').trim() || `exit ${r.status}`;
+        return res.status(500).json({ error: 'systemctl disable failed: ' + msg });
+      }
+    } else {
+      // 不在运行但 unit 还 linked 着：把 wants 符号链接也清掉，确保下次开机不自启
+      spawnSync('systemctl', ['disable', FORGE_SERVICE_NAME], { encoding: 'utf-8' });
+    }
+  }
+  res.json({ ok: true, enabled: readForgeDaemonEnabled() });
+});
+
 app.post('/api/conversations', async (req, res) => {
   const { title } = req.body;
   const { data, error } = await supabase
@@ -1017,7 +1495,7 @@ app.post('/api/conversations', async (req, res) => {
 app.get('/api/conversations/:id/messages', async (req, res) => {
   const { data, error } = await supabase
     .from('messages')
-    .select('id, role, content, thinking, tool_calls, images, token_input, token_output, created_at')
+    .select('id, role, content, thinking, tool_calls, images, token_input, token_output, cache_detail, created_at')
     .eq('conversation_id', req.params.id)
     .order('created_at', { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
@@ -1059,6 +1537,50 @@ function extractSearchableText(content) {
   return parts.join('\n');
 }
 
+// sessions_cheng 里 forged_from_session 不为 null 的行，反过来建 parent_sid → forged_start_uuid 映射
+// 用途：搜索/列消息时，旧 session JSONL 里从这个 uuid 开始的尾巴已经被复制到新 session（uuid 已重写），跳过避免重复
+let _forgeMapCache = { ts: 0, map: null };
+async function getForgeChildMap() {
+  const now = Date.now();
+  if (_forgeMapCache.map && now - _forgeMapCache.ts < 30_000) return _forgeMapCache.map;
+  const map = new Map();
+  try {
+    const { data, error } = await supabase
+      .from('sessions_cheng')
+      .select('forged_from_session, forged_start_uuid')
+      .not('forged_from_session', 'is', null);
+    if (!error && Array.isArray(data)) {
+      for (const row of data) {
+        if (row.forged_from_session && row.forged_start_uuid) {
+          map.set(row.forged_from_session, row.forged_start_uuid);
+        }
+      }
+    }
+  } catch { /* 静默：拉不到就退化到无去重 */ }
+  _forgeMapCache = { ts: now, map };
+  return map;
+}
+
+// 读一个 session 的 JSONL，过滤出 user/assistant 事件（去掉 sidechain），并应用 forge 去重：
+// 如果这个 session 有子 session，从 forged_start_uuid 那行起整段 break（这些行已经在子 session 里）
+async function readSessionEvents(sessionId, forgeMap) {
+  let raw;
+  try { raw = await fs.promises.readFile(path.join(CC_JSONL_DIR, `${sessionId}.jsonl`), 'utf-8'); }
+  catch { return []; }
+  const stopUuid = forgeMap.get(sessionId) || null;
+  const out = [];
+  for (const line of raw.split('\n')) {
+    if (!line) continue;
+    let ev;
+    try { ev = JSON.parse(line); } catch { continue; }
+    if (stopUuid && ev.uuid === stopUuid) break;
+    if (ev.type !== 'user' && ev.type !== 'assistant') continue;
+    if (ev.isSidechain) continue;
+    out.push(ev);
+  }
+  return out;
+}
+
 app.get('/api/search/messages', async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) {
@@ -1075,18 +1597,12 @@ app.get('/api/search/messages', async (req, res) => {
     return res.status(500).json({ error: 'failed to read jsonl dir: ' + e.message });
   }
 
+  const forgeMap = await getForgeChildMap();
   const results = [];
   for (const file of files) {
     const sessionId = file.replace(/\.jsonl$/, '');
-    let raw;
-    try { raw = await fs.promises.readFile(path.join(CC_JSONL_DIR, file), 'utf-8'); }
-    catch { continue; }
-    for (const line of raw.split('\n')) {
-      if (!line) continue;
-      let ev;
-      try { ev = JSON.parse(line); } catch { continue; }
-      if (ev.type !== 'user' && ev.type !== 'assistant') continue;
-      if (ev.isSidechain) continue;
+    const events = await readSessionEvents(sessionId, forgeMap);
+    for (const ev of events) {
       const text = extractSearchableText(ev.message?.content);
       if (!text) continue;
       const idx = text.toLowerCase().indexOf(qLower);
@@ -1096,6 +1612,7 @@ app.get('/api/search/messages', async (req, res) => {
       const preview = (start > 0 ? '…' : '') + text.slice(start, end).replace(/\s+/g, ' ') + (end < text.length ? '…' : '');
       results.push({
         session_id: sessionId,
+        uuid: ev.uuid || null,
         type: ev.type,
         timestamp: ev.timestamp || null,
         preview,
@@ -1110,6 +1627,53 @@ app.get('/api/search/messages', async (req, res) => {
     total,
     truncated: total > MAX_RESULTS,
     results: results.slice(0, MAX_RESULTS),
+  });
+});
+
+// 取某段时间内所有 session 的全部消息（应用 forge 去重，时间正序）
+// 用于搜索结果展开"匹配消息所在那一天"的全部消息
+app.get('/api/search/day-messages', async (req, res) => {
+  const start = String(req.query.start || '').trim();
+  const end = String(req.query.end || '').trim();
+  const startTs = Date.parse(start);
+  const endTs = Date.parse(end);
+  if (!isFinite(startTs) || !isFinite(endTs) || endTs < startTs) {
+    return res.status(400).json({ error: 'start and end (ISO) required, end >= start' });
+  }
+
+  let files;
+  try {
+    files = (await fs.promises.readdir(CC_JSONL_DIR)).filter(f => f.endsWith('.jsonl'));
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to read jsonl dir: ' + e.message });
+  }
+
+  const forgeMap = await getForgeChildMap();
+  const MAX = 2000;
+  const items = [];
+  for (const file of files) {
+    const sessionId = file.replace(/\.jsonl$/, '');
+    const events = await readSessionEvents(sessionId, forgeMap);
+    for (const ev of events) {
+      if (!ev.timestamp) continue;
+      const t = Date.parse(ev.timestamp);
+      if (!isFinite(t) || t < startTs || t > endTs) continue;
+      const text = extractSearchableText(ev.message?.content);
+      if (!text) continue;
+      items.push({
+        session_id: sessionId,
+        uuid: ev.uuid || null,
+        type: ev.type,
+        timestamp: ev.timestamp,
+        text,
+      });
+    }
+  }
+  items.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+  res.json({
+    total: items.length,
+    truncated: items.length > MAX,
+    messages: items.slice(0, MAX),
   });
 });
 

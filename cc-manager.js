@@ -96,10 +96,10 @@ export class CCProcessManager extends EventEmitter {
         console.error('recordSessionStart failed:', e?.message || e)
       );
     }
-    const proc = spawn('sudo', ['-u', 'claude-user', '-H', '--preserve-env=PATH', 'claude', ...claudeArgs], {
+    const proc = spawn('sudo', ['-u', 'claude-user', '-H', '--preserve-env=PATH,ENABLE_PROMPT_CACHING_1H', 'claude', ...claudeArgs], {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.cwd,
-      env: { ...process.env, FORCE_COLOR: '0' },
+      env: { ...process.env, FORCE_COLOR: '0', ENABLE_PROMPT_CACHING_1H: '1' },
     });
     this.proc = proc;
 
@@ -181,6 +181,17 @@ export class CCProcessManager extends EventEmitter {
       case 'assistant': {
         if (!this.currentTurn) this.currentTurn = { text: '', thinking: '', toolIds: new Set() };
         if (!this.currentTurn.toolIds) this.currentTurn.toolIds = new Set();
+        // 追踪每次 API 调用的 usage（最后一次 = 实际上下文大小，不是 result 里的累加值）
+        const msgUsage = ev.message?.usage;
+        if (msgUsage) {
+          const ctx = (msgUsage.input_tokens || 0)
+                    + (msgUsage.cache_read_input_tokens || 0)
+                    + (msgUsage.cache_creation_input_tokens || 0);
+          if (ctx > 0) {
+            if (!this.firstContextTokens) this.firstContextTokens = ctx;
+            this.lastContextTokens = ctx;
+          }
+        }
         const blocks = ev.message?.content || [];
 
         // tool_use blocks aren't streamed as deltas — always emit (deduped by id)
@@ -237,10 +248,16 @@ export class CCProcessManager extends EventEmitter {
         if (inFull > 0) this.lastInputTokens = inFull;
         const turn = this.currentTurn || { text: ev.result || '', thinking: '' };
         this.currentTurn = null;
+        const contextTokens = this.lastContextTokens || null;
+        const systemTokens = this.firstContextTokens || null;
+        this.lastContextTokens = null;
+        this.firstContextTokens = null;
         this.emit('turn_done', {
           text: turn.text,
           thinking: turn.thinking,
           usage,
+          contextTokens,
+          systemTokens,
           is_error: ev.is_error === true,
           subtype: ev.subtype,
         });
