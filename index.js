@@ -220,6 +220,12 @@ async function clearFuxianBlock() {
   await writeAsClaudeUser(FUXIAN_CLAUDE_MD, next);
 }
 
+function estimateTokens(s) {
+  let t = 0;
+  for (let i = 0; i < s.length; i++) t += s.charCodeAt(i) > 0x7f ? 1.5 : 0.25;
+  return Math.ceil(t);
+}
+
 // JSONL 是否会被 forge 截断 —— 跟 forge_reload.py 的 estimate_tokens 算法对齐
 // （len(json.dumps(ev))//3，仅累计 user/assistant），返回累计 tokens
 function estimateJsonlTokens(jsonlPath) {
@@ -477,6 +483,14 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
   activeTurn = null;
   if (!turn) return;
 
+  if (turn.stopped) {
+    safeSend(turn.ws, { type: 'stopped' });
+    maybeFireSummary();
+    tryFlushBuffer();
+    tryFireBark();
+    return;
+  }
+
   if (text) {
     const memories = parseMemoryTags(text);
     for (const m of memories) {
@@ -610,9 +624,10 @@ async function bumpSessionTurnAndTokens(sessionId, tokensTotal) {
 
 cc.on('turn_error', (err) => {
   if (activeTurn) {
-    if (activeTurn.barkFire) {
+    if (activeTurn.stopped) {
+      safeSend(activeTurn.ws, { type: 'stopped' });
+    } else if (activeTurn.barkFire) {
       console.warn(`[BARK] 触发失败 ${activeTurn.barkScheduleId}: ${err.message}`);
-      // 标 fired 防止下次轮询重复尝试同一条
       markBarkFired(activeTurn.barkScheduleId).catch(() => {});
     } else {
       safeSend(activeTurn.ws, { type: 'error', message: err.message });
@@ -776,7 +791,7 @@ async function injectConversationContext(conversationId, { withThinking = true }
   let acc = 0;
   let startIdx = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
-    acc += Math.ceil(lines[i].length / 3);
+    acc += estimateTokens(lines[i]);
     if (acc > TOKEN_CAP) break;
     startIdx = i;
   }
@@ -785,10 +800,10 @@ async function injectConversationContext(conversationId, { withThinking = true }
 
   const kept = filtered.slice(startIdx);
   const msgCount = kept.length;
-  const estTokens = Math.ceil(transcript.length / 3);
+  const estTokens = estimateTokens(transcript);
   const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
   const thinkingTokens = withThinking
-    ? kept.reduce((s, m) => m.thinking ? s + Math.ceil(m.thinking.length / 3) : s, 0)
+    ? kept.reduce((s, m) => m.thinking ? s + estimateTokens(m.thinking) : s, 0)
     : 0;
 
   const prompt = `【系统任务·对话上下文注入】\n` +
@@ -1212,7 +1227,7 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
   const TOKEN_CAP = 90000;
   let acc = 0, startIdx = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
-    acc += Math.ceil(lines[i].length / 3);
+    acc += estimateTokens(lines[i]);
     if (acc > TOKEN_CAP) break;
     startIdx = i;
   }
@@ -1221,10 +1236,10 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
 
   const kept = msgs.slice(startIdx);
   const msgCount = kept.length;
-  const estTokens = Math.ceil(transcript.length / 3);
+  const estTokens = estimateTokens(transcript);
   const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
   const thinkingTokens = withThinking
-    ? kept.reduce((s, m) => m.thinking ? s + Math.ceil(m.thinking.length / 3) : s, 0)
+    ? kept.reduce((s, m) => m.thinking ? s + estimateTokens(m.thinking) : s, 0)
     : 0;
 
   const prompt = `【系统任务·对话上下文注入】\n` +
@@ -1317,11 +1332,6 @@ async function injectExternalContext(messages, { withThinking = true, thinkingPc
 
   const pct = Math.max(0, Math.min(100, thinkingPct)) / 100;
   const cap = Math.max(1000, tokenCap || 90000);
-  const estimateTokens = (s) => {
-    let t = 0;
-    for (let i = 0; i < s.length; i++) t += s.charCodeAt(i) > 0x7f ? 1.5 : 0.25;
-    return Math.ceil(t);
-  };
 
   // Uniform sampling: at pct%, include ~pct fraction of thinking messages
   const thinkingSet = new Set();
@@ -1875,10 +1885,14 @@ wss.on('connection', (ws, req) => {
           pendingBuffer = null;
         }
         if (activeTurn) {
-          const turn = activeTurn;
-          activeTurn = null;
-          await cc.restart();
-          safeSend(turn.ws, { type: 'stopped' });
+          activeTurn.stopped = true;
+          safeSend(activeTurn.ws, { type: 'stopped' });
+        }
+      } else if (msg.type === 'flush') {
+        if (pendingBuffer) {
+          if (pendingBuffer.timer) { clearTimeout(pendingBuffer.timer); pendingBuffer.timer = null; }
+          pendingBuffer.readyToFlush = true;
+          tryFlushBuffer();
         }
       }
     } catch (err) {
