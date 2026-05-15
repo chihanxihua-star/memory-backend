@@ -369,6 +369,7 @@ cc.start();
 let activeTurn = null; // { ws, conversationId, settings, silent }
 const summaryTriggers = new Map(); // conversation_id -> last k triggered
 let pendingSummary = null; // { conversationId, summaryLength }
+let lastActiveConvId = null; // bark 主动消息存到最近活跃的对话
 
 // 短消息模式：累积用户消息，bufferTime 内无新消息就合并发给 CC
 // { ws, items: [{content, imgs, conversation_id, settings}], timer, readyToFlush }
@@ -496,9 +497,8 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
 
   const clean = removeBarkTags(removeMemoryTags(text || ''));
 
-  // barkFire 轮：把 clean 推到手机，不入库不发 ws
+  // barkFire 轮：推到手机 + 存 DB + 广播 ws
   if (turn.barkFire) {
-    // CC 觉得这个时候不该打扰 → 输出含 [SKIP] → 跳过推送，但仍 markFired 防止下次轮询重复
     const skip = /\[SKIP\]/i.test(clean);
     if (skip) {
       console.log(`[BARK] CC 选择跳过 ${turn.barkScheduleId}`);
@@ -512,6 +512,28 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
       if (body) {
         const ok = await pushBark({ title: '澄', body });
         console.log(`[BARK] 推送 ${turn.barkScheduleId}: ${ok ? 'ok' : 'failed'} (${body.slice(0, 40)})`);
+        // 存到 messages 并广播到前端
+        if (lastActiveConvId) {
+          try {
+            const { data: row } = await supabase.from('messages').insert({
+              conversation_id: lastActiveConvId,
+              role: 'assistant',
+              content: clean,
+              event: 'bark',
+            }).select('id, created_at').single();
+            broadcast({
+              type: 'bark_msg',
+              conversation_id: lastActiveConvId,
+              message: {
+                id: row?.id || 'bark-' + Date.now(),
+                role: 'assistant',
+                content: clean,
+                event: 'bark',
+                created_at: row?.created_at || new Date().toISOString(),
+              },
+            });
+          } catch (e) { console.error('[BARK] 存消息/广播失败:', e); }
+        }
       } else {
         console.warn(`[BARK] ${turn.barkScheduleId} 生成空消息，跳过推送`);
       }
@@ -1226,8 +1248,11 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
 app.post('/api/cc/inject-session', async (req, res) => {
   try {
     const { session_id, withThinking, conversation_id } = req.body || {};
-    if (!session_id) return res.status(400).json({ error: '缺少 session_id' });
-    const info = await injectSessionContext(session_id, { withThinking: withThinking !== false });
+    if (!session_id && !conversation_id) return res.status(400).json({ error: '缺少 session_id 或 conversation_id' });
+    // 优先 JSONL（session），没有才回退到 messages 表（conversation）
+    let info = null;
+    if (session_id) info = await injectSessionContext(session_id, { withThinking: withThinking !== false });
+    if (!info && conversation_id) info = await injectConversationContext(conversation_id, { withThinking: withThinking !== false });
     if (!info) return res.json({ ok: true, injected: false });
     console.log(`📋 旧 session 已注入（${info.msgCount} 条, ~${info.estTokens} tokens, ${info.thinkingCount} 思绪）`);
     const injectSummary = `已浮想 ${info.msgCount} 个回忆` +
@@ -1495,7 +1520,7 @@ app.post('/api/conversations', async (req, res) => {
 app.get('/api/conversations/:id/messages', async (req, res) => {
   const { data, error } = await supabase
     .from('messages')
-    .select('id, role, content, thinking, tool_calls, images, token_input, token_output, cache_detail, created_at')
+    .select('id, role, content, thinking, tool_calls, images, token_input, token_output, cache_detail, event, created_at')
     .eq('conversation_id', req.params.id)
     .order('created_at', { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
@@ -1952,6 +1977,8 @@ async function handleChat(ws, msg) {
   if (!cc.isRunning()) {
     return safeSend(ws, { type: 'error', message: 'CC进程未运行，请点击重启' });
   }
+
+  if (conversation_id) lastActiveConvId = conversation_id;
 
   // 用户消息照常落库（每条独立一行，保留时间线）
   if (conversation_id) {
