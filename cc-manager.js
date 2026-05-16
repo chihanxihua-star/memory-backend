@@ -70,7 +70,6 @@ export class CCProcessManager extends EventEmitter {
     }
 
     const claudeArgs = [
-      '--print',
       '--verbose',
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
