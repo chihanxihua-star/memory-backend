@@ -226,24 +226,6 @@ function estimateTokens(s) {
   return Math.ceil(t);
 }
 
-// JSONL 是否会被 forge 截断 —— 跟 forge_reload.py 的 estimate_tokens 算法对齐
-// （len(json.dumps(ev))//3，仅累计 user/assistant），返回累计 tokens
-function estimateJsonlTokens(jsonlPath) {
-  let total = 0;
-  try {
-    const raw = fs.readFileSync(jsonlPath, 'utf-8');
-    for (const line of raw.split('\n')) {
-      if (!line) continue;
-      try {
-        const ev = JSON.parse(line);
-        if (ev.type === 'user' || ev.type === 'assistant') {
-          total += Math.floor(JSON.stringify(ev).length / 3);
-        }
-      } catch {}
-    }
-  } catch {}
-  return total;
-}
 
 function readRetainTokens() {
   try {
@@ -485,7 +467,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
 
   if (turn.stopped) {
     maybeFireSummary();
-    tryFlushBuffer();
+    flushOrGrace();
     tryFireBark();
     return;
   }
@@ -554,7 +536,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
     try { await markBarkFired(turn.barkScheduleId); }
     catch (e) { console.warn('[BARK] markFired 异常:', e); }
     maybeFireSummary();
-    tryFlushBuffer();
+    flushOrGrace();
     tryFireBark();
     return;
   }
@@ -601,7 +583,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
   );
 
   maybeFireSummary();
-  tryFlushBuffer(); // 这轮完了，如果用户在生成期间排了队就发出去
+  flushOrGrace(); // 这轮完了，排队消息给 2 秒窗口再合并送出
   tryFireBark();
 });
 
@@ -633,7 +615,7 @@ cc.on('turn_error', (err) => {
     }
     activeTurn = null;
   }
-  tryFlushBuffer();
+  flushOrGrace();
   tryFireBark();
 });
 
@@ -707,7 +689,6 @@ app.put('/api/claude-md', (req, res) => {
 
 // forge 相关常量：和 forge-reload daemon 写在同一份 config.json，cc-manager 也在同一目录读 marker
 const FORGE_RELOAD_DIR = '/root/forge-reload';
-const FORGE_RELOAD_SCRIPT = path.join(FORGE_RELOAD_DIR, 'forge_reload.py');
 const FORGE_CONFIG_PATH = path.join(FORGE_RELOAD_DIR, 'config.json');
 const FORGE_MARKER_PATH = path.join(FORGE_RELOAD_DIR, 'last_forge.json');
 // cc-manager.js EXPECTED_PROJECT_DIR 同步：CC 跑在 claude-user 下，session JSONL 在这里
@@ -818,10 +799,11 @@ async function injectConversationContext(conversationId, { withThinking = true }
       cc.off('turn_error', onErr);
       clearTimeout(timer);
     };
-    const onDone = () => {
+    const onDone = (turnData) => {
       if (settled) return; settled = true; cleanup();
       activeTurn = null;
-      resolve({ msgCount, estTokens, thinkingCount, thinkingTokens });
+      const realTokens = turnData?.contextTokens || null;
+      resolve({ msgCount, estTokens, thinkingCount, thinkingTokens, realTokens });
     };
     const onErr = (err) => {
       if (settled) return; settled = true; cleanup();
@@ -845,45 +827,6 @@ async function injectConversationContext(conversationId, { withThinking = true }
   });
 }
 
-function runForgeReload(jsonlPath) {
-  return new Promise((resolve, reject) => {
-    const p = spawnProc('python3', [FORGE_RELOAD_SCRIPT, jsonlPath], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let out = '', err = '';
-    p.stdout.on('data', d => { out += d.toString(); });
-    p.stderr.on('data', d => { err += d.toString(); });
-    p.on('error', reject);
-    p.on('exit', code => {
-      if (code === 0) {
-        // stdout 只有 new_sid 一行；stderr 是 [forge] 日志
-        const sid = (out.trim().split('\n').pop() || '').trim();
-        // 抽 token / events 两个指标给前端
-        const evMatch = /\((\d+)\s*->\s*(\d+)\s*events\)/.exec(err);
-        const tkMatch = /tokens (\d+) -> (\d+)/.exec(err);
-        const totalEvents = evMatch ? Number(evMatch[1]) : null;
-        const retainedEvents = evMatch ? Number(evMatch[2]) : null;
-        const totalTokens = tkMatch ? Number(tkMatch[1]) : null;
-        const retainedTokens = tkMatch ? Number(tkMatch[2]) : null;
-        const truncated =
-          totalTokens != null && retainedTokens != null
-            ? retainedTokens < totalTokens
-            : (totalEvents != null && retainedEvents != null && retainedEvents < totalEvents);
-        resolve({
-          sid, stderr: err,
-          total: totalEvents, retained: retainedEvents,
-          total_tokens: totalTokens, retained_tokens: retainedTokens,
-          truncated,
-        });
-      } else {
-        // forge_reload 失败时 stderr 一般有 [forge] xxx — 抽最后一条让 toast 可读
-        const lastLine = err.trim().split('\n').filter(Boolean).pop() || `exit ${code}`;
-        const reason = lastLine.replace(/^\[forge\]\s*/, '');
-        reject(new Error(reason));
-      }
-    });
-  });
-}
 
 app.post('/api/cc/restart', async (req, res) => {
   // 提前声明，让外层 catch 也能用 progressId 关掉 forge_pending
@@ -938,11 +881,11 @@ app.post('/api/cc/restart', async (req, res) => {
         console.log(`⏭️  跳过 forge（${skipReason}），直接重启`);
       } else {
       // 1) CC 静默轮生成总结。只在 *将要截断* 时才花这一轮 —— 整段保留的话总结也用不上
-      //    （writeForgeSummary 也只在 truncated 时落地）。先估算 tokens 跟 retain 比。
+      //    （writeForgeSummary 也只在 truncated 时落地）。用 CC 上一轮 API 的真实 token 数判断。
       const retainTokens = readRetainTokens();
-      const estTokens = estimateJsonlTokens(jsonl);
-      const willTruncate = estTokens > retainTokens;
-      console.log(`📏 forge 估算 ${estTokens} tokens vs retain ${retainTokens} → ${willTruncate ? '会截断' : '不截断'}`);
+      const actualTokens = cc.lastInputTokens || 0;
+      const willTruncate = actualTokens > retainTokens;
+      console.log(`📏 forge 实际 ${actualTokens} tokens vs retain ${retainTokens} → ${willTruncate ? '会截断' : '不截断'}`);
       if (willTruncate) {
         try {
           const summaryLength = req.body?.summaryLength ?? req.body?.summary_length ?? null;
@@ -955,39 +898,23 @@ app.post('/api/cc/restart', async (req, res) => {
       } else {
         console.log('⏭️  整段保留场景，跳过总结生成');
       }
-      // 2) 跑 forge_reload.py
+      // 2) 清 forge marker，CC 重启后干净启动（不 resume），靠注入拿对话
       try {
-        forgeResult = await runForgeReload(jsonl);
-        console.log(`🔨 forge ${curSid} → ${forgeResult.sid}`);
-        if (forgeResult.stderr) console.log(`   forge stderr: ${forgeResult.stderr.trim()}`);
+        if (fs.existsSync(FORGE_MARKER_PATH)) {
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          fs.renameSync(FORGE_MARKER_PATH, `${FORGE_MARKER_PATH}.skipped.${stamp}`);
+        }
       } catch (e) {
-        console.error('forge_reload 失败:', e.message);
-        broadcast({
-          type: 'system', kind: 'forge_done',
-          id: progressId, content: '小太阳起床失败', detail: { error: e.message },
-        });
-        return res.status(500).json({ error: 'forge 失败: ' + e.message });
+        console.warn('marker 重命名失败:', e.message);
       }
-      // 3) 只在真截断时把总结落地 —— 整段保留的场景不写，避免误导新 CC
-      if (forgeSummary && forgeResult.truncated && forgeResult.sid) {
+      // 3) 只在真截断时把总结落地
+      if (forgeSummary && willTruncate) {
         try {
           await writeForgeSummary(forgeSummary);
           console.log(`✏️  <上次对话总结> 已写入 sandbox CLAUDE.md`);
         } catch (e) {
           console.error('writeForgeSummary 失败:', e.message);
         }
-        // PATCH supabase sessions_cheng.summary（forge_reload.py 那条 insert 写的是 null）
-        try {
-          const { error } = await supabase
-            .from('sessions_cheng')
-            .update({ summary: forgeSummary })
-            .eq('session_id', forgeResult.sid);
-          if (error) console.warn('sessions_cheng.summary 更新失败:', error.message);
-        } catch (e) {
-          console.warn('sessions_cheng.summary 更新异常:', e.message);
-        }
-      } else if (forgeSummary && !forgeResult.truncated) {
-        console.log('forge 未截断，丢弃总结');
       }
       } // end else (forge 实际执行块；JSONL 不存在或 < 10KB 时跳过整段)
     }
@@ -1116,7 +1043,7 @@ app.post('/api/cc/inject', async (req, res) => {
     if (!conversation_id) return res.status(400).json({ error: '缺少 conversation_id' });
     const info = await injectConversationContext(conversation_id, { withThinking: withThinking !== false });
     if (!info) return res.json({ ok: true, injected: false });
-    console.log(`📋 对话原文已注入新 CC（${info.msgCount} 条, ~${info.estTokens} tokens, ${info.thinkingCount} 思绪, thinking=${withThinking !== false}）`);
+    console.log(`📋 对话原文已注入新 CC（${info.msgCount} 条, ${info.realTokens ?? '~' + info.estTokens} tokens, ${info.thinkingCount} 思绪, thinking=${withThinking !== false}）`);
     // 更新 DB 里最近一条"小太阳醒啦"消息的 tool_calls，把注入结果持久化
     if (conversation_id) {
       try {
@@ -1132,6 +1059,7 @@ app.post('/api/cc/inject', async (req, res) => {
             ...(rows[0].tool_calls || {}),
             inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
             inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+            inject_real_tokens: info.realTokens,
           };
           await supabase.from('messages').update({ tool_calls: merged }).eq('id', rows[0].id);
         }
@@ -1145,6 +1073,7 @@ app.post('/api/cc/inject', async (req, res) => {
       detail: {
         inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
         inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+        inject_real_tokens: info.realTokens,
         withThinking: withThinking !== false,
       },
     });
@@ -1152,6 +1081,7 @@ app.post('/api/cc/inject', async (req, res) => {
       ok: true, injected: true,
       msgCount: info.msgCount, estTokens: info.estTokens,
       thinkingCount: info.thinkingCount, thinkingTokens: info.thinkingTokens,
+      realTokens: info.realTokens,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1260,7 +1190,7 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const cleanup = () => { cc.off('turn_done', onDone); cc.off('turn_error', onErr); clearTimeout(timer); };
-    const onDone = () => { if (settled) return; settled = true; cleanup(); activeTurn = null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens }); };
+    const onDone = (turnData) => { if (settled) return; settled = true; cleanup(); activeTurn = null; const realTokens = turnData?.contextTokens || null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens, realTokens }); };
     const onErr = (err) => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(err); };
     const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('session 注入超时')); }, 120000);
     cc.on('turn_done', onDone);
@@ -1278,12 +1208,13 @@ app.post('/api/cc/inject-session', async (req, res) => {
     if (session_id) info = await injectSessionContext(session_id, { withThinking: withThinking !== false });
     if (!info && conversation_id) info = await injectConversationContext(conversation_id, { withThinking: withThinking !== false });
     if (!info) return res.json({ ok: true, injected: false });
-    console.log(`📋 旧 session 已注入（${info.msgCount} 条, ~${info.estTokens} tokens, ${info.thinkingCount} 思绪）`);
+    console.log(`📋 旧 session 已注入（${info.msgCount} 条, ${info.realTokens ?? '~' + info.estTokens} tokens, ${info.thinkingCount} 思绪）`);
     const injectSummary = `已浮想 ${info.msgCount} 个回忆` +
       (info.thinkingCount > 0 ? ` · ${info.thinkingCount} 个思绪` : '');
     const injectDetail = {
       inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
       inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+      inject_real_tokens: info.realTokens,
       withThinking: withThinking !== false, from_session: session_id,
     };
     broadcast({
@@ -1305,6 +1236,7 @@ app.post('/api/cc/inject-session', async (req, res) => {
       ok: true, injected: true,
       msgCount: info.msgCount, estTokens: info.estTokens,
       thinkingCount: info.thinkingCount, thinkingTokens: info.thinkingTokens,
+      realTokens: info.realTokens,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1392,7 +1324,7 @@ async function injectExternalContext(messages, { withThinking = true, thinkingPc
   return new Promise((resolve, reject) => {
     let settled = false;
     const cleanup = () => { cc.off('turn_done', onDone); cc.off('turn_error', onErr); clearTimeout(timer); };
-    const onDone = () => { if (settled) return; settled = true; cleanup(); activeTurn = null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens }); };
+    const onDone = (turnData) => { if (settled) return; settled = true; cleanup(); activeTurn = null; const realTokens = turnData?.contextTokens || null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens, realTokens }); };
     const onErr = (err) => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(err); };
     const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('外部浮想超时')); }, 120000);
     cc.on('turn_done', onDone);
@@ -1410,12 +1342,13 @@ app.post('/api/cc/inject-external', async (req, res) => {
 
     const info = await injectExternalContext(messages, { withThinking: withThinking !== false, thinkingPct: thinkingPct ?? 100, tokenCap: tokenCap || 90000, summary: summary || '' });
     if (!info) return res.json({ ok: true, injected: false });
-    console.log(`📋 外部对话已浮想（${info.msgCount} 条, ~${info.estTokens} tokens, ${info.thinkingCount} 思绪）`);
+    console.log(`📋 外部对话已浮想（${info.msgCount} 条, ${info.realTokens ?? '~' + info.estTokens} tokens, ${info.thinkingCount} 思绪）`);
     const injectSummary = `已浮想外部对话 ${info.msgCount} 个回忆` +
       (info.thinkingCount > 0 ? ` · ${info.thinkingCount} 个思绪` : '');
     const injectDetail = {
       inject_msg_count: info.msgCount, inject_est_tokens: info.estTokens,
       inject_thinking_count: info.thinkingCount, inject_thinking_tokens: info.thinkingTokens,
+      inject_real_tokens: info.realTokens,
       withThinking: withThinking !== false,
       source: 'claude.ai',
     };
@@ -1438,6 +1371,7 @@ app.post('/api/cc/inject-external', async (req, res) => {
       ok: true, injected: true,
       msgCount: info.msgCount, estTokens: info.estTokens,
       thinkingCount: info.thinkingCount, thinkingTokens: info.thinkingTokens,
+      realTokens: info.realTokens,
       parsedTotal: messages.length,
     });
   } catch (e) {
@@ -1899,9 +1833,13 @@ wss.on('connection', (ws, req) => {
         }
       } else if (msg.type === 'flush') {
         if (pendingBuffer) {
-          if (pendingBuffer.timer) { clearTimeout(pendingBuffer.timer); pendingBuffer.timer = null; }
-          pendingBuffer.readyToFlush = true;
-          tryFlushBuffer();
+          if (!activeTurn) {
+            // CC 空闲：立即 flush（单条消息快速送达）
+            if (pendingBuffer.timer) { clearTimeout(pendingBuffer.timer); pendingBuffer.timer = null; }
+            pendingBuffer.readyToFlush = true;
+            tryFlushBuffer();
+          }
+          // CC 忙碌时忽略 flush，让 timer 继续跑，这样后续消息可以合并进同一批
         }
       }
     } catch (err) {
@@ -2065,6 +2003,20 @@ function tryFlushBuffer() {
   const ws = pendingBuffer.ws;
   pendingBuffer = null;
   flushPendingToCC(ws, items).catch(e => console.error('flush failed:', e));
+}
+
+// CC 刚空闲后调用：先 tryFlush，如果缓冲区还没 ready 就给 2 秒窗口再送出
+function flushOrGrace() {
+  tryFlushBuffer();
+  if (pendingBuffer && !pendingBuffer.readyToFlush) {
+    if (pendingBuffer.timer) clearTimeout(pendingBuffer.timer);
+    pendingBuffer.timer = setTimeout(() => {
+      if (!pendingBuffer) return;
+      pendingBuffer.timer = null;
+      pendingBuffer.readyToFlush = true;
+      tryFlushBuffer();
+    }, 2000);
+  }
 }
 
 async function flushPendingToCC(ws, items) {
