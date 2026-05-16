@@ -222,7 +222,7 @@ async function clearFuxianBlock() {
 
 function estimateTokens(s) {
   let t = 0;
-  for (let i = 0; i < s.length; i++) t += s.charCodeAt(i) > 0x7f ? 1.5 : 0.25;
+  for (let i = 0; i < s.length; i++) t += s.charCodeAt(i) > 0x7f ? 1.0 : 0.25;
   return Math.ceil(t);
 }
 
@@ -484,7 +484,6 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
   if (!turn) return;
 
   if (turn.stopped) {
-    safeSend(turn.ws, { type: 'stopped' });
     maybeFireSummary();
     tryFlushBuffer();
     tryFireBark();
@@ -800,11 +799,11 @@ async function injectConversationContext(conversationId, { withThinking = true }
 
   const kept = filtered.slice(startIdx);
   const msgCount = kept.length;
-  const estTokens = estimateTokens(transcript);
   const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
   const thinkingTokens = withThinking
     ? kept.reduce((s, m) => m.thinking ? s + estimateTokens(m.thinking) : s, 0)
     : 0;
+  const estTokens = estimateTokens(transcript) - thinkingTokens;
 
   const prompt = `【系统任务·对话上下文注入】\n` +
     `以下是你和小茉莉之前的对话原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
@@ -1056,6 +1055,7 @@ app.post('/api/cc/restart', async (req, res) => {
 
 // 失忆：清 forge marker → 用新 random UUID 启动 CC（无 --resume）。不走 forge / 不写总结。
 app.post('/api/cc/amnesia', async (req, res) => {
+  const amnesiaConvId = req.body?.conversation_id || lastActiveConvId;
   const progressId = 'amnesia-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
   try {
     broadcast({
@@ -1090,6 +1090,15 @@ app.post('/api/cc/amnesia', async (req, res) => {
       id: progressId, content: '失忆完成 · 干净新 session',
       detail: { skipped: true, model: cc.model || null },
     });
+    if (amnesiaConvId) {
+      try {
+        await supabase.from('messages').insert({
+          conversation_id: amnesiaConvId,
+          role: 'system',
+          content: '失忆完成 · 干净新 session',
+        });
+      } catch (e) { console.warn('amnesia save msg:', e.message); }
+    }
     res.json({ ok: true, session: cc.sessionId });
   } catch (err) {
     broadcast({
@@ -1236,11 +1245,11 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
 
   const kept = msgs.slice(startIdx);
   const msgCount = kept.length;
-  const estTokens = estimateTokens(transcript);
   const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
   const thinkingTokens = withThinking
     ? kept.reduce((s, m) => m.thinking ? s + estimateTokens(m.thinking) : s, 0)
     : 0;
+  const estTokens = estimateTokens(transcript) - thinkingTokens;
 
   const prompt = `【系统任务·对话上下文注入】\n` +
     `以下是你和小茉莉之前的对话原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
@@ -1367,11 +1376,11 @@ async function injectExternalContext(messages, { withThinking = true, thinkingPc
 
   const kept = messages.slice(startIdx);
   const msgCount = kept.length;
-  const estTokens = estimateTokens(transcript);
   const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
   const thinkingTokens = withThinking
     ? kept.reduce((s, m) => m.thinking ? s + Math.ceil(m.thinking.length / 3) : s, 0)
     : 0;
+  const estTokens = estimateTokens(transcript) - thinkingTokens;
 
   const summaryBlock = summary ? `【前情摘要】\n${summary}\n\n【以下是最近的对话原文】\n\n` : '';
   const prompt = `【系统任务·对话上下文注入】\n` +
