@@ -554,7 +554,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
         + (usage.cache_read_input_tokens || 0) * 0.1
         + (usage.cache_creation_input_tokens || 0) * 2.0
       );
-      await supabase.from('messages').insert({
+      const { data: inserted } = await supabase.from('messages').insert({
         conversation_id: turn.conversationId,
         role: 'assistant',
         content: clean,
@@ -567,14 +567,15 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
           cache_read: usage.cache_read_input_tokens || 0,
           cache_creation: usage.cache_creation_input_tokens || 0,
         },
-      });
+      }).select('id').single();
+      turn.messageId = inserted?.id || null;
       await checkContextThreshold(turn.conversationId, turn.settings);
     } catch (e) { console.error('存消息失败:', e); }
   }
 
   if (!turn.silent) {
     if (text !== clean) safeSend(turn.ws, { type: 'clean', text: clean });
-    safeSend(turn.ws, { type: 'done', usage, contextTokens, systemTokens, is_error });
+    safeSend(turn.ws, { type: 'done', usage, contextTokens, systemTokens, is_error, message_id: turn.messageId || null });
   }
 
   // sessions_cheng.turn_count +1 + 同步当前实际上下文 tokens（不阻塞主流程；单用户系统不担心并发竞争）
@@ -743,6 +744,22 @@ async function generateForgeSummary({ summaryLength }) {
   });
 }
 
+// 根据 thinking_keep_ratio 配置，只保留后 X% 的 thinking 条目（按位置）
+function buildThinkingKeepSet(messages) {
+  let ratio = 0.5;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(FORGE_CONFIG_PATH, 'utf-8'));
+    if (cfg.thinking_keep_ratio != null) ratio = Math.max(0, Math.min(1, Number(cfg.thinking_keep_ratio)));
+  } catch {}
+  const thinkingIndices = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].thinking) thinkingIndices.push(i);
+  }
+  const keepCount = Math.ceil(thinkingIndices.length * ratio);
+  const keepSet = new Set(thinkingIndices.slice(-keepCount));
+  return keepSet;
+}
+
 // forge 后把对话原文喂给新 CC（silent turn），让新进程在 API 层面看到完整上下文。
 // < 100k：全部原文；> 100k：最近 ~100k 的原文（被截掉的部分靠 CLAUDE.md 摘要补充）
 async function injectConversationContext(conversationId, { withThinking = true } = {}) {
@@ -759,10 +776,11 @@ async function injectConversationContext(conversationId, { withThinking = true }
   if (!msgs || msgs.length === 0) return;
 
   const filtered = msgs.filter(m => m.content);
-  const lines = filtered.map(m => {
+  const thinkingKeepSet = withThinking ? buildThinkingKeepSet(filtered) : new Set();
+  const lines = filtered.map((m, idx) => {
     const label = m.role === 'user' ? '小茉莉' : '澄';
     let line = `[${label}] ${m.content}`;
-    if (withThinking && m.thinking) line = `[${label}·思考] ${m.thinking}\n[${label}] ${m.content}`;
+    if (withThinking && m.thinking && thinkingKeepSet.has(idx)) line = `[${label}·思考] ${m.thinking}\n[${label}] ${m.content}`;
     return line;
   });
 
@@ -775,14 +793,14 @@ async function injectConversationContext(conversationId, { withThinking = true }
     if (acc > TOKEN_CAP) break;
     startIdx = i;
   }
-  const transcript = lines.slice(startIdx).join('\n\n');
+  const transcript = lines.slice(startIdx).join('\n');
   if (!transcript.trim()) return null;
 
   const kept = filtered.slice(startIdx);
   const msgCount = kept.length;
-  const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
+  const thinkingCount = withThinking ? kept.filter((m, i) => m.thinking && thinkingKeepSet.has(startIdx + i)).length : 0;
   const thinkingTokens = withThinking
-    ? kept.reduce((s, m) => m.thinking ? s + estimateTokens(m.thinking) : s, 0)
+    ? kept.reduce((s, m, i) => (m.thinking && thinkingKeepSet.has(startIdx + i)) ? s + estimateTokens(m.thinking) : s, 0)
     : 0;
   const estTokens = estimateTokens(transcript) - thinkingTokens;
 
@@ -1096,6 +1114,7 @@ function readSessionMessages(sessionId) {
   const raw = fs.readFileSync(jsonlPath, 'utf-8');
   const messages = [];
   let pendingAssistant = null;
+  let skipNextAssistant = false;
 
   const flushAssistant = () => {
     if (!pendingAssistant) return;
@@ -1118,9 +1137,14 @@ function readSessionMessages(sessionId) {
           const text = typeof content === 'string' ? content
             : Array.isArray(content) ? content.filter(b => b.type === 'text').map(b => b.text || '').join('\n')
             : '';
-          if (text.trim()) messages.push({ role: 'user', content: text.trim(), thinking: null });
+          if (text.includes('【系统任务·对话上下文注入】')) {
+            skipNextAssistant = true;
+          } else if (text.trim()) {
+            messages.push({ role: 'user', content: text.trim(), thinking: null });
+          }
         }
       } else if (ev.type === 'assistant') {
+        if (skipNextAssistant) { skipNextAssistant = false; continue; }
         if (!pendingAssistant) pendingAssistant = { role: 'assistant', content: '', thinking: null };
         const blocks = ev.message?.content;
         if (Array.isArray(blocks)) {
@@ -1156,10 +1180,11 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
   const msgs = readSessionMessages(sessionId);
   if (!msgs || msgs.length === 0) return null;
 
-  const lines = msgs.map(m => {
+  const thinkingKeepSet = withThinking ? buildThinkingKeepSet(msgs) : new Set();
+  const lines = msgs.map((m, idx) => {
     const label = m.role === 'user' ? '小茉莉' : '澄';
     let line = `[${label}] ${m.content}`;
-    if (withThinking && m.thinking) line = `[${label}·思考] ${m.thinking}\n[${label}] ${m.content}`;
+    if (withThinking && m.thinking && thinkingKeepSet.has(idx)) line = `[${label}·思考] ${m.thinking}\n[${label}] ${m.content}`;
     return line;
   });
 
@@ -1170,14 +1195,14 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
     if (acc > TOKEN_CAP) break;
     startIdx = i;
   }
-  const transcript = lines.slice(startIdx).join('\n\n');
+  const transcript = lines.slice(startIdx).join('\n');
   if (!transcript.trim()) return null;
 
   const kept = msgs.slice(startIdx);
   const msgCount = kept.length;
-  const thinkingCount = withThinking ? kept.filter(m => m.thinking).length : 0;
+  const thinkingCount = withThinking ? kept.filter((m, i) => m.thinking && thinkingKeepSet.has(startIdx + i)).length : 0;
   const thinkingTokens = withThinking
-    ? kept.reduce((s, m) => m.thinking ? s + estimateTokens(m.thinking) : s, 0)
+    ? kept.reduce((s, m, i) => (m.thinking && thinkingKeepSet.has(startIdx + i)) ? s + estimateTokens(m.thinking) : s, 0)
     : 0;
   const estTokens = estimateTokens(transcript) - thinkingTokens;
 
@@ -1303,7 +1328,7 @@ async function injectExternalContext(messages, { withThinking = true, thinkingPc
     if (acc > cap) break;
     startIdx = i;
   }
-  const transcript = lines.slice(startIdx).join('\n\n');
+  const transcript = lines.slice(startIdx).join('\n');
   if (!transcript.trim()) return null;
 
   const kept = messages.slice(startIdx);
@@ -1387,6 +1412,7 @@ app.get('/api/forge/config', (req, res) => {
     res.json({
       retain_tokens: cfg.retain_tokens,
       trigger_threshold: cfg.trigger_threshold,
+      thinking_keep_ratio: cfg.thinking_keep_ratio ?? 0.5,
     });
   } catch (e) {
     res.status(500).json({ error: 'read forge config: ' + e.message });
@@ -1407,6 +1433,13 @@ app.put('/api/forge/config', (req, res) => {
         patch[k] = Math.round(v);
       }
     }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'thinking_keep_ratio')) {
+      const v = Number(req.body.thinking_keep_ratio);
+      if (!Number.isFinite(v) || v < 0 || v > 1) {
+        return res.status(400).json({ error: 'thinking_keep_ratio 必须在 0~1 之间' });
+      }
+      patch.thinking_keep_ratio = Math.round(v * 100) / 100;
+    }
     if (!Object.keys(patch).length) {
       return res.status(400).json({ error: '没有可更新字段' });
     }
@@ -1416,6 +1449,7 @@ app.put('/api/forge/config', (req, res) => {
       ok: true,
       retain_tokens: next.retain_tokens,
       trigger_threshold: next.trigger_threshold,
+      thinking_keep_ratio: next.thinking_keep_ratio ?? 0.5,
     });
   } catch (e) {
     res.status(500).json({ error: 'write forge config: ' + e.message });
