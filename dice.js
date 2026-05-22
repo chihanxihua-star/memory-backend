@@ -167,7 +167,7 @@ export class DiceDaemon {
         lambda,
         probability: Math.round(prob * 1000) / 1000,
         roll: Math.round(roll * 1000) / 1000,
-        appSummary,
+        app_status: appSummary || null,
       };
 
       const prompt = buildDicePrompt(appSummary);
@@ -215,7 +215,7 @@ export class DiceDaemon {
         ...fire,
         hit: true,
         judgment: 'skip_cc',
-        app_status: fire.appSummary || null,
+        app_status: fire.app_status || null,
       });
       return true;
     }
@@ -233,7 +233,7 @@ export class DiceDaemon {
         hit: true,
         judgment: 'skip_cc',
         reason: '空消息',
-        app_status: fire.appSummary || null,
+        app_status: fire.app_status || null,
       });
       return true;
     }
@@ -270,7 +270,7 @@ export class DiceDaemon {
       hit: true,
       judgment: 'send',
       message_sent: body,
-      app_status: fire.appSummary || null,
+      app_status: fire.app_status || null,
     });
 
     return true;
