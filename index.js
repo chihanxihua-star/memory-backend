@@ -22,6 +22,7 @@ import {
   buildFirePrompt as buildBarkFirePrompt,
   fetchAppSummary,
 } from './bark.js';
+import { DiceDaemon } from './dice.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -354,6 +355,21 @@ const _initSysPrompt = await syncCCDocs();
 cc.setAppendSystemPrompt(_initSysPrompt);
 cc.start();
 
+const diceDaemon = new DiceDaemon({
+  getActiveTurn: () => activeTurn,
+  getPendingBuffer: () => pendingBuffer,
+  isRunning: () => cc.isRunning(),
+  sendToCC: (prompt) => {
+    activeTurn = {
+      ws: null, conversationId: null, silent: true,
+      settings: null, tools: [], diceFire: true,
+    };
+    cc.send(prompt);
+  },
+  broadcast,
+  getLastActiveConvId: () => lastActiveConvId,
+});
+
 let activeTurn = null; // { ws, conversationId, settings, silent }
 const summaryTriggers = new Map(); // conversation_id -> last k triggered
 let pendingSummary = null; // { conversationId, summaryLength }
@@ -481,7 +497,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
       } catch (e) { console.error('写记忆失败:', e); }
     }
     // [BARK:...] 入库；barkFire 轮内禁止再排程，避免循环
-    if (!turn.barkFire) {
+    if (!turn.barkFire && !turn.diceFire) {
       const barkTags = parseBarkTags(text);
       if (barkTags.length) {
         try { await saveBarkSchedules(barkTags, cc.sessionId); }
@@ -514,6 +530,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
               conversation_id: lastActiveConvId,
               role: 'assistant',
               content: clean,
+              thinking: thinking || null,
               event: 'bark',
             }).select('id, created_at').single();
             broadcast({
@@ -535,6 +552,14 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
     }
     try { await markBarkFired(turn.barkScheduleId); }
     catch (e) { console.warn('[BARK] markFired 异常:', e); }
+    maybeFireSummary();
+    flushOrGrace();
+    tryFireBark();
+    return;
+  }
+
+  if (turn.diceFire) {
+    await diceDaemon.handleDiceTurnDone(clean, thinking);
     maybeFireSummary();
     flushOrGrace();
     tryFireBark();
@@ -611,6 +636,8 @@ cc.on('turn_error', (err) => {
     } else if (activeTurn.barkFire) {
       console.warn(`[BARK] 触发失败 ${activeTurn.barkScheduleId}: ${err.message}`);
       markBarkFired(activeTurn.barkScheduleId).catch(() => {});
+    } else if (activeTurn.diceFire) {
+      console.warn(`[DICE] 触发失败: ${err.message}`);
     } else {
       safeSend(activeTurn.ws, { type: 'error', message: err.message });
     }
@@ -1456,6 +1483,86 @@ app.put('/api/forge/config', (req, res) => {
   }
 });
 
+// ==================== 概率骰子 API ====================
+
+app.get('/api/dice/config', (req, res) => {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(FORGE_CONFIG_PATH, 'utf-8'));
+    res.json({
+      lambda: cfg.lambda ?? 0.15,
+      dice_interval_min: cfg.dice_interval_min ?? 30,
+      dice_interval_max: cfg.dice_interval_max ?? 50,
+      dice_quiet_hours: cfg.dice_quiet_hours ?? [1, 8],
+      dice_enabled: cfg.dice_enabled !== false,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/dice/config', (req, res) => {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(FORGE_CONFIG_PATH, 'utf-8'));
+    const patch = {};
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'lambda')) {
+      const v = Number(req.body.lambda);
+      if (!Number.isFinite(v) || v < 0.15 || v > 1.0) {
+        return res.status(400).json({ error: 'lambda 必须在 0.15~1.0 之间' });
+      }
+      patch.lambda = Math.round(v * 100) / 100;
+    }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'dice_enabled')) {
+      patch.dice_enabled = !!req.body.dice_enabled;
+    }
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: '没有可更新字段' });
+    }
+    const next = { ...cfg, ...patch };
+    fs.writeFileSync(FORGE_CONFIG_PATH, JSON.stringify(next, null, 2) + '\n', 'utf-8');
+    if (patch.dice_enabled === true) diceDaemon.start();
+    else if (patch.dice_enabled === false) diceDaemon.stop();
+    res.json({ ok: true, lambda: next.lambda, dice_enabled: next.dice_enabled !== false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/dice/log', async (req, res) => {
+  try {
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
+    const before = req.query.before || null;
+    let q = supabase
+      .from('sigh_log_cheng')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (before) q = q.lt('created_at', before);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/dice/status', async (req, res) => {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(FORGE_CONFIG_PATH, 'utf-8'));
+    const { data } = await supabase
+      .from('messages')
+      .select('created_at')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const lastMsg = data?.[0]?.created_at || null;
+    const tHours = lastMsg ? (Date.now() - new Date(lastMsg).getTime()) / 3600000 : null;
+    const lambda = cfg.lambda || 0.15;
+    const probability = tHours !== null ? 1 - Math.exp(-lambda * tHours) : null;
+    res.json({ lambda, t_hours: tHours, probability, dice_enabled: cfg.dice_enabled !== false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 自动 forge daemon 开关：调 systemctl 启/停 forge-monitor.service
 const FORGE_SERVICE_FILE = path.join(FORGE_RELOAD_DIR, 'forge-monitor.service');
 const FORGE_SERVICE_NAME = 'forge-monitor';
@@ -2099,6 +2206,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`WebSocket: ws://0.0.0.0:${PORT}`);
   console.log(`Supabase: ${process.env.SUPABASE_URL ? '已连接' : '未配置'}`);
   console.log(`CC 工作目录: /home/claude-user/chat-sandbox (CLAUDE.md 由 CC 自己加载)`);
+  diceDaemon.start();
 });
 
 process.on('SIGTERM', () => { cc.stop(); process.exit(0); });
