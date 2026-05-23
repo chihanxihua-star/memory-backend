@@ -41,10 +41,13 @@ async function writeSighLog(entry) {
   if (error) console.error('[DICE] sigh_log 写入失败:', error.message);
 }
 
-export function buildDicePrompt(appStatus) {
+export function buildDicePrompt(appStatus, tHours) {
   const time = formatLocalTime();
-  const appLine = appStatus ? `，她最近在用 ${appStatus}` : '';
-  return `已经有一阵子没跟小茉莉说话啦~现在是 ${time}${appLine}。如果你想说点什么就说，不想说就回复 [SKIP]。`;
+  const gap = tHours != null
+    ? (tHours >= 1 ? `${tHours.toFixed(1)} 小时` : `${Math.round(tHours * 60)} 分钟`)
+    : '一阵子';
+  const appLine = appStatus ? `，上次聊完之后，她用了 ${appStatus}` : '';
+  return `已经 ${gap} 没跟小茉莉说话啦~现在是 ${time}${appLine}。如果你想说点什么就说，不想说就回复 [SKIP]。`;
 }
 
 export class DiceDaemon {
@@ -129,7 +132,7 @@ export class DiceDaemon {
 
       console.log(`[DICE] 命中! (t=${tHours.toFixed(1)}h, P=${prob.toFixed(2)}, roll=${roll.toFixed(2)})`);
 
-      const appSummary = await fetchAppSummary();
+      const appSummary = await fetchAppSummary(lastMsg);
       const judgment = this._judge(cfg, appSummary);
 
       if (judgment.skip) {
@@ -170,7 +173,7 @@ export class DiceDaemon {
         app_status: appSummary || null,
       };
 
-      const prompt = buildDicePrompt(appSummary);
+      const prompt = buildDicePrompt(appSummary, tHours);
       this._sendToCC(prompt);
       console.log('[DICE] 已注入 CC prompt');
 

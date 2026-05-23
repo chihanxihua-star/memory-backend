@@ -163,11 +163,13 @@ export async function pushBark({ title, body }) {
   }
 }
 
-export async function fetchAppSummary() {
+export async function fetchAppSummary(since) {
   const base = process.env.SUPABASE_URL;
   if (!base) return null;
   try {
-    const r = await fetch(`${base.replace(/\/+$/, '')}/functions/v1/app-summary`, {
+    let url = `${base.replace(/\/+$/, '')}/functions/v1/app-summary`;
+    if (since instanceof Date) url += `?since=${since.toISOString()}`;
+    const r = await fetch(url, {
       method: 'GET',
       signal: AbortSignal.timeout(5_000),
     });

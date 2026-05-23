@@ -389,9 +389,9 @@ function maybeTimePrefix(content, conversationId) {
   convLastMsgTime.set(conversationId, now);
   if (!last || now - last < CC_TIME_GAP_MS) return content;
   const gap = Math.round((now - last) / 60000);
-  const d = new Date(now);
+  const d = new Date(now + 8 * 3600000);
   const pad = (n) => String(n).padStart(2, '0');
-  const timeStr = `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const timeStr = `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
   const gapStr = gap >= 60
     ? `${Math.floor(gap / 60)} 小时${gap % 60 ? ' ' + (gap % 60) + ' 分钟' : ''}`
     : `${gap} 分钟`;
@@ -1514,13 +1514,27 @@ app.put('/api/dice/config', (req, res) => {
     if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'dice_enabled')) {
       patch.dice_enabled = !!req.body.dice_enabled;
     }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'dice_interval_min')) {
+      const v = Number(req.body.dice_interval_min);
+      if (!Number.isFinite(v) || v < 5 || v > 120) {
+        return res.status(400).json({ error: 'dice_interval_min 必须在 5~120 之间' });
+      }
+      patch.dice_interval_min = Math.round(v);
+    }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'dice_interval_max')) {
+      const v = Number(req.body.dice_interval_max);
+      if (!Number.isFinite(v) || v < 5 || v > 120) {
+        return res.status(400).json({ error: 'dice_interval_max 必须在 5~120 之间' });
+      }
+      patch.dice_interval_max = Math.round(v);
+    }
     if (!Object.keys(patch).length) {
       return res.status(400).json({ error: '没有可更新字段' });
     }
     const next = { ...cfg, ...patch };
     fs.writeFileSync(FORGE_CONFIG_PATH, JSON.stringify(next, null, 2) + '\n', 'utf-8');
-    if (patch.dice_enabled === true) diceDaemon.start();
-    else if (patch.dice_enabled === false) diceDaemon.stop();
+    if (patch.dice_enabled === false) diceDaemon.stop();
+    else if (next.dice_enabled !== false) { diceDaemon.stop(); diceDaemon.start(); }
     res.json({ ok: true, lambda: next.lambda, dice_enabled: next.dice_enabled !== false });
   } catch (e) {
     res.status(500).json({ error: e.message });
