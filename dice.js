@@ -218,6 +218,7 @@ export class DiceDaemon {
         ...fire,
         hit: true,
         judgment: 'skip_cc',
+        thinking: thinking || null,
         app_status: fire.app_status || null,
       });
       return true;
@@ -236,6 +237,7 @@ export class DiceDaemon {
         hit: true,
         judgment: 'skip_cc',
         reason: '空消息',
+        thinking: thinking || null,
         app_status: fire.app_status || null,
       });
       return true;
@@ -273,6 +275,7 @@ export class DiceDaemon {
       hit: true,
       judgment: 'send',
       message_sent: body,
+      thinking: thinking || null,
       app_status: fire.app_status || null,
     });
 

@@ -1056,7 +1056,9 @@ app.post('/api/cc/amnesia', async (req, res) => {
     }
     const sysPrompt = await syncCCDocs();
     cc.setAppendSystemPrompt(sysPrompt);
-    await cc.restart();
+    const amnesiaOpts = {};
+    if (req.body?.effort) amnesiaOpts.effort = req.body.effort;
+    await cc.restart(amnesiaOpts);
     broadcast({
       type: 'system', kind: 'forge_done',
       id: progressId, content: '失忆完成 · 干净新 session',
@@ -1987,14 +1989,21 @@ wss.on('connection', (ws, req) => {
           safeSend(activeTurn.ws, { type: 'stopped' });
         }
       } else if (msg.type === 'flush') {
+        console.log(`[CHAT] 收到 flush 指令 (pendingBuffer=${!!pendingBuffer}, activeTurn=${!!activeTurn})`);
         if (pendingBuffer) {
           if (!activeTurn) {
-            // CC 空闲：立即 flush（单条消息快速送达）
             if (pendingBuffer.timer) { clearTimeout(pendingBuffer.timer); pendingBuffer.timer = null; }
-            pendingBuffer.readyToFlush = true;
-            tryFlushBuffer();
+            console.log('[CHAT] flush 延迟 200ms 等消息到齐');
+            pendingBuffer.timer = setTimeout(() => {
+              if (!pendingBuffer) return;
+              pendingBuffer.timer = null;
+              pendingBuffer.readyToFlush = true;
+              console.log('[CHAT] flush 200ms 到期，执行');
+              tryFlushBuffer();
+            }, 200);
+          } else {
+            console.log('[CHAT] flush 忽略（CC 忙）');
           }
-          // CC 忙碌时忽略 flush，让 timer 继续跑，这样后续消息可以合并进同一批
         }
       }
     } catch (err) {
@@ -2087,7 +2096,7 @@ function dataUrlToImageBlock(dataUrl) {
 }
 
 async function handleChat(ws, msg) {
-  const { content, images, conversation_id, settings } = msg;
+  const { content, images, conversation_id, settings, msgId } = msg;
   const imgs = Array.isArray(images) ? images.filter(Boolean) : [];
 
   if (!cc.isRunning()) {
@@ -2112,26 +2121,30 @@ async function handleChat(ws, msg) {
 
   const bufferTime = Math.max(0, parseInt(settings?.bufferTime) || 0);
   const shortMsgCount = Math.max(1, parseInt(settings?.shortMsgCount) || 1);
+  console.log(`[CHAT] 收到消息 (bufferTime=${bufferTime}s, shortMsgCount=${shortMsgCount}, activeTurn=${!!activeTurn}, pendingBuffer=${!!pendingBuffer}, content="${content.slice(0, 30)}")`);
 
   // bufferTime=0 且 CC 空闲：保留原直发路径
   if (bufferTime <= 0 && !activeTurn && !pendingBuffer) {
-    return flushPendingToCC(ws, [{ content, imgs, conversation_id, settings }]);
+    console.log('[CHAT] 直发 CC（bufferTime=0 且空闲）');
+    if (msgId) safeSend(ws, { type: 'flushed', ids: [msgId] });
+    return flushPendingToCC(ws, [{ content, imgs, conversation_id, settings, msgId }]);
   }
 
   // 否则进入缓冲
   if (!pendingBuffer) {
     pendingBuffer = { ws, items: [], timer: null, readyToFlush: false };
   } else {
-    // 多窗口情况：以最新 ws 为准
     pendingBuffer.ws = ws;
   }
-  pendingBuffer.items.push({ content, imgs, conversation_id, settings });
+  pendingBuffer.items.push({ content, imgs, conversation_id, settings, msgId });
+  console.log(`[CHAT] 入 buffer (count=${pendingBuffer.items.length}, readyToFlush=${pendingBuffer.readyToFlush})`);
   safeSend(ws, { type: 'buffering', count: pendingBuffer.items.length, waitMs: bufferTime * 1000 });
 
   // 达到条数上限：立刻标记 ready
   if (pendingBuffer.items.length >= shortMsgCount) {
     if (pendingBuffer.timer) { clearTimeout(pendingBuffer.timer); pendingBuffer.timer = null; }
     pendingBuffer.readyToFlush = true;
+    console.log(`[CHAT] 条数满 (${pendingBuffer.items.length}>=${shortMsgCount})，flush`);
     return tryFlushBuffer();
   }
 
@@ -2142,33 +2155,47 @@ async function handleChat(ws, msg) {
       if (!pendingBuffer) return;
       pendingBuffer.timer = null;
       pendingBuffer.readyToFlush = true;
+      console.log(`[CHAT] bufferTime 到期 (${bufferTime}s)，flush`);
       tryFlushBuffer();
     }, bufferTime * 1000);
   } else {
     // bufferTime=0 但 CC 忙：直接 ready，等 turn_done 触发
     pendingBuffer.readyToFlush = true;
+    console.log('[CHAT] bufferTime=0 + CC忙，标记 ready 等 turn_done');
     tryFlushBuffer();
   }
 }
 
 function tryFlushBuffer() {
-  if (!pendingBuffer || !pendingBuffer.readyToFlush) return;
-  if (activeTurn) return; // CC 忙，等 turn_done
+  if (!pendingBuffer || !pendingBuffer.readyToFlush) {
+    if (pendingBuffer) console.log(`[CHAT] tryFlush 跳过 (readyToFlush=${pendingBuffer.readyToFlush})`);
+    return;
+  }
+  if (activeTurn) {
+    console.log('[CHAT] tryFlush 跳过 (CC 忙)');
+    return;
+  }
   const items = pendingBuffer.items;
   const ws = pendingBuffer.ws;
   pendingBuffer = null;
+  const flushedIds = items.map(i => i.msgId).filter(Boolean);
+  console.log(`[CHAT] flush ${items.length} 条消息给 CC`);
+  if (flushedIds.length) safeSend(ws, { type: 'flushed', ids: flushedIds });
   flushPendingToCC(ws, items).catch(e => console.error('flush failed:', e));
 }
 
 // CC 刚空闲后调用：先 tryFlush，如果缓冲区还没 ready 就给 2 秒窗口再送出
 function flushOrGrace() {
+  console.log(`[CHAT] flushOrGrace (pendingBuffer=${!!pendingBuffer}, readyToFlush=${pendingBuffer?.readyToFlush})`);
   tryFlushBuffer();
   if (pendingBuffer && !pendingBuffer.readyToFlush) {
     if (pendingBuffer.timer) clearTimeout(pendingBuffer.timer);
+    console.log('[CHAT] grace 2s 窗口启动');
     pendingBuffer.timer = setTimeout(() => {
       if (!pendingBuffer) return;
       pendingBuffer.timer = null;
       pendingBuffer.readyToFlush = true;
+      console.log('[CHAT] grace 2s 到期，flush');
       tryFlushBuffer();
     }, 2000);
   }
