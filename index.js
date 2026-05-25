@@ -1628,13 +1628,22 @@ app.post('/api/conversations', async (req, res) => {
 });
 
 app.get('/api/conversations/:id/messages', async (req, res) => {
-  const { data, error } = await supabase
-    .from('messages')
-    .select('id, role, content, thinking, tool_calls, images, token_input, token_output, cache_detail, event, created_at')
-    .eq('conversation_id', req.params.id)
-    .order('created_at', { ascending: true });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  const pageSize = 1000;
+  let all = [];
+  let from = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('id, role, content, thinking, tool_calls, images, token_input, token_output, cache_detail, event, created_at')
+      .eq('conversation_id', req.params.id)
+      .order('created_at', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) return res.status(500).json({ error: error.message });
+    all = all.concat(data);
+    if (data.length < pageSize) break;
+    from += pageSize;
+  }
+  res.json(all);
 });
 
 // 消息编辑 / 删除（给前端的编辑和重新生成用）
