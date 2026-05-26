@@ -212,6 +212,11 @@ function extractSummaryBlock(text) {
 const FUXIAN_CLAUDE_MD = '/home/claude-user/.claude/CLAUDE.md';
 const FUXIAN_REGEX = /<浮现>[\s\S]*?<\/浮现>/;
 
+// <think指令> 区段：控制 Opus 4.7 thinking 复述，同一个文件
+const THINK_REGEX = /<think指令>[\s\S]*?<\/think指令>/;
+const THINK_WRAP = '在每次回复的最开头，用 <think>...</think> 标签包裹你的思考过程，然后再写正式回复。';
+const THINK_INSTRUCTION = `<think指令>\n${THINK_WRAP}\n</think指令>`;
+
 async function clearFuxianBlock() {
   let existing;
   try { existing = await fs.promises.readFile(FUXIAN_CLAUDE_MD, 'utf8'); }
@@ -295,7 +300,7 @@ async function syncCCDocs() {
     for (const d of data || []) {
       try {
         if (d.doc_type === 'claude_md') {
-          // 跟 <浮现> 同款处理：覆盖前先抽 <上次对话总结> 区段保留，避免被 supabase 文档冲掉
+          // 覆盖前先抽 <上次对话总结> 和 <think指令> 区段保留，避免被 supabase 文档冲掉
           const claudeMdPath = path.join(SANDBOX_DIR, 'CLAUDE.md');
           let merged = d.content || '';
           try {
@@ -304,6 +309,11 @@ async function syncCCDocs() {
             if (block) {
               const sep = merged && !merged.endsWith('\n') ? '\n\n' : (merged ? '\n' : '');
               merged = merged + sep + block + '\n';
+            }
+            const thinkBlock = THINK_REGEX.exec(cur);
+            if (thinkBlock && thinkBlock[0].replace(/<\/?think指令>/g, '').trim()) {
+              const sep2 = merged && !merged.endsWith('\n') ? '\n' : '';
+              merged = merged + sep2 + thinkBlock[0] + '\n';
             }
           } catch {}
           await writeAsClaudeUser(claudeMdPath, merged);
@@ -722,6 +732,39 @@ app.put('/api/claude-md', (req, res) => {
   try {
     fs.writeFileSync('/home/claude-user/chat-sandbox/CLAUDE.md', req.body.content, 'utf-8');
     res.json({ ok: true, message: '已保存，下次重启CC生效' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// thinking 指令开关：读取 / 切换 sandbox/CLAUDE.md 中的 <think指令> 区段
+const SANDBOX_CLAUDE_MD = path.join(SANDBOX_DIR, 'CLAUDE.md');
+app.get('/api/thinking-toggle', (req, res) => {
+  try {
+    const content = fs.readFileSync(SANDBOX_CLAUDE_MD, 'utf-8');
+    const m = /<think指令>([\s\S]*?)<\/think指令>/.exec(content);
+    const raw = m ? m[1].trim() : '';
+    const enabled = !!raw;
+    const guidance = raw.replace(THINK_WRAP, '').trim();
+    res.json({ enabled, instruction: guidance });
+  } catch { res.json({ enabled: false, instruction: '' }); }
+});
+
+app.post('/api/thinking-toggle', async (req, res) => {
+  try {
+    const { enabled, instruction } = req.body;
+    const guidance = (typeof instruction === 'string') ? instruction.trim() : '';
+    const full = guidance ? `${THINK_WRAP}\n${guidance}` : THINK_WRAP;
+    let content;
+    try { content = await fs.promises.readFile(SANDBOX_CLAUDE_MD, 'utf8'); }
+    catch { content = ''; }
+    const block = enabled ? `<think指令>\n${full}\n</think指令>` : '<think指令>\n</think指令>';
+    if (THINK_REGEX.test(content)) {
+      content = content.replace(THINK_REGEX, block);
+    } else {
+      const sep = content && !content.endsWith('\n') ? '\n' : '';
+      content = content + sep + block + '\n';
+    }
+    await writeAsClaudeUser(SANDBOX_CLAUDE_MD, content);
+    res.json({ ok: true, enabled });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1147,7 +1190,7 @@ app.post('/api/cc/inject', async (req, res) => {
 
 // 从 JSONL 读取某个 session 的 user/assistant 消息
 // 一个 turn 可能有多条 assistant 事件（thinking / text / tool_use 分开），需要合并
-function readSessionMessages(sessionId) {
+function readSessionMessages(sessionId, { keepBubbles = false } = {}) {
   const jsonlPath = path.join(CC_JSONL_DIR, `${sessionId}.jsonl`);
   if (!fs.existsSync(jsonlPath)) return null;
   const raw = fs.readFileSync(jsonlPath, 'utf-8');
@@ -1157,8 +1200,11 @@ function readSessionMessages(sessionId) {
 
   const flushAssistant = () => {
     if (!pendingAssistant) return;
-    // 去掉 ---bubble--- 标记
-    pendingAssistant.content = pendingAssistant.content.replace(/---bubble---/g, '').replace(/\n{3,}/g, '\n\n').trim();
+    if (keepBubbles) {
+      pendingAssistant.content = pendingAssistant.content.replace(/\n{3,}/g, '\n\n').trim();
+    } else {
+      pendingAssistant.content = pendingAssistant.content.replace(/---bubble---/g, '').replace(/\n{3,}/g, '\n\n').trim();
+    }
     if (pendingAssistant.content) messages.push(pendingAssistant);
     pendingAssistant = null;
   };
@@ -1179,12 +1225,12 @@ function readSessionMessages(sessionId) {
           if (text.includes('【系统任务·对话上下文注入】')) {
             skipNextAssistant = true;
           } else if (text.trim()) {
-            messages.push({ role: 'user', content: text.trim(), thinking: null });
+            messages.push({ role: 'user', content: text.trim(), thinking: null, created_at: ev.timestamp || null });
           }
         }
       } else if (ev.type === 'assistant') {
         if (skipNextAssistant) { skipNextAssistant = false; continue; }
-        if (!pendingAssistant) pendingAssistant = { role: 'assistant', content: '', thinking: null };
+        if (!pendingAssistant) pendingAssistant = { role: 'assistant', content: '', thinking: null, created_at: ev.timestamp || null };
         const blocks = ev.message?.content;
         if (Array.isArray(blocks)) {
           for (const b of blocks) {
@@ -1201,10 +1247,81 @@ function readSessionMessages(sessionId) {
   return messages;
 }
 
+// 列出所有 session 文件（拾光用）
+app.get('/api/cc/sessions', async (req, res) => {
+  try {
+    const files = (await fs.promises.readdir(CC_JSONL_DIR)).filter(f => f.endsWith('.jsonl'));
+    const sessions = await Promise.all(files.map(async (file) => {
+      const id = file.replace(/\.jsonl$/, '');
+      const filePath = path.join(CC_JSONL_DIR, file);
+      const stat = await fs.promises.stat(filePath);
+      let preview = '';
+      try {
+        const fd = await fs.promises.open(filePath, 'r');
+        const buf = Buffer.alloc(8192);
+        const { bytesRead } = await fd.read(buf, 0, 8192, 0);
+        await fd.close();
+        const head = buf.toString('utf-8', 0, bytesRead);
+        for (const line of head.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.type === 'user') {
+              const content = ev.message?.content;
+              const text = typeof content === 'string' ? content
+                : Array.isArray(content) ? content.filter(b => b.type === 'text').map(b => b.text || '').join(' ')
+                : '';
+              if (text && !text.includes('【系统任务')) { preview = text.slice(0, 80); break; }
+            }
+          } catch {}
+        }
+      } catch {}
+      return { id, mtime: stat.mtimeMs, size: stat.size, preview };
+    }));
+    sessions.sort((a, b) => b.mtime - a.mtime);
+    res.json({ sessions, total: sessions.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 搜索所有 session 内容，返回每个 session 的匹配数（拾光用）
+app.get('/api/cc/sessions/search', async (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (!q) return res.json({ matches: {} });
+  try {
+    const files = (await fs.promises.readdir(CC_JSONL_DIR)).filter(f => f.endsWith('.jsonl'));
+    const matches = {};
+    await Promise.all(files.map(async (file) => {
+      const id = file.replace(/\.jsonl$/, '');
+      try {
+        const raw = await fs.promises.readFile(path.join(CC_JSONL_DIR, file), 'utf-8');
+        let count = 0;
+        for (const line of raw.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.type !== 'user' && ev.type !== 'assistant') continue;
+            const blocks = ev.message?.content;
+            let text = '';
+            if (typeof blocks === 'string') text = blocks;
+            else if (Array.isArray(blocks)) text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join(' ');
+            if (text.toLowerCase().includes(q)) count++;
+          } catch {}
+        }
+        if (count > 0) matches[id] = count;
+      } catch {}
+    }));
+    res.json({ matches });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 读取旧 session 的聊天记录（给前端预览用）
 app.get('/api/cc/session-messages/:sid', (req, res) => {
   try {
-    const msgs = readSessionMessages(req.params.sid);
+    const msgs = readSessionMessages(req.params.sid, { keepBubbles: true });
     if (!msgs) return res.status(404).json({ error: 'JSONL 不存在' });
     res.json({ messages: msgs, count: msgs.length, thinkingCount: msgs.filter(m => m.thinking).length });
   } catch (e) {
