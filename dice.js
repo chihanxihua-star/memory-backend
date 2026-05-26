@@ -80,6 +80,13 @@ export class DiceDaemon {
     }
   }
 
+  resetOnMessage() {
+    const cfg = readConfig();
+    if (cfg.dice_enabled === false) return;
+    this.stop();
+    this._scheduleNext();
+  }
+
   _scheduleNext() {
     const cfg = readConfig();
     if (cfg.dice_enabled === false) return;
@@ -183,17 +190,6 @@ export class DiceDaemon {
   }
 
   _judge(cfg, appSummary) {
-    const hour = getLocalHour();
-    const quietStart = cfg.dice_quiet_hours?.[0] ?? 1;
-    const quietEnd = cfg.dice_quiet_hours?.[1] ?? 8;
-    const inQuiet = quietStart < quietEnd
-      ? (hour >= quietStart && hour < quietEnd)
-      : (hour >= quietStart || hour < quietEnd);
-
-    if (inQuiet) {
-      return { skip: true, code: 'skip_night', reason: `凌晨${hour}点，她应该在睡觉` };
-    }
-
     if (appSummary) {
       const busyApps = /学习|作业|备忘录|笔记|office|word|excel|ppt|wps|钉钉|飞书|企业微信|考试|题库/i;
       if (busyApps.test(appSummary)) {

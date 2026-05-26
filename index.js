@@ -374,6 +374,16 @@ let activeTurn = null; // { ws, conversationId, settings, silent }
 const summaryTriggers = new Map(); // conversation_id -> last k triggered
 let pendingSummary = null; // { conversationId, summaryLength }
 let lastActiveConvId = null; // bark 主动消息存到最近活跃的对话
+(async () => {
+  try {
+    const { data } = await supabase.from('messages').select('conversation_id')
+      .order('created_at', { ascending: false }).limit(1);
+    if (data?.[0]?.conversation_id) {
+      lastActiveConvId = data[0].conversation_id;
+      console.log('[INIT] lastActiveConvId =', lastActiveConvId);
+    }
+  } catch (e) { console.warn('[INIT] 获取 lastActiveConvId 失败:', e.message); }
+})();
 
 // 短消息模式：累积用户消息，bufferTime 内无新消息就合并发给 CC
 // { ws, items: [{content, imgs, conversation_id, settings}], timer, readyToFlush }
@@ -2114,6 +2124,8 @@ async function handleChat(ws, msg) {
 
   if (conversation_id) lastActiveConvId = conversation_id;
 
+  diceDaemon.resetOnMessage();
+
   // 用户消息照常落库（每条独立一行，保留时间线）
   if (conversation_id) {
     try {
@@ -2141,7 +2153,7 @@ async function handleChat(ws, msg) {
 
   // 否则进入缓冲
   if (!pendingBuffer) {
-    pendingBuffer = { ws, items: [], timer: null, readyToFlush: false };
+    pendingBuffer = { ws, items: [], timer: null, readyToFlush: false, bufferTime };
   } else {
     pendingBuffer.ws = ws;
   }
@@ -2195,9 +2207,13 @@ function tryFlushBuffer() {
 
 // CC 刚空闲后调用：先 tryFlush，如果缓冲区还没 ready 就给 2 秒窗口再送出
 function flushOrGrace() {
-  console.log(`[CHAT] flushOrGrace (pendingBuffer=${!!pendingBuffer}, readyToFlush=${pendingBuffer?.readyToFlush})`);
+  console.log(`[CHAT] flushOrGrace (pendingBuffer=${!!pendingBuffer}, readyToFlush=${pendingBuffer?.readyToFlush}, bufferTime=${pendingBuffer?.bufferTime})`);
   tryFlushBuffer();
   if (pendingBuffer && !pendingBuffer.readyToFlush) {
+    if (pendingBuffer.bufferTime > 0) {
+      console.log('[CHAT] 短消息模式，不自动 grace，等用户手动发送');
+      return;
+    }
     if (pendingBuffer.timer) clearTimeout(pendingBuffer.timer);
     console.log('[CHAT] grace 2s 窗口启动');
     pendingBuffer.timer = setTimeout(() => {
