@@ -95,10 +95,10 @@ export class CCProcessManager extends EventEmitter {
         console.error('recordSessionStart failed:', e?.message || e)
       );
     }
-    const proc = spawn('sudo', ['-u', 'claude-user', '-H', '--preserve-env=PATH,ENABLE_PROMPT_CACHING_1H', 'claude', ...claudeArgs], {
+    const proc = spawn('sudo', ['-u', 'claude-user', '-H', '--preserve-env=PATH,ENABLE_PROMPT_CACHING_1H', '/usr/bin/claude', ...claudeArgs], {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.cwd,
-      env: { ...process.env, FORCE_COLOR: '0', ENABLE_PROMPT_CACHING_1H: '1' },
+      env: { ...process.env, PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', FORCE_COLOR: '0', ENABLE_PROMPT_CACHING_1H: '1' },
     });
     this.proc = proc;
 
@@ -154,12 +154,16 @@ export class CCProcessManager extends EventEmitter {
   }
 
   handleEvent(ev) {
+    console.log(`[CC-EVENT] type=${ev.type} subtype=${ev.subtype || ''} currentTurn=${!!this.currentTurn}${ev.type === 'result' ? ' is_error=' + ev.is_error + ' result=' + JSON.stringify(ev.result || '').slice(0, 200) : ''}`);
     switch (ev.type) {
       case 'system':
         if (ev.subtype === 'init') {
           if (!this.currentTurn) {
+            console.log('[CC-EVENT] ✅ 新建 currentTurn');
             this.currentTurn = { text: '', thinking: '', toolIds: new Set() };
             this.emit('turn_start');
+          } else {
+            console.log('[CC-EVENT] ⏩ currentTurn 已存在，跳过 init（轮内 tool 续）');
           }
         }
         break;
@@ -199,6 +203,7 @@ export class CCProcessManager extends EventEmitter {
         for (const b of blocks) {
           if (b.type === 'tool_use' && b.id && !this.currentTurn.toolIds.has(b.id)) {
             this.currentTurn.toolIds.add(b.id);
+            console.log(`[CC-EVENT] 🔧 tool_use: ${b.name} id=${b.id} input=${JSON.stringify(b.input || {}).slice(0, 150)}`);
             this.emit('tool_use', { id: b.id, name: b.name, input: b.input || {} });
           }
         }
@@ -272,6 +277,7 @@ export class CCProcessManager extends EventEmitter {
 
   send(content) {
     if (!this.proc) throw new Error('CC进程未运行');
+    console.log(`[CC-SEND] currentTurn=${!!this.currentTurn} → null, content=${typeof content === 'string' ? content.slice(0, 80) : 'blocks[' + (content?.length || 0) + ']'}`);
     this.currentTurn = null;
     // content 可以是字符串，或 Anthropic content-block 数组（用于带图片的消息）
     const payload = typeof content === 'string' || Array.isArray(content) ? content : String(content);
