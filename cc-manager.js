@@ -74,6 +74,7 @@ export class CCProcessManager extends EventEmitter {
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--include-partial-messages',
+      '--thinking-display', 'summarized',
       '--dangerously-skip-permissions',
       '--allowedTools', 'mcp__supabase__*',
     ];
