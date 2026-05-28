@@ -83,7 +83,7 @@ export class CCProcessManager extends EventEmitter {
       claudeArgs.push('--session-id', this.sessionId);
     }
     if (this.model) claudeArgs.push('--model', this.model);
-    if (this.effort) claudeArgs.push('--effort', this.effort);
+    if (this.effort && this.effort !== 'off') claudeArgs.push('--effort', this.effort);
     if (this.appendSystemPrompt) claudeArgs.push('--append-system-prompt', this.appendSystemPrompt);
 
     console.log(`${resuming ? '🔁 接 forge session' : '🚀 启动CC'} (session=${this.sessionId}${this.model ? ', model=' + this.model : ''}${this.effort ? ', effort=' + this.effort : ''}${this.appendSystemPrompt ? ', sys-prompt=' + this.appendSystemPrompt.length + 'ch' : ''})`);
@@ -155,6 +155,9 @@ export class CCProcessManager extends EventEmitter {
 
   handleEvent(ev) {
     console.log(`[CC-EVENT] type=${ev.type} subtype=${ev.subtype || ''} currentTurn=${!!this.currentTurn}${ev.type === 'result' ? ' is_error=' + ev.is_error + ' result=' + JSON.stringify(ev.result || '').slice(0, 200) : ''}`);
+    if (ev.type === 'rate_limit_event') {
+      console.log(`[CC-RATELIMIT] ${new Date().toISOString()} ${JSON.stringify(ev).slice(0, 1500)}`);
+    }
     switch (ev.type) {
       case 'system':
         if (ev.subtype === 'init') {

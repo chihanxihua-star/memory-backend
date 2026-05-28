@@ -212,10 +212,8 @@ function extractSummaryBlock(text) {
 const FUXIAN_CLAUDE_MD = '/home/claude-user/.claude/CLAUDE.md';
 const FUXIAN_REGEX = /<浮现>[\s\S]*?<\/浮现>/;
 
-// <think指令> 区段：控制 Opus 4.7 thinking 复述，同一个文件
+// <think指令> 区段：跟 use-style 同款的纯指令开关（写 chat-sandbox/CLAUDE.md）
 const THINK_REGEX = /<think指令>[\s\S]*?<\/think指令>/;
-const THINK_WRAP = '在每次回复的最开头，用 <think>...</think> 标签包裹你的思考过程，然后再写正式回复。';
-const THINK_INSTRUCTION = `<think指令>\n${THINK_WRAP}\n</think指令>`;
 
 // <use-style> 区段：风格指令，跟 think指令 同机制
 const STYLE_REGEX = /<use-style>[\s\S]*?<\/use-style>/;
@@ -745,26 +743,38 @@ app.put('/api/claude-md', (req, res) => {
 
 // thinking 指令开关：读取 / 切换 chat-sandbox/CLAUDE.md 中的 <think指令> 区段
 const SANDBOX_CLAUDE_MD = path.join(SANDBOX_DIR, 'CLAUDE.md');
+// 开关草稿：关开关时生效区段写空，但内容存这里，GET 读回，刷新/重启都不丢
+const TOGGLE_DRAFTS_PATH = '/root/memory-home/server/.toggle-drafts.json';
+function readToggleDraft(key) {
+  try { return JSON.parse(fs.readFileSync(TOGGLE_DRAFTS_PATH, 'utf8'))[key] || ''; }
+  catch { return ''; }
+}
+function writeToggleDraft(key, val) {
+  let d = {};
+  try { d = JSON.parse(fs.readFileSync(TOGGLE_DRAFTS_PATH, 'utf8')); } catch {}
+  d[key] = val;
+  try { fs.writeFileSync(TOGGLE_DRAFTS_PATH, JSON.stringify(d, null, 2)); }
+  catch (e) { console.warn('写开关草稿失败:', e.message); }
+}
+
 app.get('/api/thinking-toggle', (req, res) => {
   try {
     const content = fs.readFileSync(SANDBOX_CLAUDE_MD, 'utf-8');
     const m = /<think指令>([\s\S]*?)<\/think指令>/.exec(content);
     const raw = m ? m[1].trim() : '';
-    const enabled = !!raw;
-    const guidance = raw.replace(THINK_WRAP, '').trim();
-    res.json({ enabled, instruction: guidance });
+    res.json({ enabled: !!raw, instruction: readToggleDraft('think') || raw });
   } catch { res.json({ enabled: false, instruction: '' }); }
 });
 
 app.post('/api/thinking-toggle', async (req, res) => {
   try {
     const { enabled, instruction } = req.body;
-    const guidance = (typeof instruction === 'string') ? instruction.trim() : '';
-    const full = guidance ? `${THINK_WRAP}\n${guidance}` : THINK_WRAP;
+    const text = (typeof instruction === 'string') ? instruction.trim() : '';
+    if (text) writeToggleDraft('think', text);
     let content;
     try { content = await fs.promises.readFile(SANDBOX_CLAUDE_MD, 'utf8'); }
     catch { content = ''; }
-    const block = enabled ? `<think指令>\n${full}\n</think指令>` : '<think指令>\n</think指令>';
+    const block = enabled && text ? `<think指令>\n${text}\n</think指令>` : '<think指令>\n</think指令>';
     if (THINK_REGEX.test(content)) {
       content = content.replace(THINK_REGEX, block);
     } else {
@@ -772,7 +782,7 @@ app.post('/api/thinking-toggle', async (req, res) => {
       content = content + sep + block + '\n';
     }
     await writeAsClaudeUser(SANDBOX_CLAUDE_MD, content);
-    res.json({ ok: true, enabled });
+    res.json({ ok: true, enabled: !!(enabled && text) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -781,7 +791,7 @@ app.get('/api/use-style', (req, res) => {
     const content = fs.readFileSync(SANDBOX_CLAUDE_MD, 'utf-8');
     const m = /<use-style>([\s\S]*?)<\/use-style>/.exec(content);
     const raw = m ? m[1].trim() : '';
-    res.json({ enabled: !!raw, instruction: raw });
+    res.json({ enabled: !!raw, instruction: readToggleDraft('style') || raw });
   } catch { res.json({ enabled: false, instruction: '' }); }
 });
 
@@ -789,6 +799,7 @@ app.post('/api/use-style', async (req, res) => {
   try {
     const { enabled, instruction } = req.body;
     const text = (typeof instruction === 'string') ? instruction.trim() : '';
+    if (text) writeToggleDraft('style', text);
     let content;
     try { content = await fs.promises.readFile(SANDBOX_CLAUDE_MD, 'utf8'); }
     catch { content = ''; }
