@@ -214,6 +214,8 @@ const FUXIAN_REGEX = /<浮现>[\s\S]*?<\/浮现>/;
 
 // <think指令> 区段：跟 use-style 同款的纯指令开关（写 chat-sandbox/CLAUDE.md）
 const THINK_REGEX = /<think指令>[\s\S]*?<\/think指令>/;
+// 包裹指令：开启「思考链」时追加这条，让 CC 把思考用 <think>…</think> 写进正文（再由 turn_done 抽出、折叠进思绪）
+const THINK_WRAP = '在每次回复的最开头，用 <think>...</think> 标签包裹你的思考过程，然后再写正式回复。';
 
 // <use-style> 区段：风格指令，跟 think指令 同机制
 const STYLE_REGEX = /<use-style>[\s\S]*?<\/use-style>/;
@@ -762,7 +764,9 @@ app.get('/api/thinking-toggle', (req, res) => {
     const content = fs.readFileSync(SANDBOX_CLAUDE_MD, 'utf-8');
     const m = /<think指令>([\s\S]*?)<\/think指令>/.exec(content);
     const raw = m ? m[1].trim() : '';
-    res.json({ enabled: !!raw, instruction: readToggleDraft('think') || raw });
+    const enabled = raw.includes(THINK_WRAP);          // enabled = 区段里有没有包裹指令
+    const guidance = raw.replace(THINK_WRAP, '').trim(); // 纯引导文本（去掉包裹指令）
+    res.json({ enabled, instruction: readToggleDraft('think') || guidance });
   } catch { res.json({ enabled: false, instruction: '' }); }
 });
 
@@ -774,7 +778,13 @@ app.post('/api/thinking-toggle', async (req, res) => {
     let content;
     try { content = await fs.promises.readFile(SANDBOX_CLAUDE_MD, 'utf8'); }
     catch { content = ''; }
-    const block = enabled && text ? `<think指令>\n${text}\n</think指令>` : '<think指令>\n</think指令>';
+    // 引导文本恒注入（保存即写，跟 use-style 一样）；只有开启时才追加包裹指令。
+    // 包裹指令放最前（跟旧版 aedb62a 一致），否则会被后面的长引导淹没、4.7 只走原生不写 <think>
+    const parts = [];
+    if (enabled) parts.push(THINK_WRAP);
+    if (text) parts.push(text);
+    const inner = parts.join('\n\n');
+    const block = inner ? `<think指令>\n${inner}\n</think指令>` : '<think指令>\n</think指令>';
     if (THINK_REGEX.test(content)) {
       content = content.replace(THINK_REGEX, block);
     } else {
@@ -782,7 +792,7 @@ app.post('/api/thinking-toggle', async (req, res) => {
       content = content + sep + block + '\n';
     }
     await writeAsClaudeUser(SANDBOX_CLAUDE_MD, content);
-    res.json({ ok: true, enabled: !!(enabled && text) });
+    res.json({ ok: true, enabled: !!enabled });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
