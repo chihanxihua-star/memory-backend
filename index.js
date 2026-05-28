@@ -367,6 +367,7 @@ const cc = new CCProcessManager({
   cwd: SANDBOX_DIR,
   effort: savedCfg.effort || 'high',
   model: savedCfg.model || null,
+  nativeThinking: savedCfg.nativeThinking || false,
 });
 // 启动前先把 documents_cheng 的内容拉下来落盘 + 注入 system_prompt
 const _initSysPrompt = await syncCCDocs();
@@ -766,7 +767,7 @@ app.get('/api/thinking-toggle', (req, res) => {
     const raw = m ? m[1].trim() : '';
     const enabled = raw.includes(THINK_WRAP);          // enabled = 区段里有没有包裹指令
     const guidance = raw.replace(THINK_WRAP, '').trim(); // 纯引导文本（去掉包裹指令）
-    res.json({ enabled, instruction: readToggleDraft('think') || guidance });
+    res.json({ enabled, instruction: readToggleDraft('think') || guidance, nativeThinking: !!cc.nativeThinking });
   } catch { res.json({ enabled: false, instruction: '' }); }
 });
 
@@ -996,6 +997,10 @@ app.post('/api/cc/restart', async (req, res) => {
     if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'effort')) {
       opts.effort = req.body.effort;
       patch.effort = req.body.effort || null;
+    }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'nativeThinking')) {
+      opts.nativeThinking = !!req.body.nativeThinking;
+      patch.nativeThinking = !!req.body.nativeThinking;
     }
     // 模型切换进度通过 WebSocket "system" 消息广播。
     // 同一个 progressId：先发 forge_pending（前端渲染思绪样式动画），

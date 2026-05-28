@@ -35,6 +35,7 @@ export class CCProcessManager extends EventEmitter {
     this.restartTimer = null;
     this.model = options.model || null; // 默认跟随 CC 用户配置
     this.effort = options.effort || null; // low / medium / high / xhigh / max
+    this.nativeThinking = options.nativeThinking || false; // 开 = 加 --thinking-display summarized
     this.appendSystemPrompt = options.appendSystemPrompt || null;
     this.failedResumeSids = new Set(); // 试过 --resume 但 CC 启不来的 sid，避免死循环
     this.lastResumeAttemptSid = null;  // 本轮 start() 用的 resume sid（成功后清零）
@@ -74,7 +75,6 @@ export class CCProcessManager extends EventEmitter {
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--include-partial-messages',
-      '--thinking-display', 'summarized',
       '--dangerously-skip-permissions',
       '--allowedTools', 'mcp__supabase__*',
     ];
@@ -85,6 +85,7 @@ export class CCProcessManager extends EventEmitter {
     }
     if (this.model) claudeArgs.push('--model', this.model);
     if (this.effort && this.effort !== 'off') claudeArgs.push('--effort', this.effort);
+    if (this.nativeThinking) claudeArgs.push('--thinking-display', 'summarized');
     if (this.appendSystemPrompt) claudeArgs.push('--append-system-prompt', this.appendSystemPrompt);
 
     console.log(`${resuming ? '🔁 接 forge session' : '🚀 启动CC'} (session=${this.sessionId}${this.model ? ', model=' + this.model : ''}${this.effort ? ', effort=' + this.effort : ''}${this.appendSystemPrompt ? ', sys-prompt=' + this.appendSystemPrompt.length + 'ch' : ''})`);
@@ -295,6 +296,7 @@ export class CCProcessManager extends EventEmitter {
   async restart(options = {}) {
     if (options.model !== undefined) this.model = options.model || null;
     if (options.effort !== undefined) this.effort = options.effort || null;
+    if (options.nativeThinking !== undefined) this.nativeThinking = !!options.nativeThinking;
     console.log(`🔄 重启CC${this.model ? ' (model=' + this.model + ')' : ''}${this.effort ? ' (effort=' + this.effort + ')' : ''}...`);
     this.stopping = true;
     if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
