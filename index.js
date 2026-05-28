@@ -217,6 +217,9 @@ const THINK_REGEX = /<think指令>[\s\S]*?<\/think指令>/;
 const THINK_WRAP = '在每次回复的最开头，用 <think>...</think> 标签包裹你的思考过程，然后再写正式回复。';
 const THINK_INSTRUCTION = `<think指令>\n${THINK_WRAP}\n</think指令>`;
 
+// <use-style> 区段：风格指令，跟 think指令 同机制
+const STYLE_REGEX = /<use-style>[\s\S]*?<\/use-style>/;
+
 async function clearFuxianBlock() {
   let existing;
   try { existing = await fs.promises.readFile(FUXIAN_CLAUDE_MD, 'utf8'); }
@@ -314,6 +317,11 @@ async function syncCCDocs() {
             if (thinkBlock && thinkBlock[0].replace(/<\/?think指令>/g, '').trim()) {
               const sep2 = merged && !merged.endsWith('\n') ? '\n' : '';
               merged = merged + sep2 + thinkBlock[0] + '\n';
+            }
+            const styleBlock = STYLE_REGEX.exec(cur);
+            if (styleBlock && styleBlock[0].replace(/<\/?use-style>/g, '').trim()) {
+              const sep3 = merged && !merged.endsWith('\n') ? '\n' : '';
+              merged = merged + sep3 + styleBlock[0] + '\n';
             }
           } catch {}
           await writeAsClaudeUser(claudeMdPath, merged);
@@ -735,7 +743,7 @@ app.put('/api/claude-md', (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// thinking 指令开关：读取 / 切换 sandbox/CLAUDE.md 中的 <think指令> 区段
+// thinking 指令开关：读取 / 切换 chat-sandbox/CLAUDE.md 中的 <think指令> 区段
 const SANDBOX_CLAUDE_MD = path.join(SANDBOX_DIR, 'CLAUDE.md');
 app.get('/api/thinking-toggle', (req, res) => {
   try {
@@ -765,6 +773,34 @@ app.post('/api/thinking-toggle', async (req, res) => {
     }
     await writeAsClaudeUser(SANDBOX_CLAUDE_MD, content);
     res.json({ ok: true, enabled });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/use-style', (req, res) => {
+  try {
+    const content = fs.readFileSync(SANDBOX_CLAUDE_MD, 'utf-8');
+    const m = /<use-style>([\s\S]*?)<\/use-style>/.exec(content);
+    const raw = m ? m[1].trim() : '';
+    res.json({ enabled: !!raw, instruction: raw });
+  } catch { res.json({ enabled: false, instruction: '' }); }
+});
+
+app.post('/api/use-style', async (req, res) => {
+  try {
+    const { enabled, instruction } = req.body;
+    const text = (typeof instruction === 'string') ? instruction.trim() : '';
+    let content;
+    try { content = await fs.promises.readFile(SANDBOX_CLAUDE_MD, 'utf8'); }
+    catch { content = ''; }
+    const block = enabled && text ? `<use-style>\n${text}\n</use-style>` : '<use-style>\n</use-style>';
+    if (STYLE_REGEX.test(content)) {
+      content = content.replace(STYLE_REGEX, block);
+    } else {
+      const sep = content && !content.endsWith('\n') ? '\n' : '';
+      content = content + sep + block + '\n';
+    }
+    await writeAsClaudeUser(SANDBOX_CLAUDE_MD, content);
+    res.json({ ok: true, enabled: !!(enabled && text) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
