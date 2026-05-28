@@ -157,8 +157,10 @@ export class CCProcessManager extends EventEmitter {
     switch (ev.type) {
       case 'system':
         if (ev.subtype === 'init') {
-          this.currentTurn = { text: '', thinking: '', toolIds: new Set() };
-          this.emit('turn_start');
+          if (!this.currentTurn) {
+            this.currentTurn = { text: '', thinking: '', toolIds: new Set() };
+            this.emit('turn_start');
+          }
         }
         break;
 
@@ -270,7 +272,7 @@ export class CCProcessManager extends EventEmitter {
 
   send(content) {
     if (!this.proc) throw new Error('CC进程未运行');
-    if (this.currentTurn) throw new Error('CC 正在处理上一轮请求');
+    this.currentTurn = null;
     // content 可以是字符串，或 Anthropic content-block 数组（用于带图片的消息）
     const payload = typeof content === 'string' || Array.isArray(content) ? content : String(content);
     const msg = {
