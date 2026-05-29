@@ -7,9 +7,9 @@
 //   - 治空回靠交互模式本身；轮完成判定靠 "esc to interrupt" 消失。
 import { execFile } from 'child_process';
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 
 function sh(cmd, args, input) {
   return new Promise((resolve, reject) => {
@@ -38,12 +38,16 @@ export class TmuxCCManager extends EventEmitter {
     this.nativeThinking = options.nativeThinking || false;
     this.appendSystemPrompt = options.appendSystemPrompt || null;
     this.projectDir = projectDirFor(this.cwd);
-    this.transcript = null;       // 当前 session 的 jsonl 路径
+    this.transcript = null;       // 当前 session 的 jsonl 路径（start 时按 sessionId 定）
+    this.sessionId = null;        // 启动时生成、用 --session-id 传给 claude
+    this.running = false;         // isRunning() 同步返回这个
+    this.resumedFromForge = false;// 交互模式不走 forge，恒 false（对齐 cc-manager 字段）
     this.busy = false;
     this.stopping = false;
     this.lastInputTokens = 0;
     this.firstContextTokens = 0;
     this._watching = false;
+    this._watchdog = null;
   }
 
   setAppendSystemPrompt(text) { this.appendSystemPrompt = text || null; }
@@ -52,7 +56,8 @@ export class TmuxCCManager extends EventEmitter {
     // append-system-prompt 走 CLAUDE.md（交互模式靠会话开场读），这里只拼基本 flag
     const parts = ['DISABLE_AUTOUPDATER=1', '/usr/bin/claude',
       '--model', this.model, '--dangerously-skip-permissions',
-      "--allowedTools", "'mcp__supabase__*'"];
+      "--allowedTools", "'mcp__supabase__*'",
+      '--session-id', this.sessionId];   // 确定 sessionId + transcript 路径
     if (this.effort && this.effort !== 'off') parts.push('--effort', this.effort);
     if (this.nativeThinking) parts.push('--thinking-display', 'summarized');
     return parts.join(' ');
@@ -60,6 +65,11 @@ export class TmuxCCManager extends EventEmitter {
 
   async start() {
     this.stopping = false;
+    this.running = false;
+    this.resumedFromForge = false;
+    this.sessionId = randomUUID();
+    this.transcript = path.join(this.projectDir, this.sessionId + '.jsonl');
+    this.firstContextTokens = 0; this.lastInputTokens = 0;
     await tmux('kill-session', '-t', this.session).catch(() => {});
     await sleep(800);
     await tmux('new-session', '-d', '-s', this.session, '-x', '220', '-y', '50', '-c', this.cwd);
@@ -72,7 +82,7 @@ export class TmuxCCManager extends EventEmitter {
       await sleep(1000);
       const pane = await this._pane();
       // 1) 就绪优先：CC 的 footer 出现 = UI 起来了（比 "for agents" 可靠，后者会被截断）
-      if (/bypass permissions on|for agents/.test(pane)) { this.emit('state', 'ready'); return; }
+      if (/bypass permissions on|for agents/.test(pane)) { this.running = true; this._startWatchdog(); this.emit('state', 'ready'); return; }
       // 2) 信任文件夹确认
       if (/Is this a project you created or one you trust/.test(pane)) {
         await tmux('send-keys', '-t', this.session, 'Enter'); continue;
@@ -85,8 +95,11 @@ export class TmuxCCManager extends EventEmitter {
         continue;
       }
     }
+    this.running = false;
     this.emit('state', 'down');
-    throw new Error(`CC 交互界面未就绪（启动重试 ${launchRetries} 次）`);
+    // 不 throw：index.js 在 375 行非 await 调用 start()，throw 会成未捕获 rejection。
+    // 失败就保持 down，autoRestart 看门狗（见 _watchTurn/exit）会再拉。
+    console.error(`[tmux] CC 交互界面未就绪（启动重试 ${launchRetries} 次）`);
   }
 
   async _pane() { return tmux('capture-pane', '-t', this.session, '-p').catch(() => ''); }
@@ -207,8 +220,9 @@ export class TmuxCCManager extends EventEmitter {
     return { text: texts.join('\n\n'), thinking: thinks.join('\n\n'), usage: usage || {} };
   }
 
-  async clearScreen() { // 清屏 = 原生 /clear
+  async clearScreen() { // 清屏 = 原生 /clear（注意：/clear 后 claude 会换新 session 文件）
     await tmux('send-keys', '-t', this.session, '/clear', 'Enter');
+    await sleep(1500);
     this.transcript = null; this.firstContextTokens = 0; this.lastInputTokens = 0;
   }
   async interrupt() { await tmux('send-keys', '-t', this.session, 'C-c'); }
@@ -227,9 +241,26 @@ export class TmuxCCManager extends EventEmitter {
 
   async stop() {
     this.stopping = true;
+    this.running = false;
+    if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
     await tmux('kill-session', '-t', this.session).catch(() => {});
   }
 
-  async isRunning() { return tmux('has-session', '-t', this.session).then(() => true).catch(() => false); }
+  isRunning() { return this.running; }  // 同步：index.js 里 if(!cc.isRunning()) 要这个
+
+  // 看门狗：每 10s 查会话还在不在；没了且非主动停 → 标 down + 自动重起（对齐 cc-manager autoRestart）
+  _startWatchdog() {
+    if (this._watchdog) clearInterval(this._watchdog);
+    this._watchdog = setInterval(async () => {
+      if (this.stopping || this._watching || this.busy) return; // 忙/重启中不查
+      const alive = await tmux('has-session', '-t', this.session).then(() => true).catch(() => false);
+      if (!alive && this.running) {
+        this.running = false;
+        this.emit('state', 'down');
+        console.warn('[tmux] 会话不在了，3s 后自动重起…');
+        setTimeout(() => { if (!this.stopping) this.start(); }, 3000);
+      }
+    }, 10000);
+  }
   isBusy() { return this.busy; }
 }

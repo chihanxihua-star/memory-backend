@@ -11,7 +11,9 @@ import { spawn as spawnProc, spawnSync } from 'child_process';
 import * as pty from 'node-pty';
 import { supabase, writeMemory, searchMemory, getDefaultProject } from './memory.js';
 import { CCProcessManager } from './cc-manager.js';
+import { TmuxCCManager } from './tmux-manager.js';
 import { runSurfacing } from './surfacing.js';
+import { buildMessageForCC } from './inject.js';
 import {
   parseBarkTags,
   removeBarkTags,
@@ -363,12 +365,17 @@ async function syncCCDocs() {
 }
 
 const savedCfg = loadCCConfig();
-const cc = new CCProcessManager({
+// 驱动选择：CC_DRIVER=tmux → 交互模式（治空回）；否则保持 stream-json（生产默认）。
+// 切流=设环境变量+重启；回滚=去掉变量+重启。
+const USE_TMUX = process.env.CC_DRIVER === 'tmux';
+const ccOpts = {
   cwd: SANDBOX_DIR,
   effort: savedCfg.effort || 'high',
-  model: savedCfg.model || null,
+  model: savedCfg.model || (USE_TMUX ? 'claude-opus-4-8' : null),
   nativeThinking: savedCfg.nativeThinking || false,
-});
+};
+const cc = USE_TMUX ? new TmuxCCManager({ ...ccOpts, session: 'cheng' }) : new CCProcessManager(ccOpts);
+console.log(`🧩 CC 驱动：${USE_TMUX ? 'tmux 交互' : 'stream-json'}`);
 // 启动前先把 documents_cheng 的内容拉下来落盘 + 注入 system_prompt
 const _initSysPrompt = await syncCCDocs();
 cc.setAppendSystemPrompt(_initSysPrompt);
@@ -2423,13 +2430,20 @@ async function flushPendingToCC(ws, items) {
   activeTurn = { ws, conversationId: conversation_id, settings, tools: [] };
 
   try {
-    try { await runSurfacing(combinedText); } catch (e) { console.error('[surfacing] uncaught:', e); }
-
     const prefixed = maybeTimePrefix(combinedText, conversation_id);
-    let payload = prefixed;
+    // 浮现：tmux 交互模式折进消息（长驻会话不重读 CLAUDE.md）；stream-json 仍写 CLAUDE.md。
+    let textForCC = prefixed;
+    if (USE_TMUX) {
+      const { message } = await buildMessageForCC(combinedText, prefixed);
+      textForCC = message;
+    } else {
+      try { await runSurfacing(combinedText); } catch (e) { console.error('[surfacing] uncaught:', e); }
+    }
+
+    let payload = textForCC;
     if (combinedImgs.length > 0) {
       const blocks = [];
-      if (prefixed && prefixed.length) blocks.push({ type: 'text', text: prefixed });
+      if (textForCC && textForCC.length) blocks.push({ type: 'text', text: textForCC });
       for (const dataUrl of combinedImgs) {
         const b = dataUrlToImageBlock(dataUrl);
         if (b) blocks.push(b);
