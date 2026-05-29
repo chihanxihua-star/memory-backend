@@ -176,7 +176,44 @@ async function writeBlock(blockText) {
   if (ids) { try { fs.chownSync(FUXIAN_PATH, ids[0], ids[1]); } catch {} }
 }
 
-// ─────── 主入口 ───────
+// ─────── 收集命中项（runSurfacing 与 surfaceForInject 共用）───────
+async function gatherItems(userText) {
+  const [boardItems, searchItems, rumination] = await Promise.all([
+    getUnreadBoard(),
+    searchMemory(userText),
+    getRandomL2(),
+  ]);
+  let items = [].concat(boardItems, searchItems);
+  if (rumination) items.push(rumination);
+  const seen = new Set();
+  return items.filter(it => {
+    const k = `${it.source}:${it.id}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  }).slice(0, MAX_ITEMS);
+}
+
+// ─────── tmux 交互模式入口：返回可折进消息的浮现文本，不写 CLAUDE.md ───────
+// 返回 { text, items }；text 是渲染好的浮现行（不含 <浮现> 标签），无命中则空串。
+// 冷却/去重/recentIds 记账与 runSurfacing 一致，避免两种模式行为漂移。
+export async function surfaceForInject(userText) {
+  if (!userText || typeof userText !== 'string') return { text: '', items: [] };
+  turnsSinceLast += 1;
+  if (turnsSinceLast < COOLDOWN) return { text: '', items: [] };
+
+  const items = await gatherItems(userText);
+  if (items.length > 0) {
+    for (const it of items) if (it.source !== 'board') pushRecent(it.id);
+    turnsSinceLast = 0;
+    console.log(`[surfacing→inject] ${items.length} item(s):`,
+      items.map(it => `${it.source}:${String(it.id).slice(0, 8)}`).join(', '));
+  }
+  const text = items.length ? items.map(renderItem).join('\n') : '';
+  return { text, items };
+}
+
+// ─────── 主入口（stream-json 模式：写 CLAUDE.md）───────
 export async function runSurfacing(userText) {
   if (!userText || typeof userText !== 'string') return;
 
