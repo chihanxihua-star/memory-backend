@@ -517,6 +517,13 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
   activeTurn = null;
   if (!turn) return;
 
+  // tmux 交互模式没有流式 delta：在 done 前把完整 思绪+正文 当一次性 delta 补发，
+  // 否则前端气泡/思绪是空的（stream-json 模式靠 delta 累积，这里跳过）。
+  if (USE_TMUX && !turn.stopped) {
+    if (thinking) safeSend(turn.ws, { type: 'thinking', text: thinking });
+    if (text) safeSend(turn.ws, { type: 'delta', text });
+  }
+
   if (turn.stopped) {
     maybeFireSummary();
     flushOrGrace();

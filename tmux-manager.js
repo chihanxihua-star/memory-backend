@@ -70,36 +70,33 @@ export class TmuxCCManager extends EventEmitter {
     this.sessionId = randomUUID();
     this.transcript = path.join(this.projectDir, this.sessionId + '.jsonl');
     this.firstContextTokens = 0; this.lastInputTokens = 0;
-    await tmux('kill-session', '-t', this.session).catch(() => {});
-    await sleep(800);
-    await tmux('new-session', '-d', '-s', this.session, '-x', '220', '-y', '50', '-c', this.cwd);
-    await sleep(800);
-    await tmux('send-keys', '-t', this.session, this._launchCmd(), 'Enter');
-    // 等就绪：界面出现 "for agents"，并处理首次"信任文件夹"确认 +
-    // 自动更新器 churn 二进制导致的 "No such file/command not found" → 重发启动命令
-    let launchRetries = 0;
-    for (let i = 0; i < 150; i++) {
-      await sleep(1000);
-      const pane = await this._pane();
-      // 1) 就绪优先：CC 的 footer 出现 = UI 起来了（比 "for agents" 可靠，后者会被截断）
-      if (/bypass permissions on|for agents/.test(pane)) { this.running = true; this._startWatchdog(); this.emit('state', 'ready'); return; }
-      // 2) 信任文件夹确认
-      if (/Is this a project you created or one you trust/.test(pane)) {
-        await tmux('send-keys', '-t', this.session, 'Enter'); continue;
+    // 让 tmux 会话「直接把 claude 当命令跑」(不经交互 shell)：
+    // 这样 churn 把二进制弄没只会让会话退出，不会留下"命令落进输入框"的垃圾。
+    // churn 杀了会话 → 外层重建；最多重建 30 次（覆盖一整个二进制稳定窗口）。
+    const cmd = this._launchCmd();
+    for (let attempt = 0; attempt < 30; attempt++) {
+      await tmux('kill-session', '-t', this.session).catch(() => {});
+      await sleep(500);
+      await tmux('new-session', '-d', '-s', this.session, '-x', '220', '-y', '50', '-c', this.cwd, cmd).catch(() => {});
+      // 等就绪 或 会话因 churn 死亡（最多 ~25s）
+      for (let i = 0; i < 25; i++) {
+        await sleep(1000);
+        const alive = await tmux('has-session', '-t', this.session).then(() => true).catch(() => false);
+        if (!alive) break;                          // churn 杀了它 → 外层重建
+        const pane = await this._pane();
+        if (/Is this a project you created or one you trust/.test(pane)) {
+          await tmux('send-keys', '-t', this.session, 'Enter'); continue;   // 信任确认
+        }
+        if (/bypass permissions on|for agents/.test(pane)) {
+          this.running = true; this._startWatchdog(); this.emit('state', 'ready'); return;
+        }
       }
-      // 3) 自动更新 churn 把二进制弄没 → 重发启动命令（仅在 CC 还没起来时）
-      if (/(No such file or directory|command not found)/.test(pane) && launchRetries < 30) {
-        launchRetries++;
-        await sleep(3000);
-        await tmux('send-keys', '-t', this.session, this._launchCmd(), 'Enter');
-        continue;
-      }
+      if (attempt < 29) await sleep(2000);          // churn 窗口，喘口气再重建
     }
     this.running = false;
     this.emit('state', 'down');
-    // 不 throw：index.js 在 375 行非 await 调用 start()，throw 会成未捕获 rejection。
-    // 失败就保持 down，autoRestart 看门狗（见 _watchTurn/exit）会再拉。
-    console.error(`[tmux] CC 交互界面未就绪（启动重试 ${launchRetries} 次）`);
+    // 不 throw：index.js 在 375 行非 await 调用 start()，throw 会成未捕获 rejection。看门狗会再拉。
+    console.error('[tmux] CC 交互界面 30 次重建仍未就绪');
   }
 
   async _pane() { return tmux('capture-pane', '-t', this.session, '-p').catch(() => ''); }
