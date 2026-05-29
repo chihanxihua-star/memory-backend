@@ -152,10 +152,16 @@ export class TmuxCCManager extends EventEmitter {
     try {
       // 等开始（最多 ~12s 出现 working；没出现就当瞬时完成）
       for (let i = 0; i < 8; i++) { if (await this._isWorking()) break; await sleep(1500); }
-      // 等连续空闲
+      // 等真完成：空闲 + transcript 最后一条 assistant 的 stop_reason=end_turn。
+      // 只看"空闲"会被工具执行时 esc-to-interrupt 短暂消失骗到 → 提前读取 → 吞掉工具后的回复。
       let idle = 0;
-      for (let i = 0; i < 120; i++) {
-        if (await this._isWorking()) idle = 0; else if (++idle >= 3) break;
+      for (let i = 0; i < 200; i++) {
+        if (await this._isWorking()) { idle = 0; }
+        else {
+          idle++;
+          // 空闲且 transcript 显示这轮真结束(非 tool_use 中途)才完成
+          if (idle >= 2 && await this._turnEnded()) break;
+        }
         await sleep(1500);
       }
       await sleep(1200); // transcript flush
@@ -184,6 +190,24 @@ export class TmuxCCManager extends EventEmitter {
     } finally {
       this._watching = false;
     }
+  }
+
+  // 这轮是否真结束：transcript 最后一条 assistant 的 stop_reason 是终止态(非 tool_use 中途)
+  async _turnEnded() {
+    const tf = this.transcript;
+    if (!tf) return true;
+    const raw = await sh('sudo', ['-u', 'claude-user', 'cat', tf]).catch(() => '');
+    const lines = raw.split('\n').filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let o; try { o = JSON.parse(lines[i]); } catch { continue; }
+      if (o.type === 'assistant') {
+        const sr = o.message?.stop_reason;
+        return sr === 'end_turn' || sr === 'stop_sequence' || sr === 'max_tokens';
+      }
+      // 最后是 user(tool_result) 在 assistant 之前 → 工具刚回、CC 还要接着说 → 没结束
+      if (o.type === 'user') return false;
+    }
+    return false;
   }
 
   // 找当前 session 最新 transcript，倒扫到上一条真实 user，收集 assistant text/thinking + 最近 usage
