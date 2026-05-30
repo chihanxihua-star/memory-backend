@@ -759,6 +759,12 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', cc_running: cc.isRunning(), session: cc.sessionId, model: cc.model, effort: cc.effort });
 });
 
+// 最近活跃对话 id：给拆分后的独立聊天页(/chat/)用——新环境(PWA)localStorage 没 convId 时
+// 调这个认领最近对话,把历史加载回来(否则拆分后新设备/新图标打开聊天是空的)。
+app.get('/api/cc/last-conv', (req, res) => {
+  res.json({ conversation_id: lastActiveConvId || null });
+});
+
 app.get('/api/claude-md', (req, res) => {
   try {
     const content = fs.readFileSync('/home/claude-user/chat-sandbox/CLAUDE.md', 'utf-8');
