@@ -2232,6 +2232,13 @@ wss.on('connection', (ws, req) => {
           activeTurn.stopped = true;
           safeSend(activeTurn.ws, { type: 'stopped' });
         }
+        // 真打断：tmux 发 Ctrl+C 让 CC 真停下（治"软停只标记、CC 卡死时还占着 activeTurn 发不出消息"）。
+        // C-c 后 `esc to interrupt` 消失 → _watchTurn 数秒内判完成 → emit turn_done(走 stopped 分支)
+        // → 清 activeTurn + flush 排队消息 → 用户立刻能重发。正常叫停/卡死自救两场景都覆盖。
+        if (USE_TMUX) {
+          try { await cc.interrupt(); console.log('[STOP] 已发 Ctrl+C 打断 CC'); }
+          catch (e) { console.warn('[STOP] interrupt 失败:', e?.message || e); }
+        }
       } else if (msg.type === 'flush') {
         console.log(`[CHAT] 收到 flush 指令 (pendingBuffer=${!!pendingBuffer}, activeTurn=${!!activeTurn})`);
         if (pendingBuffer) {
