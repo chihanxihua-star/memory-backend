@@ -512,10 +512,25 @@ cc.on('tool_result', ({ tool_use_id, content, is_error }) => {
   safeSend(activeTurn.ws, { type: 'tool_result', tool_use_id, content, is_error });
 });
 
-cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, is_error }) => {
+cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, is_error, timedOut }) => {
   const turn = activeTurn;
   activeTurn = null;
   if (!turn) return;
+
+  // 空回观测：每轮记一条。"有思考、正文空" = 真空回（stream-json 老毛病），标成可 grep 的 [EMPTY]。
+  // 交互模式理论上 0 空回，这条日志就是用来确认/抓现行的。grep '[EMPTY]' /tmp/canary.log
+  {
+    const _txt = (text || '').trim();
+    const _think = (thinking || '').trim();
+    const _kind = turn.barkFire ? 'bark' : turn.diceFire ? 'dice' : turn.silent ? 'silent' : 'chat';
+    const _tag = (!_txt && _think) ? '[EMPTY] ⚠️空回(有思考无正文)'
+               : (!_txt && !_think) ? '[EMPTY] ⚠️全空(无思考无正文)'
+               : '[TURN] ok';
+    // timedOut = watchTurn 循环耗尽(~660s)兜底，没等到 end_turn → 这条正文可能是上一轮旧文本。grep '[TIMEOUT]' 抓现行
+    const _to = timedOut ? ' [TIMEOUT] ⚠️超时兜底(正文可能是旧轮残留)' : '';
+    const _out = usage?.output_tokens ?? '-';   // 思考链+正文都算进 output_tokens：空回但 out 很大 = 思考烧了很多 token
+    console.log(`${_tag}${_to} kind=${_kind} thinking=${_think.length}字 正文=${_txt.length}字 out=${_out}tok conv=${turn.conversationId || '-'} ctx=${contextTokens || '-'}${is_error ? ' is_error=true' : ''}`);
+  }
 
   // tmux 交互模式没有流式 delta：在 done 前把完整 思绪+正文 当一次性 delta 补发，
   // 否则前端气泡/思绪是空的（stream-json 模式靠 delta 累积，这里跳过）。
@@ -882,8 +897,8 @@ async function generateForgeSummary({ summaryLength }) {
     const timer = setTimeout(() => {
       if (settled) return; settled = true; cleanup();
       activeTurn = null;
-      reject(new Error('总结超时 (120s)'));
-    }, 120000);
+      reject(new Error('总结超时 (600s)'));
+    }, 600000);
     cc.on('turn_done', onDone);
     cc.on('turn_error', onErr);
     try {
@@ -956,10 +971,14 @@ async function injectConversationContext(conversationId, { withThinking = true }
     : 0;
   const estTokens = estimateTokens(transcript) - thinkingTokens;
 
-  const prompt = `【系统任务·对话上下文注入】\n` +
-    `以下是你和小茉莉之前的对话原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
-    `仅输出"OK"两个字，不要输出其他任何内容。\n\n` +
-    transcript;
+  const prompt = `【系统·静默上下文加载，这不是对话】\n` +
+    `下面是你和小茉莉过去的对话原文。现在是后台静默注入，目的只是让你把它们读进上下文、延续你们的关系——这不是她正在跟你说话。\n` +
+    `所以：原文（包括最后一句）只读、不回应、不续写；本轮也不要调用任何工具（不查记忆、不搜索、不核对）。\n` +
+    `读完直接输出两个字：OK。（OK 是"加载完毕"的回执，不是回复内容）\n\n` +
+    `===== 历史对话开始（仅供加载，切勿回应）=====\n` +
+    transcript +
+    `\n===== 历史对话结束 =====\n` +
+    `现在，只输出：OK`;
 
   activeTurn = { ws: null, conversationId: null, silent: true, settings: null, tools: [] };
   return new Promise((resolve, reject) => {
@@ -983,8 +1002,8 @@ async function injectConversationContext(conversationId, { withThinking = true }
     const timer = setTimeout(() => {
       if (settled) return; settled = true; cleanup();
       activeTurn = null;
-      reject(new Error('对话注入超时 (120s)'));
-    }, 120000);
+      reject(new Error('对话注入超时 (600s)'));
+    }, 600000);
     cc.on('turn_done', onDone);
     cc.on('turn_error', onErr);
     try {
@@ -1298,7 +1317,8 @@ function readSessionMessages(sessionId, { keepBubbles = false } = {}) {
           const text = typeof content === 'string' ? content
             : Array.isArray(content) ? content.filter(b => b.type === 'text').map(b => b.text || '').join('\n')
             : '';
-          if (text.includes('【系统任务·对话上下文注入】')) {
+          // 新旧两种注入标题都认：历史 transcript 里改版前后的注入轮都要截掉，避免把注入指令当对话喂回去
+          if (text.includes('【系统·静默上下文加载，这不是对话】') || text.includes('【系统任务·对话上下文注入】')) {
             skipNextAssistant = true;
           } else if (text.trim()) {
             messages.push({ role: 'user', content: text.trim(), thinking: null, created_at: ev.timestamp || null });
@@ -1438,10 +1458,14 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
     : 0;
   const estTokens = estimateTokens(transcript) - thinkingTokens;
 
-  const prompt = `【系统任务·对话上下文注入】\n` +
-    `以下是你和小茉莉之前的对话原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
-    `仅输出"OK"两个字，不要输出其他任何内容。\n\n` +
-    transcript;
+  const prompt = `【系统·静默上下文加载，这不是对话】\n` +
+    `下面是你和小茉莉过去的对话原文。现在是后台静默注入，目的只是让你把它们读进上下文、延续你们的关系——这不是她正在跟你说话。\n` +
+    `所以：原文（包括最后一句）只读、不回应、不续写；本轮也不要调用任何工具（不查记忆、不搜索、不核对）。\n` +
+    `读完直接输出两个字：OK。（OK 是"加载完毕"的回执，不是回复内容）\n\n` +
+    `===== 历史对话开始（仅供加载，切勿回应）=====\n` +
+    transcript +
+    `\n===== 历史对话结束 =====\n` +
+    `现在，只输出：OK`;
 
   activeTurn = { ws: null, conversationId: null, silent: true, settings: null, tools: [] };
   return new Promise((resolve, reject) => {
@@ -1449,7 +1473,7 @@ async function injectSessionContext(sessionId, { withThinking = true } = {}) {
     const cleanup = () => { cc.off('turn_done', onDone); cc.off('turn_error', onErr); clearTimeout(timer); };
     const onDone = (turnData) => { if (settled) return; settled = true; cleanup(); activeTurn = null; const realTokens = turnData?.contextTokens || null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens, realTokens }); };
     const onErr = (err) => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(err); };
-    const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('session 注入超时')); }, 120000);
+    const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('session 注入超时 (600s)')); }, 600000);
     cc.on('turn_done', onDone);
     cc.on('turn_error', onErr);
     try { cc.send(prompt); } catch (e) { if (!settled) { settled = true; cleanup(); activeTurn = null; reject(e); } }
@@ -1572,10 +1596,12 @@ async function injectExternalContext(messages, { withThinking = true, thinkingPc
   const estTokens = estimateTokens(transcript) - thinkingTokens;
 
   const summaryBlock = summary ? `【前情摘要】\n${summary}\n\n【以下是最近的对话原文】\n\n` : '';
-  const prompt = `【系统任务·对话上下文注入】\n` +
-    `以下是你和小茉莉之前在别处的对话${summary ? '摘要与' : ''}原文，请将这些视为你们之间已经发生的真实交流，延续这段关系继续聊天。\n` +
-    `仅输出"OK"两个字，不要输出其他任何内容。\n\n` +
-    summaryBlock + transcript;
+  const prompt = `【系统·静默上下文加载，这不是对话】\n` +
+    `下面是你和小茉莉之前在别处的对话${summary ? '摘要与' : ''}原文。现在是后台静默注入，目的只是让你读进上下文、延续这段关系——这不是她正在跟你说话。\n` +
+    `所以：原文（包括最后一句）只读、不回应、不续写；本轮也不要调用任何工具（不查记忆、不搜索、不核对）。\n` +
+    `读完直接输出两个字：OK。（OK 是"加载完毕"的回执，不是回复内容）\n\n` +
+    summaryBlock + transcript +
+    `\n\n现在，只输出：OK`;
 
   activeTurn = { ws: null, conversationId: null, silent: true, settings: null, tools: [] };
   return new Promise((resolve, reject) => {
@@ -1583,7 +1609,7 @@ async function injectExternalContext(messages, { withThinking = true, thinkingPc
     const cleanup = () => { cc.off('turn_done', onDone); cc.off('turn_error', onErr); clearTimeout(timer); };
     const onDone = (turnData) => { if (settled) return; settled = true; cleanup(); activeTurn = null; const realTokens = turnData?.contextTokens || null; resolve({ msgCount, estTokens, thinkingCount, thinkingTokens, realTokens }); };
     const onErr = (err) => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(err); };
-    const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('外部浮想超时')); }, 120000);
+    const timer = setTimeout(() => { if (settled) return; settled = true; cleanup(); activeTurn = null; reject(new Error('外部浮想超时 (600s)')); }, 600000);
     cc.on('turn_done', onDone);
     cc.on('turn_error', onErr);
     try { cc.send(prompt); } catch (e) { if (!settled) { settled = true; cleanup(); activeTurn = null; reject(e); } }

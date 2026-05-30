@@ -154,13 +154,15 @@ export class TmuxCCManager extends EventEmitter {
       for (let i = 0; i < 8; i++) { if (await this._isWorking()) break; await sleep(1500); }
       // 等真完成：空闲 + transcript 最后一条 assistant 的 stop_reason=end_turn。
       // 只看"空闲"会被工具执行时 esc-to-interrupt 短暂消失骗到 → 提前读取 → 吞掉工具后的回复。
-      let idle = 0;
-      for (let i = 0; i < 200; i++) {
+      let idle = 0, ended = false;
+      // 200→440：单轮上限 ~300s→~660s，扛住分钟级上游 stall（≥ inject 的 600s，
+      // 否则 stall 时这里的"耗尽兜底"会抢先 emit 旧文本，注入/对话都拿到半截）。
+      for (let i = 0; i < 440; i++) {
         if (await this._isWorking()) { idle = 0; }
         else {
           idle++;
           // 空闲且 transcript 显示这轮真结束(非 tool_use 中途)才完成
-          if (idle >= 2 && await this._turnEnded()) break;
+          if (idle >= 2 && await this._turnEnded()) { ended = true; break; }
         }
         await sleep(1500);
       }
@@ -183,6 +185,7 @@ export class TmuxCCManager extends EventEmitter {
         systemTokens: this.firstContextTokens || null,
         is_error: false,
         empty: !turn.text.trim(),   // 交互模式理论上不空；真空了这里标出来
+        timedOut: !ended,           // true = 循环耗尽兜底(没等到 end_turn)，读到的可能是上一轮旧文本，下游别当真回复
       });
     } catch (e) {
       this.busy = false;
