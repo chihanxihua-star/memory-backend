@@ -48,6 +48,7 @@ export class TmuxCCManager extends EventEmitter {
     this.firstContextTokens = 0;
     this._watching = false;
     this._watchdog = null;
+    this.lastSent = null;        // 上一轮发给 CC 的文本（卡死哨兵重发用，比读 /tmp 文件稳）
   }
 
   setAppendSystemPrompt(text) { this.appendSystemPrompt = text || null; }
@@ -132,6 +133,7 @@ export class TmuxCCManager extends EventEmitter {
         ? `\n\n[用户发来图片，请查看：${imgPaths.join('  ')}]` : '';
       content = (text || (imgPaths.length ? '看看这个' : '')) + imgLine;
     }
+    this.lastSent = String(content);   // 记下本轮文本，供卡死哨兵重发
     // 写到 /tmp（claude-user 的 tmux 要能读 load-buffer 的文件）；不用 os.tmpdir()（可能是私有目录）
     const tmp = `/tmp/tmux-msg-${this.session}.txt`;
     fs.writeFileSync(tmp, String(content)); fs.chmodSync(tmp, 0o644);
@@ -246,6 +248,30 @@ export class TmuxCCManager extends EventEmitter {
     }
     texts.reverse(); thinks.reverse();
     return { text: texts.join('\n\n'), thinking: thinks.join('\n\n'), usage: usage || {} };
+  }
+
+  // 卡死哨兵用：当前 transcript 文件最后修改时间(ms)。0 = 还没 transcript。
+  transcriptMtime() {
+    if (!this.transcript) return 0;
+    try { return fs.statSync(this.transcript).mtimeMs; } catch { return 0; }
+  }
+
+  // 卡死哨兵用：transcript 末尾是否停在"已发起工具调用、还没拿到结果"
+  //（在等慢工具，不是思考卡死，哨兵应放过别误杀）。
+  async awaitingToolResult() {
+    const tf = this.transcript;
+    if (!tf) return false;
+    const raw = await sh('sudo', ['-u', 'claude-user', 'cat', tf]).catch(() => '');
+    const lines = raw.split('\n').filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let o; try { o = JSON.parse(lines[i]); } catch { continue; }
+      if (o.type === 'user') return false;        // 最后是 tool_result → 工具已回，不在等
+      if (o.type === 'assistant') {
+        const c = o.message?.content;
+        return Array.isArray(c) && c.some(b => b?.type === 'tool_use');
+      }
+    }
+    return false;
   }
 
   async clearScreen() { // 清屏 = 原生 /clear（注意：/clear 后 claude 会换新 session 文件）

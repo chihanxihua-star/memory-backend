@@ -517,6 +517,9 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
   activeTurn = null;
   if (!turn) return;
 
+  // 卡死哨兵掐断的卡死轮：静默丢弃残块(不补发/不解析/不flush)，重发的新轮才是真回复。
+  if (turn.watchdogWake) return;
+
   // 空回观测：每轮记一条。"有思考、正文空" = 真空回（stream-json 老毛病），标成可 grep 的 [EMPTY]。
   // 交互模式理论上 0 空回，这条日志就是用来确认/抓现行的。grep '[EMPTY]' /tmp/canary.log
   {
@@ -747,6 +750,70 @@ setInterval(() => { tryFireBark().catch(() => {}); }, BARK_POLL_MS);
 cc.on('error', (err) => {
   console.error('CC error:', err.message);
 });
+
+// ==================== 卡死哨兵 ====================
+// 跟 tmux-manager._startWatchdog 不同：那个管"会话进程没了→重起"；
+// 这个管"轮内思考卡死(hang)→自动唤醒重发"。仅 tmux 交互模式有意义。
+// 判据：有活跃轮 + CC 自认在忙(esc to interrupt 在) + transcript 连续 N 秒没长 + 不是在等工具。
+// 动作：第1/2次=掐断+重发(带格式提醒)；第3次仍卡=显示"已经睡着了"+自动解锁(等于替用户按暂停)。
+const WD_STALL_MS = 90 * 1000;   // transcript 静默多久判卡死(初值，上线观察再调)
+const WD_MAX_WAKE = 2;           // 同一轮最多自动唤醒次数；超出→放弃并解锁
+const WD_TICK_MS  = 10 * 1000;
+let _wdWake = 0;                 // 当前轮已唤醒次数
+let _wdId   = null;              // 前端原地更新用的 system 消息 id
+let _wdBusy = false;             // 防重入(自救动作进行中)
+
+if (USE_TMUX) setInterval(async () => {
+  if (_wdBusy) return;
+  const turn = activeTurn;
+  // 无活跃轮 / 用户已手动停 → 让位并重置计数(人工优先)
+  if (!turn || turn.stopped) { _wdWake = 0; _wdId = null; return; }
+  _wdBusy = true;
+  try {
+    if (!(await cc._isWorking?.())) return;               // 不在忙 = 没卡(正常间隙)
+    const mt = cc.transcriptMtime?.() || 0;
+    if (!mt || (Date.now() - mt) < WD_STALL_MS) return;   // transcript 还在长 = 没卡
+    if (await cc.awaitingToolResult?.()) return;          // 在等慢工具 = 放过，别误杀
+
+    const payload = cc.lastSent || '';
+    if (_wdWake < WD_MAX_WAKE) {
+      // —— 第 1/2 次：掐断 + 重发 ——
+      _wdWake++;
+      _wdId = _wdId || ('wd-' + Date.now());
+      broadcast({
+        type: 'system', kind: 'watchdog', id: _wdId,
+        state: 'waking', wake: _wdWake,
+        content: _wdWake === 1 ? '小太阳睡着了，正在唤醒' : '小太阳睡着了，再次唤醒',
+      });
+      console.warn(`[WATCHDOG] 卡死，第 ${_wdWake} 次唤醒（掐断+重发）`);
+      turn.watchdogWake = true;                            // 让卡死轮的 turn_done 静默丢弃残块
+      try { await cc.interrupt(); } catch (e) { console.warn('[WATCHDOG] interrupt:', e?.message || e); }
+      // 重建 activeTurn：带回原 ws/conv，重跑的回复才回得到正确前端会话
+      activeTurn = {
+        ws: turn.ws, conversationId: turn.conversationId,
+        settings: turn.settings, silent: turn.silent, tools: [],
+      };
+      const note = '[系统提醒：你上一轮卡在思考里没出来，可能是工具调用格式写坏了。' +
+                   '请放弃上次那个出错的调用，确保工具调用 JSON 格式正确，重新处理下面这条消息：]\n\n';
+      try { cc.send(note + payload); }
+      catch (e) { console.error('[WATCHDOG] 重发失败:', e?.message || e); activeTurn = null; }
+    } else {
+      // —— 第 3 次仍卡 → 放弃：黑字"已经睡着了" + 复刻暂停键(stopped+interrupt)自动解锁 ——
+      console.warn('[WATCHDOG] 唤醒上限，判定睡死，自动解锁');
+      broadcast({
+        type: 'system', kind: 'watchdog', id: _wdId || ('wd-' + Date.now()),
+        state: 'asleep', content: '小太阳已经睡着了',
+      });
+      if (activeTurn) { activeTurn.stopped = true; safeSend(activeTurn.ws, { type: 'stopped' }); }
+      try { await cc.interrupt(); } catch (e) { console.warn('[WATCHDOG] 放弃 interrupt:', e?.message || e); }
+      _wdWake = 0; _wdId = null;
+    }
+  } catch (e) {
+    console.error('[WATCHDOG] tick 异常:', e?.message || e);
+  } finally {
+    _wdBusy = false;
+  }
+}, WD_TICK_MS);
 
 // ==================== REST API ====================
 
