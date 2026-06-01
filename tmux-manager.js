@@ -149,6 +149,7 @@ export class TmuxCCManager extends EventEmitter {
   async _watchTurn() {
     if (this._watching) return;
     this._watching = true;
+    this._interrupted = false;
     try {
       // 等开始（最多 ~12s 出现 working；没出现就当瞬时完成）
       for (let i = 0; i < 8; i++) { if (await this._isWorking()) break; await sleep(1500); }
@@ -158,6 +159,9 @@ export class TmuxCCManager extends EventEmitter {
       // 200→440：单轮上限 ~300s→~660s，扛住分钟级上游 stall（≥ inject 的 600s，
       // 否则 stall 时这里的"耗尽兜底"会抢先 emit 旧文本，注入/对话都拿到半截）。
       for (let i = 0; i < 440; i++) {
+        // 被 interrupt()(用户按停止→Ctrl+C)打断：立刻收尾，别再等屏幕判定/660s 超时。
+        // ended=true → timedOut=false（这是主动结束、不是耗尽兜底）；下游 turn_done 走 stopped 分支清锁+flush。
+        if (this._interrupted) { ended = true; break; }
         if (await this._isWorking()) { idle = 0; }
         else {
           idle++;
@@ -249,7 +253,15 @@ export class TmuxCCManager extends EventEmitter {
     await sleep(1500);
     this.transcript = null; this.firstContextTokens = 0; this.lastInputTokens = 0;
   }
-  async interrupt() { await tmux('send-keys', '-t', this.session, 'C-c'); }
+  async interrupt() {
+    this._interrupted = true;                                   // 让正在跑的 _watchTurn 立刻收尾
+    await tmux('send-keys', '-t', this.session, 'C-c');
+    // 等观察器释放 _watching（它每 ~1.5s 检查一次 _interrupted）：否则紧接着的新一轮 send()
+    // 会因 _watching=true 拿不到观察器 → 新轮永不 emit turn_done。最多等 ~4.5s 兜底。
+    for (let i = 0; i < 30 && this._watching; i++) await sleep(150);
+    this.busy = false;
+    this._interrupted = false;
+  }
 
   async amnesia() { // 失忆 = 杀会话重起（交互新会话天然无上文，等价不带 --resume）
     this.transcript = null; this.firstContextTokens = 0; this.lastInputTokens = 0;
