@@ -1195,11 +1195,9 @@ app.post('/api/cc/amnesia', async (req, res) => {
         fs.renameSync(FORGE_MARKER_PATH, `${FORGE_MARKER_PATH}.amnesia.${stamp}`);
       }
     } catch (e) { console.warn('amnesia marker rename:', e.message); }
-    // 2) 清空两块注入区，否则新 session 启动后 CC 还是会读到旧上下文：
-    //    - sandbox/CLAUDE.md 的 <上次对话总结>（forge 写进来的）
-    //    - ~/.claude/CLAUDE.md 的 <浮现>（surfacing.js 写进来的）
+    // 2) 清空 sandbox/CLAUDE.md 的 <上次对话总结>（forge 写进来的），否则新 session 启动后 CC 还会读到旧上下文。
+    //    注意：~/.claude/CLAUDE.md 的 <浮现> 区（surfacing.js 写进来的）失忆时**保留不清**。
     try { await writeForgeSummary(''); } catch (e) { console.warn('amnesia clear 上次对话总结:', e.message); }
-    try { await clearFuxianBlock(); } catch (e) { console.warn('amnesia clear 浮现:', e.message); }
     // 3) 落库当前 session 的 tokens，再走 cc.restart（cc-manager 看不到 marker，会走 randomUUID 分支）
     if (cc.sessionId && cc.lastInputTokens > 0) {
       try {
