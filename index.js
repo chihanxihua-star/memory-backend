@@ -1277,6 +1277,8 @@ app.post('/api/cc/amnesia', async (req, res) => {
     cc.setAppendSystemPrompt(sysPrompt);
     const amnesiaOpts = {};
     if (req.body?.effort) amnesiaOpts.effort = req.body.effort;
+    if (req.body?.model !== undefined) amnesiaOpts.model = req.body.model;
+    if (req.body?.nativeThinking !== undefined) amnesiaOpts.nativeThinking = !!req.body.nativeThinking;
     await cc.restart(amnesiaOpts);
     broadcast({
       type: 'system', kind: 'forge_done',
