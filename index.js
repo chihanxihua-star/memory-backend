@@ -127,6 +127,38 @@ app.post('/api/internal/cc/restart', async (req, res) => {
   }
 });
 
+// CC 工具调用实时上报（hook → 这里 → 复用 tool_use/tool_result 事件 → 前端工具卡片）。
+// loopback only + 立即响应；hook 脚本本就 fire-and-forget，这里也绝不让它等。
+// phase: pre=PreToolUse(调用中) / post=PostToolUse(成功) / fail=PostToolUseFailure(失败带原因)。
+function summarizeToolResp(r) {
+  if (r == null) return '';
+  if (typeof r === 'string') return r.slice(0, 2000);
+  if (typeof r.stdout === 'string' || typeof r.stderr === 'string') {
+    const s = (r.stdout || '') + (r.stderr ? ('\n' + r.stderr) : '');
+    return (s.trim() || '(无输出)').slice(0, 2000);
+  }
+  try { return JSON.stringify(r).slice(0, 2000); } catch { return String(r).slice(0, 2000); }
+}
+app.post('/api/internal/cc/tool-hook', (req, res) => {
+  const ip = (req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  if (ip !== '127.0.0.1' && ip !== '::1') return res.status(403).json({ error: 'forbidden (loopback only)' });
+  res.json({ ok: true });   // 立刻回，hook 不等
+  try {
+    if (!USE_TMUX || !activeTurn) return;   // 只 tmux 模式需要(stream-json 自己 emit)；无活跃轮丢弃
+    const phase = req.query.phase;
+    const b = req.body || {};
+    const id = b.tool_use_id;
+    if (!id) return;
+    if (phase === 'pre') {
+      cc.emit('tool_use', { id, name: b.tool_name || 'tool', input: b.tool_input || {} });
+    } else if (phase === 'post') {
+      cc.emit('tool_result', { tool_use_id: id, content: summarizeToolResp(b.tool_response), is_error: false });
+    } else if (phase === 'fail') {
+      cc.emit('tool_result', { tool_use_id: id, content: b.error || '工具调用失败', is_error: true });
+    }
+  } catch (e) { console.error('[tool-hook]', e?.message || e); }
+});
+
 // 公开：登录换 token
 app.post('/api/auth', (req, res) => {
   const { password } = req.body || {};
