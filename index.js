@@ -865,7 +865,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       const wmType = wm[1].toLowerCase();
       const wmContent = (wm[2] || '').trim();
       if (!wmContent) continue;
-      const canFace = wmType === 'face' && chengLoc && userLoc && chengLoc === userLoc;
+      const canFace = wmType === 'face' && canFaceToFace(chengLoc, userLoc);
 
       if (canFace) {
         // 真面对面：不推 Bark，记 daily_timeline
@@ -938,9 +938,28 @@ function safeSend(ws, obj) {
 function broadcast(obj) {
   for (const c of wss.clients) safeSend(c, obj);
 }
+function chatStatus(ws, label, detail = null, extra = {}) {
+  safeSend(ws, { type: 'chat_status', ok: true, label, detail, ...extra });
+}
+function broadcastChatStatus(label, detail = null, extra = {}) {
+  broadcast({ type: 'chat_status', ok: true, label, detail, ...extra });
+}
 
-// 当前互动通道：澄 location 与小茉莉 location 相同=face（面对面），否则=phone（异地手机聊天）。
-// 读不到默认 face（保守，不把普通回复乱标成手机）。以后可扩展 canFaceToFace（休息室/同房间等）。
+// 能不能面对面：不能只看 location 字符串相同。澄和小茉莉同公司不同组——各自的「公司·工位」
+// 不是同一个面对面空间。第一版规则：家里同一房间 / 公司休息室 才算面对面；工位等一律不算。
+// 以后能见面的地方（会议室等）往这里加。
+function canFaceToFace(chengLocation, userLocation) {
+  if (!chengLocation || !userLocation) return false;
+  if (chengLocation.startsWith('家 · ') && userLocation.startsWith('家 · ')) {
+    return chengLocation === userLocation; // 家里：必须同一具体房间
+  }
+  if (chengLocation === '公司 · 休息室' && userLocation === '公司 · 休息室') {
+    return true; // 公司：只有休息室能面对面
+  }
+  return false; // 公司工位 / 不同地点 一律手机
+}
+
+// 当前互动通道：能面对面=face（普通白气泡），否则=phone（异地/工位 手机蓝气泡）。读不到默认 phone（异地是常态）。
 async function getCurrentChannel() {
   try {
     const [cs, us] = await Promise.all([
@@ -949,11 +968,10 @@ async function getCurrentChannel() {
     ]);
     const chengLoc = cs.data?.[0]?.location || '';
     const userLoc = us.data?.[0]?.location || '';
-    if (chengLoc && userLoc && chengLoc === userLoc) return 'face';
-    return 'phone';
+    return canFaceToFace(chengLoc, userLoc) ? 'face' : 'phone';
   } catch (e) {
-    console.warn('[CHANNEL] 读位置失败，默认 face:', e.message);
-    return 'face';
+    console.warn('[CHANNEL] 读位置失败，默认 phone:', e.message);
+    return 'phone';
   }
 }
 
@@ -1005,6 +1023,9 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
     const _to = timedOut ? ' [TIMEOUT] ⚠️超时兜底(正文可能是旧轮残留)' : '';
     const _out = usage?.output_tokens ?? '-';   // 思考链+正文都算进 output_tokens：空回但 out 很大 = 思考烧了很多 token
     console.log(`${_tag}${_to} kind=${_kind} thinking=${_think.length}字 正文=${_txt.length}字 out=${_out}tok conv=${turn.conversationId || '-'} ctx=${contextTokens || '-'}${is_error ? ' is_error=true' : ''}`);
+    if (!turn.silent && !turn.barkFire && !turn.diceFire && !turn.worldWake) {
+      broadcastChatStatus('CC 已回复', `正文 ${_txt.length} 字 / thinking ${_think.length} 字`);
+    }
   }
 
   // tmux 交互模式没有流式 delta：在 done 前把完整 思绪+正文 当一次性 delta 补发，
@@ -1141,6 +1162,10 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
         event: chatChannel === 'phone' ? 'phone_chat' : null, // 异地普通回复标手机聊天（不加 "-  "）
       }).select('id').single();
       turn.messageId = inserted?.id || null;
+      broadcastChatStatus('已写入数据库', turn.messageId ? `assistant ${turn.messageId}` : 'assistant 消息已保存', {
+        conversation_id: turn.conversationId,
+        reload: true,
+      });
       await checkContextThreshold(turn.conversationId, turn.settings);
     } catch (e) { console.error('存消息失败:', e); }
   }
@@ -2904,6 +2929,10 @@ wss.on('connection', (ws, req) => {
 
   console.log('客户端已连接');
   safeSend(ws, { type: 'cc_status', status: cc.isRunning() ? 'ready' : 'down' });
+  if (activeTurn) {
+    activeTurn.ws = ws;
+    chatStatus(ws, '已接管进行中的回复', 'websocket 重连后继续接收当前 turn');
+  }
 
   ws.on('message', async (data) => {
     try {
@@ -2957,6 +2986,7 @@ wss.on('connection', (ws, req) => {
       if (pendingBuffer.timer) clearTimeout(pendingBuffer.timer);
       pendingBuffer = null;
     }
+    if (activeTurn && activeTurn.ws === ws) activeTurn.ws = null;
     console.log('客户端断开');
   });
 });
@@ -3064,6 +3094,7 @@ async function handleChat(ws, msg) {
           },
         });
       }
+      chatStatus(ws, '已发送到后端', savedUserMsg?.id ? `user ${savedUserMsg.id}` : '用户消息已入库');
       await supabase.from('conversations')
         .update({ updated_at: new Date().toISOString() })
         .eq('id', conversation_id);
@@ -3079,6 +3110,7 @@ async function handleChat(ws, msg) {
   if (bufferTime <= 0 && !activeTurn && !pendingBuffer) {
     console.log('[CHAT] 直发 CC（bufferTime=0 且空闲）');
     if (msgId) safeSend(ws, { type: 'flushed', ids: [msgId] });
+    chatStatus(ws, '已 flush 给 CC', '1 条消息（直发）');
     return flushPendingToCC(ws, [{ content, imgs, conversation_id, settings, msgId }]);
   }
 
@@ -3091,6 +3123,7 @@ async function handleChat(ws, msg) {
   pendingBuffer.items.push({ content, imgs, conversation_id, settings, msgId });
   console.log(`[CHAT] 入 buffer (count=${pendingBuffer.items.length}, readyToFlush=${pendingBuffer.readyToFlush})`);
   safeSend(ws, { type: 'buffering', count: pendingBuffer.items.length, waitMs: bufferTime * 1000 });
+  chatStatus(ws, '已进入缓冲', `第 ${pendingBuffer.items.length} 条 / 满 ${shortMsgCount} 条发送给 CC`);
 
   // 达到条数上限：立刻标记 ready
   if (pendingBuffer.items.length >= shortMsgCount) {
@@ -3133,6 +3166,7 @@ function tryFlushBuffer() {
   const flushedIds = items.map(i => i.msgId).filter(Boolean);
   console.log(`[CHAT] flush ${items.length} 条消息给 CC`);
   if (flushedIds.length) safeSend(ws, { type: 'flushed', ids: flushedIds });
+  chatStatus(ws, '已 flush 给 CC', `${items.length} 条消息`);
   flushPendingToCC(ws, items).catch(e => console.error('flush failed:', e));
 }
 
