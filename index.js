@@ -2533,6 +2533,23 @@ app.post('/api/world/action', async (req, res) => {
   }
 });
 
+// 第9步：小手机消息列表。只返 WORLD_MESSAGE:phone 主动消息（event=world_message），
+// 不漏普通聊天/phone_chat——所以走后端过滤，不让 world-home 直接读 messages 表。最近 20 条。
+app.get('/api/world/phone/messages', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('id, content, event, created_at')
+      .eq('event', 'world_message')
+      .order('created_at', { ascending: false })
+      .limit(20);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/dice/log', async (req, res) => {
   try {
     const limit = Math.min(100, parseInt(req.query.limit) || 50);
