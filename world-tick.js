@@ -123,6 +123,21 @@ export async function advanceOneTick() {
   return updated;
 }
 
+// 紧急修正：把 character_status_cheng.world_time 同步到当前 UTC+8(Asia/Shanghai)的 HH:mm。
+// 只动 world_time，不碰 location/activity/天气/date，不读城市名，不影响 weather-fetcher。
+// 不 engage 澄、不触发事件、不发消息——纯数据校正。
+export async function syncWorldTimeToRealTime() {
+  const hhmm = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+  const { data, error } = await supabase
+    .from('character_status_cheng')
+    .update({ world_time: hhmm, updated_at: new Date().toISOString() })
+    .eq('name', '澄')
+    .select('world_time, location, activity')
+    .limit(1);
+  if (error) throw error;
+  return data?.[0] || { world_time: hhmm };
+}
+
 // ── 配置读写 ────────────────────────────────────────────
 export function readWorldConfig() {
   try {

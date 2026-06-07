@@ -25,7 +25,7 @@ import {
   fetchAppSummary,
 } from './bark.js';
 import { DiceDaemon } from './dice.js';
-import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WORLD_EVENTS } from './world-tick.js';
+import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WORLD_EVENTS, syncWorldTimeToRealTime } from './world-tick.js';
 import { PendingWakeDaemon } from './world-pending.js';
 import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } from './world-actions.js';
 import { formatWeather } from './world-env.js';
@@ -2666,6 +2666,14 @@ app.post('/api/world/random', async (req, res) => {
 // 10B：随机事件列表（给 DevPanel 出按钮）
 app.get('/api/world/random/list', (req, res) => {
   res.json(Object.values(RANDOM_EVENTS).map(e => ({ id: e.id, label: e.label })));
+});
+
+// 紧急修正：手动把 world_time 同步到当前 UTC+8。只动 world_time，不 engage 澄/不触发事件/不发消息。
+app.post('/api/world/sync-time', async (req, res) => {
+  try {
+    const status = await syncWorldTimeToRealTime();
+    res.json({ ok: true, status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 第9步：小手机消息列表。只返 WORLD_MESSAGE:phone 主动消息（event=world_message），
