@@ -194,13 +194,41 @@ async function gatherItems(userText) {
   }).slice(0, MAX_ITEMS);
 }
 
+// ─────── 补充：读 user 当前状态 → 一行，注入浮现最前（让聊天里的澄知道小茉莉在哪、在做啥）───────
+// 只读不写，不进长期记忆。读失败/空字段都给兜底，绝不产出 undefined。
+async function getUserStatusLine() {
+  try {
+    const { data, error } = await supabase
+      .from('user_status_cheng')
+      .select('presence, location, activity, custom_note')
+      .eq('name', 'user')
+      .limit(1);
+    if (error) throw error;
+    const u = data && data[0];
+    if (!u) return '';
+    const presence = u.presence || '在家';
+    const location = u.location || '家 · 客厅';
+    const activity = u.activity || '休息';
+    const note = u.custom_note ? `（${u.custom_note}）` : '';
+    return `小茉莉当前状态：${presence} · ${location}，正在${activity}${note}`;
+  } catch (e) {
+    console.warn('[surfacing] 读 user_status 失败，跳过状态注入:', e.message);
+    return ''; // 不影响原本浮现
+  }
+}
+
 // ─────── tmux 交互模式入口：返回可折进消息的浮现文本，不写 CLAUDE.md ───────
-// 返回 { text, items }；text 是渲染好的浮现行（不含 <浮现> 标签），无命中则空串。
-// 冷却/去重/recentIds 记账与 runSurfacing 一致，避免两种模式行为漂移。
+// 返回 { statusLine, text, items }：
+//   statusLine = user 当前状态一行（总是带，绕过冷却）→ inject 端包进独立的 <此刻> 块
+//   text       = 记忆浮现行（不含标签，受冷却+命中限制）→ inject 端包进 <记忆浮现> 块
+// 两者分开：「此刻」是现实情境、「记忆浮现」是浮上来的旧事，别让澄混淆。
 export async function surfaceForInject(userText) {
-  if (!userText || typeof userText !== 'string') return { text: '', items: [] };
+  if (!userText || typeof userText !== 'string') return { statusLine: '', text: '', items: [] };
+
+  const statusLine = await getUserStatusLine(); // 总是带上，绕过冷却
+
   turnsSinceLast += 1;
-  if (turnsSinceLast < COOLDOWN) return { text: '', items: [] };
+  if (turnsSinceLast < COOLDOWN) return { statusLine, text: '', items: [] };
 
   const items = await gatherItems(userText);
   if (items.length > 0) {
@@ -210,7 +238,7 @@ export async function surfaceForInject(userText) {
       items.map(it => `${it.source}:${String(it.id).slice(0, 8)}`).join(', '));
   }
   const text = items.length ? items.map(renderItem).join('\n') : '';
-  return { text, items };
+  return { statusLine, text, items };
 }
 
 // ─────── 主入口（stream-json 模式：写 CLAUDE.md）───────

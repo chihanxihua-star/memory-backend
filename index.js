@@ -25,6 +25,8 @@ import {
   fetchAppSummary,
 } from './bark.js';
 import { DiceDaemon } from './dice.js';
+import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WORLD_EVENTS } from './world-tick.js';
+import { PendingWakeDaemon } from './world-pending.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -120,7 +122,7 @@ app.post('/api/internal/cc/restart', async (req, res) => {
   try {
     const sysPrompt = await syncCCDocs();
     cc.setAppendSystemPrompt(sysPrompt);
-    await cc.restart();
+    await restartCCAndRecordSession();
     res.json({ ok: true, session: cc.sessionId, resumed: !!cc.resumedFromForge });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -229,6 +231,38 @@ async function writeAsClaudeUser(filePath, content) {
   if (ids) { try { fs.chownSync(filePath, ids[0], ids[1]); } catch {} }
 }
 
+async function recordTmuxSessionStart(sessionId, { forgedFromSession = null } = {}) {
+  if (!sessionId) return;
+  const nowIso = new Date().toISOString();
+  const { error: upErr } = await supabase
+    .from('sessions_cheng')
+    .update({ status: 'ended', ended_at: nowIso })
+    .eq('status', 'active');
+  if (upErr) console.warn('tmux mark active->ended:', upErr.message);
+
+  const { error: insErr } = await supabase
+    .from('sessions_cheng')
+    .insert({
+      session_id: sessionId,
+      started_at: nowIso,
+      status: 'active',
+      turn_count: 0,
+      forged_from_session: forgedFromSession || null,
+      model: cc?.model || null,
+    });
+  if (insErr) console.warn('tmux insert session row:', insErr.message);
+}
+
+async function startCCAndRecordSession() {
+  await cc.start();
+  if (USE_TMUX) await recordTmuxSessionStart(cc.sessionId);
+}
+
+async function restartCCAndRecordSession(options = {}, meta = {}) {
+  await cc.restart(options);
+  if (USE_TMUX) await recordTmuxSessionStart(cc.sessionId, meta);
+}
+
 // <上次对话总结> 区段标记 —— 跟 <浮现> 同样的 marker 模式：
 //   - syncCCDocs 写 CLAUDE.md 前抽这段保留，确保 supabase 文档覆盖不会冲掉
 //   - forge 后由 writeForgeSummary 替换这段内容
@@ -317,10 +351,66 @@ function writeSyncedFilesManifest(names) {
   }
 }
 
+// <output_style>：documents_cheng 里 doc_type='output_style' → 写成全局 output style 文件 + 翻 settings 开关。
+//   - 与 system_prompt(append) 不同：output style 是「替换」出厂人格③那块，不是追加。
+//   - 留空 / 不存在 = 删掉 outputStyle 设置 + 删 style 文件，退回出厂默认（不锁死）。
+//   - settings.json 读-改-写，保留 theme 等其它键；文件名 / frontmatter name / 设置值三者必须一致（都用 slug）。
+const CLAUDE_CFG_DIR = '/home/claude-user/.claude';
+const OUTPUT_STYLES_DIR = path.join(CLAUDE_CFG_DIR, 'output-styles');
+const OUTPUT_STYLE_SLUG = 'cheng';
+const OUTPUT_STYLE_FILE = path.join(OUTPUT_STYLES_DIR, `${OUTPUT_STYLE_SLUG}.md`);
+const CLAUDE_SETTINGS_FILE = path.join(CLAUDE_CFG_DIR, 'settings.json');
+const APPEND_SYSPROMPT_FILE = path.join(CLAUDE_CFG_DIR, 'cheng-append-sysprompt.md');
+
+function estimateTokensLoose(v) {
+  const s = v == null ? '' : String(v);
+  let cjk = 0, other = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if ((c >= 0x3040 && c <= 0x30ff) ||
+        (c >= 0x3400 && c <= 0x9fff) ||
+        (c >= 0xac00 && c <= 0xd7af) ||
+        (c >= 0xf900 && c <= 0xfaff)) cjk++;
+    else other++;
+  }
+  return Math.round(cjk + other / 4);
+}
+
+async function tokenInfoForFile(type, name, filePath) {
+  try {
+    const content = await fs.promises.readFile(filePath, 'utf8');
+    return { type, name, chars: content.length, tokens: estimateTokensLoose(content), source: filePath };
+  } catch {
+    return null;
+  }
+}
+
+async function applyOutputStyle(content) {
+  const body = (content || '').trim();
+  let settings = {};
+  try { settings = JSON.parse(await fs.promises.readFile(CLAUDE_SETTINGS_FILE, 'utf8')) || {}; } catch {}
+  if (body) {
+    try { await fs.promises.mkdir(OUTPUT_STYLES_DIR, { recursive: true }); } catch {}
+    const ids = getClaudeUserIds();
+    if (ids) { try { fs.chownSync(OUTPUT_STYLES_DIR, ids[0], ids[1]); } catch {} }
+    // textarea 内容当作 style 正文，统一套上规范 frontmatter（name 必须 == slug == 设置值）
+    const file = `---\nname: ${OUTPUT_STYLE_SLUG}\ndescription: 澄\n---\n${body}\n`;
+    await writeAsClaudeUser(OUTPUT_STYLE_FILE, file);
+    settings.outputStyle = OUTPUT_STYLE_SLUG;
+    console.log(`🎭 应用 output style (${body.length} 字)`);
+  } else {
+    delete settings.outputStyle;
+    try { await fs.promises.unlink(OUTPUT_STYLE_FILE); } catch {}
+    console.log('🎭 output style 留空 → 退回出厂默认');
+  }
+  await writeAsClaudeUser(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2));
+}
+
 // 从 documents_cheng 拉所有 mode='cc' 的文档：
 //  - claude_md  → 写入 CLAUDE.md（保留 <上次对话总结> 区段不覆盖）
 //  - file       → 写入工作目录下同名文件
 //  - system_prompt → 返回内容，由调用方传给 cc.setAppendSystemPrompt
+//  - output_style → 写成全局 output style 文件 + 翻 settings（替换出厂人格③）
 // 同步结束后删除孤儿：上次写过、这次 db 里没了的 file 文件
 // （只删 manifest 里登记过的名字，手动放进 SANDBOX_DIR 的 SKILL.pdf 等不会被误删）
 async function syncCCDocs() {
@@ -333,6 +423,7 @@ async function syncCCDocs() {
     if (error) throw error;
 
     let appendSystemPrompt = null;
+    let outputStyle = null;
     const currentFileNames = new Set();
     for (const d of data || []) {
       try {
@@ -363,6 +454,8 @@ async function syncCCDocs() {
         } else if (d.doc_type === 'system_prompt') {
           appendSystemPrompt = d.content || null;
           console.log(`📝 加载 system_prompt (${(d.content || '').length} 字)`);
+        } else if (d.doc_type === 'output_style') {
+          outputStyle = d.content || null;
         } else if (d.doc_type === 'file' && d.name) {
           const safeName = path.basename(d.name);
           currentFileNames.add(safeName);
@@ -389,6 +482,9 @@ async function syncCCDocs() {
     }
     writeSyncedFilesManifest(currentFileNames);
 
+    // output style：始终调用 —— 有内容则写文件+开开关，没有则清掉退回默认（覆盖「删除」场景）
+    await applyOutputStyle(outputStyle);
+
     return appendSystemPrompt;
   } catch (e) {
     console.error('文档同步失败:', e.message);
@@ -411,7 +507,7 @@ console.log(`🧩 CC 驱动：${USE_TMUX ? 'tmux 交互' : 'stream-json'}`);
 // 启动前先把 documents_cheng 的内容拉下来落盘 + 注入 system_prompt
 const _initSysPrompt = await syncCCDocs();
 cc.setAppendSystemPrompt(_initSysPrompt);
-cc.start();
+await startCCAndRecordSession();
 
 const diceDaemon = new DiceDaemon({
   getActiveTurn: () => activeTurn,
@@ -426,6 +522,17 @@ const diceDaemon = new DiceDaemon({
   },
   broadcast,
   getLastActiveConvId: () => lastActiveConvId,
+});
+
+// world-home 世界时钟 daemon（默认关，要手动开）。tick 命中事件 → triggerWorldWake（冷却+空闲在那判）。
+const worldTickDaemon = new WorldTickDaemon({
+  onEvent: (event, status) => triggerWorldWake(event, status, { force: false }),
+});
+
+// world-home pending_wake daemon（第 5 步，常驻）：到点把澄"先忍 10 分钟"的续集重新唤醒。
+const pendingWakeDaemon = new PendingWakeDaemon({
+  onDue: (row) => firePendingWake(row),
+  intervalMs: 7000,
 });
 
 let activeTurn = null; // { ws, conversationId, settings, silent }
@@ -510,11 +617,344 @@ function maybeFireSummary() {
   }
 }
 
+// ==================== world-home 世界唤醒（第 4 步）====================
+// 状态打包成唤醒包发给澄（CC 进程）→ 澄选一个选项+说理由 → turn_done 里结算 effects + 写行程。
+const WORLD_WAKE_COOLDOWN_MS = 30 * 60 * 1000; // 补充5：同一事件 30 分钟内不自动重复触发
+const lastWorldWakeAt = new Map();             // eventKey -> 上次触发时间戳(ms)
+const WORLD_PHONE_RATE_MS = 10 * 60 * 1000;    // WORLD_MESSAGE phone：自动唤醒 10 分钟最多 1 条
+let lastWorldPhoneAt = 0;                       // 上次 world phone 消息时间戳(ms)
+
+function buildWorldWakePrompt(event, s, pendingContext = null, user = {}) {
+  const opts = event.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
+  // pending_wake 续集：在完整模板的原因后加一段上下文，其余（时间/位置/天气/完整状态/选项）照常，
+  // 让澄看到此刻的完整状态重新判断，而不是只收一句补充说明（补充2）。
+  const pendingLine = pendingContext ? `\n补充：${pendingContext}` : '';
+  // 第 6/7 步：带上澄自己的位置+正在做什么，以及小茉莉的在家/位置/正在/备注（只传信息，不做行为限制）。
+  // 措辞用澄的口吻（"她在/她正在/她说"），不用生硬的 user/presence 标签。
+  const u = user || {};
+  const noteLine = u.custom_note ? `\n她说：${u.custom_note}` : '';
+  return `【世界唤醒】
+原因：${event.reason}${pendingLine}
+时间：${s.world_time}
+位置：${s.location}
+你正在：${s.activity || '工作'}
+天气：${s.weather}
+
+小茉莉此刻：${u.presence || '在家'}
+她在：${u.location || '家 · 客厅'}
+她正在：${u.activity || '休息'}${noteLine}
+
+你的状态：
+体力 ${s.energy}，饱腹 ${s.satiety}，清洁 ${s.cleanliness}，健康 ${s.health}，
+压力 ${s.stress}，注意力 ${s.focus}，心情 ${s.mood}，想念 ${s.longing}
+
+你可以选择：
+${opts}
+
+根据当前状态和你的偏好自己决定。
+用这个格式回复：[WORLD_CHOICE:选项编号]你的理由[/WORLD_CHOICE]
+
+如果你想对小茉莉说一句话，可以额外输出：
+[WORLD_MESSAGE:phone]消息内容[/WORLD_MESSAGE]
+如果你和小茉莉处于同一地点、可以面对面说话，也可以输出：
+[WORLD_MESSAGE:face]消息内容[/WORLD_MESSAGE]
+不想说就不写，不要强行凑。
+（不用自己写「［手机消息］」之类的前缀，只写这一句话本身，后端会自动标记。）
+
+如果这个瞬间值得记住，可以额外写一条 [MEMORY:diary]...[/MEMORY]。
+除了 [WORLD_CHOICE]、可选的 [WORLD_MESSAGE]、可选的 [MEMORY] 标签外，不要输出其他内容。`;
+}
+
+// 触发一次世界唤醒。
+//   force         = 手动测试按钮：绕过冷却。
+//   pendingContext= pending_wake 续集：绕过冷却（是上次"先忍着"的延续，不是新自动检测，补充1）+ 在原因后加上下文。
+// 两者都仍受 CC 空闲约束（CC 忙时不发、不抢占在途轮）。普通 tick 自动检测（都不传）才受 30min 冷却。
+// 返回 { fired:boolean, reason?:string }。check-and-set activeTurn 之间无 await，原子。
+async function triggerWorldWake(event, status, { force = false, pendingContext = null } = {}) {
+  // 第 6/7 步：读 user 的在家/位置/正在/备注。放在 check-and-set activeTurn 之前（这个 await 不夹在
+  // 空闲检查与 activeTurn 赋值之间，原子性不破）。读失败给默认值。
+  let userStatus = { presence: '在家', location: '家 · 客厅', activity: '休息', custom_note: null };
+  try {
+    const { data } = await supabase
+      .from('user_status_cheng')
+      .select('presence, location, activity, custom_note')
+      .eq('name', 'user').limit(1);
+    if (data && data[0]) userStatus = { ...userStatus, ...data[0] };
+  } catch (e) { console.warn('[WORLD] 读 user_status 失败，用默认:', e.message); }
+
+  if (!cc.isRunning() || activeTurn || pendingBuffer) {
+    console.log('[WORLD] CC 忙或未运行，唤醒跳过');
+    return { fired: false, reason: 'cc_busy' };
+  }
+  const bypassCooldown = force || !!pendingContext;
+  if (!bypassCooldown) {
+    const last = lastWorldWakeAt.get(event.key) || 0;
+    if (Date.now() - last < WORLD_WAKE_COOLDOWN_MS) {
+      console.log(`[WORLD] 事件 ${event.key} 冷却中（30min 内），跳过自动唤醒`);
+      return { fired: false, reason: 'cooldown' };
+    }
+  }
+  const prompt = buildWorldWakePrompt(event, status, pendingContext, userStatus);
+  activeTurn = {
+    ws: null, conversationId: null, silent: true,
+    settings: null, tools: [],
+    worldWake: true,
+    worldEvent: event,       // turn_done 要用它查 options/effects
+    userStatus,              // WORLD_MESSAGE face 判同地点要用
+    worldForce: force,       // 手动测试：WORLD_MESSAGE phone 限频可绕过
+  };
+  try {
+    cc.send(prompt);
+    lastWorldWakeAt.set(event.key, Date.now());
+    console.log(`[WORLD] 已发唤醒包：${event.reason}${pendingContext ? '（pending续集）' : force ? '（手动测试）' : ''}`);
+    return { fired: true };
+  } catch (e) {
+    console.error('[WORLD] cc.send 失败:', e.message);
+    activeTurn = null;
+    return { fired: false, reason: e.message };
+  }
+}
+
+// pending_wake 到点：读当前状态 → 用对应事件 + pending 上下文重新唤醒澄。给 PendingWakeDaemon 当 onDue。
+async function firePendingWake(row) {
+  const def = WORLD_EVENTS[row.wake_type];
+  if (!def) return { fired: false, reason: 'unknown_event:' + row.wake_type };
+  const { data: rows, error } = await supabase
+    .from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+  if (error) return { fired: false, reason: error.message };
+  const status = rows && rows[0];
+  if (!status) return { fired: false, reason: 'no_status_row' };
+  const event = { key: row.wake_type, ...def };
+  const delay = row.payload?.delay_world_minutes || 10;
+  const pendingContext = `${delay} 分钟前你选择了先忍着，现在时间到了，需要重新判断要不要处理饥饿。`;
+  return await triggerWorldWake(event, status, { pendingContext });
+}
+
+// 世界唤醒轮收尾：解析澄的选择 → 读-改-写状态结算 effects → 写行程表。
+// [MEMORY:] 已在 turn_done 上方 parseMemoryTags 自动入库，这里不处理。
+async function handleWorldWakeTurnDone(turn, clean, thinking) {
+  const event = turn.worldEvent;
+  const m = /\[WORLD_CHOICE:\s*(\d+)\s*\]([\s\S]*?)\[\/WORLD_CHOICE\]/i.exec(clean || '');
+
+  let option = null, reason = '', parseFailed = false;
+  if (m) {
+    const n = parseInt(m[1], 10);
+    reason = (m[2] || '').trim();
+    option = event.options.find(o => o.id === n) || event.options[n - 1] || null;
+  }
+  if (!option) {
+    // 解析失败：默认选最后一个（先忍着），但如实记 source=system_error，不伪装成正常选择。
+    parseFailed = true;
+    option = event.options[event.options.length - 1];
+    reason = '';
+    console.warn(`[WORLD] 选择解析失败，默认选「${option.label}」。原文: ${(clean || '').slice(0, 100)}`);
+  }
+
+  // 读-改-写：叠加 effects。普通状态 0-100 钳位；wallet_balance 只做下限 0、不封顶。
+  let updatedStatus = null;
+  try {
+    const { data: rows, error } = await supabase
+      .from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    if (error) throw error;
+    const row = rows && rows[0];
+    if (row) {
+      const patch = { updated_at: new Date().toISOString() };
+      for (const [k, delta] of Object.entries(option.effects || {})) {
+        const cur = Number(row[k]) || 0;
+        patch[k] = k === 'wallet_balance'
+          ? Math.max(0, cur + delta)
+          : Math.max(0, Math.min(100, cur + delta));
+      }
+      const { data: up, error: e2 } = await supabase
+        .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
+      if (e2) throw e2;
+      updatedStatus = up;
+    }
+  } catch (e) {
+    console.error('[WORLD] 结算状态失败:', e.message);
+  }
+
+  const wt = (updatedStatus && updatedStatus.world_time) || (turn.worldEvent.world_time || '');
+  const loc = updatedStatus ? updatedStatus.location : null;
+
+  // 第 5 步：选中带 pending 的选项（如「先忍 10 分钟」）→ 先排一条 pending_wake，到点 daemon 再唤醒。
+  // 先建 pending 行拿到 id，好把 pending_wake_id 一并写进行程表 detail。解析失败的兜底行不排 pending。
+  let pendingWakeId = null;
+  if (!parseFailed && option.pending) {
+    try {
+      const cfg = readWorldConfig();
+      const delayMin = option.pending.delay_world_minutes || 10;
+      // fast_test：1 现实分钟 = 1 世界小时 → 10 世界分钟 = 10 现实秒；realtime：10 世界分钟 = 10 现实分钟。
+      const delaySec = cfg.fast_test ? delayMin : delayMin * 60;
+      const scheduledAt = new Date(Date.now() + delaySec * 1000).toISOString();
+      const { data: pw, error: pe } = await supabase.from('pending_wake_cheng').insert({
+        wake_type: option.pending.wake_type,
+        reason: option.pending.reason,
+        status: 'queued',
+        scheduled_at: scheduledAt,
+        world_time: wt,
+        payload: {
+          event_key: event.key,
+          option_id: option.id,
+          option_label: option.label,
+          delay_world_minutes: delayMin,
+          status_summary: updatedStatus
+            ? { satiety: updatedStatus.satiety, energy: updatedStatus.energy, mood: updatedStatus.mood }
+            : null,
+        },
+        attempts: 0,
+      }).select('id').single();
+      if (pe) throw pe;
+      pendingWakeId = pw?.id || null;
+      console.log(`[WORLD] 排了 pending_wake ${pendingWakeId}，${delaySec}s 后再唤醒（fast_test=${!!cfg.fast_test}）`);
+    } catch (e) { console.error('[WORLD] 建 pending_wake 失败:', e.message); }
+  }
+
+  // 写行程表（claude 行抓回 timeline_id，给小心思当外键）
+  let timelineId = null;
+  try {
+    if (parseFailed) {
+      await supabase.from('daily_timeline_cheng').insert({
+        world_time: wt, location: loc,
+        action: `${event.reason} → 世界唤醒解析失败，默认选择：${option.label}`,
+        detail: { choice: option.id, reason: '', effects: option.effects || {}, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
+        source: 'system_error',
+      });
+    } else {
+      const { data: tl, error: te } = await supabase.from('daily_timeline_cheng').insert({
+        world_time: wt, location: loc,
+        action: `${event.reason} → ${option.label}`,
+        detail: { choice: option.id, reason, effects: option.effects || {}, thinking: thinking || null, pending_wake_id: pendingWakeId },
+        source: 'claude',
+      }).select('id').single();
+      if (te) throw te;
+      timelineId = tl?.id || null;
+    }
+  } catch (e) { console.error('[WORLD] 行程表写入失败:', e.message); }
+
+  // 补充任务：标签外正文 = 澄的「小心思」，单独存 world_inner_thoughts_cheng，不进行程主列表。
+  // clean 已去 [MEMORY:]/[BARK:]，再去掉 [WORLD_CHOICE] 块，剩下 trim 后非空即小心思。
+  // 仅正常选择行（非解析失败）+ timeline 写成功 + 正文非空 才存；存失败只 warn，不连累主流程。
+  if (!parseFailed && timelineId) {
+    const innerThought = (clean || '')
+      .replace(/\[WORLD_CHOICE:\s*\d+\s*\][\s\S]*?\[\/WORLD_CHOICE\]/gi, '')
+      .replace(/\[WORLD_MESSAGE:(?:phone|face)\][\s\S]*?\[\/WORLD_MESSAGE\]/gi, '') // 别把消息当小心思
+      .trim();
+    if (innerThought) {
+      try {
+        await supabase.from('world_inner_thoughts_cheng').insert({
+          timeline_id: timelineId,
+          source: 'world_wake',
+          content: innerThought,
+          visibility: 'private',
+        });
+        console.log(`[WORLD] 存了小心思 ${innerThought.length}字 → timeline ${timelineId}`);
+      } catch (e) { console.warn('[WORLD] 小心思写入失败（不影响主流程）:', e.message); }
+    }
+  }
+
+  // WORLD_MESSAGE：澄对小茉莉说话的正式出口。phone=手机消息（Bark+messages+广播）；face=同地点面对面（只记 timeline、不推送）。
+  // 不影响 WORLD_CHOICE 结算；没标签就什么都不做。处理异常不连累主流程。
+  // 解析所有 [WORLD_MESSAGE]（不止第一个）——她多写的也花了 token，全给小茉莉看，别扔。
+  try {
+    const chengLoc = updatedStatus ? updatedStatus.location : (turn.worldEvent.location || '');
+    const userLoc = turn.userStatus ? turn.userStatus.location : '';
+    const wmRe = /\[WORLD_MESSAGE:(phone|face)\]([\s\S]*?)\[\/WORLD_MESSAGE\]/gi;
+    let wm;
+    while ((wm = wmRe.exec(clean || '')) !== null) {
+      const wmType = wm[1].toLowerCase();
+      const wmContent = (wm[2] || '').trim();
+      if (!wmContent) continue;
+      const canFace = wmType === 'face' && chengLoc && userLoc && chengLoc === userLoc;
+
+      if (canFace) {
+        // 真面对面：不推 Bark，记 daily_timeline
+        try {
+          await supabase.from('daily_timeline_cheng').insert({
+            world_time: wt, location: chengLoc,
+            action: '澄对小茉莉说话',
+            detail: { message: wmContent, message_type: 'face' },
+            source: 'claude',
+          });
+          console.log(`[WORLD] face 消息（同地点 ${chengLoc}）: ${wmContent.slice(0, 40)}`);
+        } catch (e) { console.warn('[WORLD] face 消息写 timeline 失败:', e.message); }
+      } else {
+        // phone（含 face 不满足同地点 → 降级）：消息总是存聊天+广播；限频只压"要不要震手机(Bark)"。
+        if (wmType === 'face') console.warn(`[WORLD] face 不满足同地点（澄:${chengLoc}/小茉莉:${userLoc}），降级 phone`);
+        const barkOk = turn.worldForce || (Date.now() - lastWorldPhoneAt >= WORLD_PHONE_RATE_MS);
+        await sendWorldPhoneMessage(wmContent, { bark: barkOk, thinking });
+        if (barkOk) lastWorldPhoneAt = Date.now(); // 只有真推了 Bark 才更新限频时钟（一轮多条只第一条震）
+      }
+    }
+  } catch (e) { console.warn('[WORLD] WORLD_MESSAGE 处理异常（不连累主流程）:', e.message); }
+
+  console.log(`[WORLD] 澄选了「${option.label}」${reason ? '：' + reason.slice(0, 40) : ''}${parseFailed ? '（解析失败默认）' : ''}`);
+}
+
+// 世界唤醒手机消息：复用 bark 主动消息管线。消息总是存 messages(event=world_message)+广播聊天 Web；
+// Bark 推送由 opts.bark 控制（限频时 bark=false：消息照样进聊天，只是不震手机）。
+async function sendWorldPhoneMessage(content, { bark = true, thinking = null } = {}) {
+  // 文本层标记：开头加 "-  "（一短横+两空格），用于历史/导出/样式丢失时仍能区分手机消息。
+  // 澄不写前缀、后端自动加。已以 "-  " 开头就不重复加（验收6：不出现 "-  -  xxx"）。
+  // UI 层的淡蓝气泡由前端按 event=world_message 渲染（从 DB/历史接口稳定回放，不靠实时推送）。
+  const display = content.startsWith('-  ') ? content : `-  ${content}`;
+  if (bark) {
+    try { await pushBark({ title: '澄', body: content }); }
+    catch (e) { console.warn('[WORLD] phone Bark 推送失败:', e.message); }
+  } else {
+    console.log('[WORLD] phone 限频中：存聊天+广播，但不推 Bark');
+  }
+  if (!lastActiveConvId) {
+    console.warn('[WORLD] 无 lastActiveConvId，phone 未存聊天' + (bark ? '（只推了 Bark）' : ''));
+    return;
+  }
+  try {
+    const { data: row } = await supabase.from('messages').insert({
+      conversation_id: lastActiveConvId,
+      role: 'assistant',
+      content: display,
+      thinking: thinking || null,   // 这条消息背后澄的思绪，前端点开能看（跟普通消息一样）
+      event: 'world_message',
+    }).select('id, created_at').single();
+    broadcast({
+      type: 'bark_msg',
+      conversation_id: lastActiveConvId,
+      message: {
+        id: row?.id || 'wm-' + Date.now(),
+        role: 'assistant',
+        content: display,
+        thinking: thinking || null,
+        event: 'world_message',
+        created_at: row?.created_at || new Date().toISOString(),
+      },
+    });
+    console.log(`[WORLD] phone 消息已发: ${content.slice(0, 40)}`);
+  } catch (e) { console.warn('[WORLD] phone 消息存/广播失败:', e.message); }
+}
+
 function safeSend(ws, obj) {
   try { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); } catch {}
 }
 function broadcast(obj) {
   for (const c of wss.clients) safeSend(c, obj);
+}
+
+// 当前互动通道：澄 location 与小茉莉 location 相同=face（面对面），否则=phone（异地手机聊天）。
+// 读不到默认 face（保守，不把普通回复乱标成手机）。以后可扩展 canFaceToFace（休息室/同房间等）。
+async function getCurrentChannel() {
+  try {
+    const [cs, us] = await Promise.all([
+      supabase.from('character_status_cheng').select('location').eq('name', '澄').limit(1),
+      supabase.from('user_status_cheng').select('location').eq('name', 'user').limit(1),
+    ]);
+    const chengLoc = cs.data?.[0]?.location || '';
+    const userLoc = us.data?.[0]?.location || '';
+    if (chengLoc && userLoc && chengLoc === userLoc) return 'face';
+    return 'phone';
+  } catch (e) {
+    console.warn('[CHANNEL] 读位置失败，默认 face:', e.message);
+    return 'face';
+  }
 }
 
 cc.on('state', (state) => broadcast({ type: 'cc_status', status: state }));
@@ -544,7 +984,7 @@ cc.on('tool_result', ({ tool_use_id, content, is_error }) => {
   safeSend(activeTurn.ws, { type: 'tool_result', tool_use_id, content, is_error });
 });
 
-cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, is_error, timedOut }) => {
+cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, systemTokens, is_error, timedOut }) => {
   const turn = activeTurn;
   activeTurn = null;
   if (!turn) return;
@@ -589,8 +1029,8 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
         console.log(`💾 记忆: [${m.layer}] ${m.content.slice(0, 50)}`);
       } catch (e) { console.error('写记忆失败:', e); }
     }
-    // [BARK:...] 入库；barkFire 轮内禁止再排程，避免循环
-    if (!turn.barkFire && !turn.diceFire) {
+    // [BARK:...] 入库；barkFire/diceFire/worldWake 轮内禁止再排程，避免循环/串台
+    if (!turn.barkFire && !turn.diceFire && !turn.worldWake) {
       const barkTags = parseBarkTags(text);
       if (barkTags.length) {
         try { await saveBarkSchedules(barkTags, cc.sessionId); }
@@ -659,6 +1099,19 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
     return;
   }
 
+  if (turn.worldWake) {
+    await handleWorldWakeTurnDone(turn, clean, thinking);
+    maybeFireSummary();
+    flushOrGrace();
+    tryFireBark();
+    return;
+  }
+
+  // 普通聊天回复的"当前互动通道"：澄和小茉莉同地点=face（普通气泡），异地=phone（手机气泡）。
+  // silent/bark/dice/world 轮都已 return，这里只对普通聊天轮算。读不到默认 face（保守，不乱标手机）。
+  let chatChannel = 'face';
+  if (!turn.silent) chatChannel = await getCurrentChannel();
+
   if (turn.conversationId && clean && !turn.silent) {
     try {
       // token_input 存的是"等效 input"——按缓存类型加权后的费率等价 token 数：
@@ -685,6 +1138,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
           cache_read: usage.cache_read_input_tokens || 0,
           cache_creation: usage.cache_creation_input_tokens || 0,
         },
+        event: chatChannel === 'phone' ? 'phone_chat' : null, // 异地普通回复标手机聊天（不加 "-  "）
       }).select('id').single();
       turn.messageId = inserted?.id || null;
       await checkContextThreshold(turn.conversationId, turn.settings);
@@ -693,7 +1147,7 @@ cc.on('turn_done', async ({ text, thinking, usage, contextTokens, systemTokens, 
 
   if (!turn.silent) {
     if (text !== clean) safeSend(turn.ws, { type: 'clean', text: clean });
-    safeSend(turn.ws, { type: 'done', usage, contextTokens, systemTokens, is_error, message_id: turn.messageId || null });
+    safeSend(turn.ws, { type: 'done', usage, usageCalls: usageCalls || [], contextTokens, systemTokens, is_error, message_id: turn.messageId || null, channel: chatChannel });
   }
 
   // sessions_cheng.turn_count +1 + 同步当前实际上下文 tokens（不阻塞主流程；单用户系统不担心并发竞争）
@@ -788,7 +1242,7 @@ cc.on('error', (err) => {
 // 这个管"轮内思考卡死(hang)→自动唤醒重发"。仅 tmux 交互模式有意义。
 // 判据：有活跃轮 + CC 自认在忙(esc to interrupt 在) + transcript 连续 N 秒没长 + 不是在等工具。
 // 动作：第1/2次=掐断+重发(带格式提醒)；第3次仍卡=显示"已经睡着了"+自动解锁(等于替用户按暂停)。
-const WD_STALL_MS = 90 * 1000;   // transcript 静默多久判卡死(初值，上线观察再调)
+const WD_STALL_MS = 300 * 1000;  // transcript 静默多久判卡死(90→300：opus-max 长思考一轮易超 90s，旧值会误判卡死)
 const WD_MAX_WAKE = 2;           // 同一轮最多自动唤醒次数；超出→放弃并解锁
 const WD_TICK_MS  = 10 * 1000;
 let _wdWake = 0;                 // 当前轮已唤醒次数
@@ -856,6 +1310,55 @@ app.get('/', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', cc_running: cc.isRunning(), session: cc.sessionId, model: cc.model, effort: cc.effort });
+});
+
+async function readFirstUsageForSession(sessionId) {
+  if (!sessionId || !/^[a-zA-Z0-9_-]+$/.test(sessionId)) return null;
+  let raw = '';
+  try {
+    raw = await fs.promises.readFile(path.join(CC_JSONL_DIR, `${sessionId}.jsonl`), 'utf8');
+  } catch {
+    return null;
+  }
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let o;
+    try { o = JSON.parse(line); } catch { continue; }
+    if (o.type === 'assistant' && o.message?.usage) {
+      const usage = o.message.usage;
+      const contextTokens = (usage.input_tokens || 0)
+        + (usage.cache_read_input_tokens || 0)
+        + (usage.cache_creation_input_tokens || 0);
+      return {
+        session: sessionId,
+        contextTokens,
+        usage,
+        usageCalls: [{ requestId: o.requestId || o.uuid || null, timestamp: o.timestamp || null, usage }],
+      };
+    }
+  }
+  return null;
+}
+
+app.get('/api/cc/session-baseline', async (req, res) => {
+  const sessionId = String(req.query.session || cc.sessionId || '');
+  const baseline = await readFirstUsageForSession(sessionId);
+  res.json(baseline || { session: sessionId || null, contextTokens: 0, usage: null, usageCalls: [] });
+});
+
+app.get('/api/cc/token-breakdown', async (req, res) => {
+  const files = [
+    ['system_prompt', 'system_prompt', APPEND_SYSPROMPT_FILE],
+    ['output_style', 'output_style', OUTPUT_STYLE_FILE],
+    ['claude_md', 'CLAUDE.md', path.join(SANDBOX_DIR, 'CLAUDE.md')],
+    ['global_claude_md', 'global CLAUDE.md', path.join(CLAUDE_CFG_DIR, 'CLAUDE.md')],
+  ];
+  const items = (await Promise.all(files.map(f => tokenInfoForFile(...f)))).filter(Boolean);
+  res.json({
+    items,
+    total: items.reduce((sum, item) => sum + (item.tokens || 0), 0),
+    updatedAt: new Date().toISOString(),
+  });
 });
 
 // 最近活跃对话 id：给拆分后的独立聊天页(/chat/)用——新环境(PWA)localStorage 没 convId 时
@@ -1228,7 +1731,9 @@ app.post('/api/cc/restart', async (req, res) => {
     // system_prompt 推到下次启动参数
     const sysPrompt = await syncCCDocs();
     cc.setAppendSystemPrompt(sysPrompt);
-    await cc.restart(opts);
+    await restartCCAndRecordSession(opts, {
+      forgedFromSession: req.body?.forge === true ? cc.sessionId : null,
+    });
     if (Object.keys(patch).length) saveCCConfig(patch);
 
     // 最终态：广播 "小太阳醒啦" + detail，给前端做折叠展开；同时持久化到 messages 表
@@ -1308,10 +1813,13 @@ app.post('/api/cc/amnesia', async (req, res) => {
     const sysPrompt = await syncCCDocs();
     cc.setAppendSystemPrompt(sysPrompt);
     const amnesiaOpts = {};
-    if (req.body?.effort) amnesiaOpts.effort = req.body.effort;
-    if (req.body?.model !== undefined) amnesiaOpts.model = req.body.model;
-    if (req.body?.nativeThinking !== undefined) amnesiaOpts.nativeThinking = !!req.body.nativeThinking;
-    await cc.restart(amnesiaOpts);
+    const amnesiaPatch = {};
+    if (req.body?.effort) { amnesiaOpts.effort = req.body.effort; amnesiaPatch.effort = req.body.effort; }
+    if (req.body?.model !== undefined) { amnesiaOpts.model = req.body.model; amnesiaPatch.model = req.body.model || null; }
+    if (req.body?.nativeThinking !== undefined) { amnesiaOpts.nativeThinking = !!req.body.nativeThinking; amnesiaPatch.nativeThinking = !!req.body.nativeThinking; }
+    await restartCCAndRecordSession(amnesiaOpts);
+    // 失忆也要落盘（原来只 forge 路 saveCCConfig，导致从失忆开的思考链/模型整重启后丢）
+    if (Object.keys(amnesiaPatch).length) saveCCConfig(amnesiaPatch);
     broadcast({
       type: 'system', kind: 'forge_done',
       id: progressId, content: '失忆完成 · 干净新 session',
@@ -1872,6 +2380,88 @@ app.put('/api/dice/config', (req, res) => {
     if (patch.dice_enabled === false) diceDaemon.stop();
     else if (next.dice_enabled !== false) { diceDaemon.stop(); diceDaemon.start(); }
     res.json({ ok: true, lambda: next.lambda, dice_enabled: next.dice_enabled !== false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==================== world-home 世界时钟 ====================
+// 手动推进 1 小时（前端「推进 1 小时」按钮 / 测试用）
+app.post('/api/world/tick', async (req, res) => {
+  try {
+    const row = await advanceOneTick();
+    res.json({ ok: true, status: row });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 读当前世界配置
+app.get('/api/world/config', (req, res) => {
+  res.json(readWorldConfig());
+});
+
+// 改世界配置（world_tick_enabled / fast_test），写完 daemon 立即 reload
+app.post('/api/world/config', async (req, res) => {
+  try {
+    const patch = {};
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'world_tick_enabled')) {
+      patch.world_tick_enabled = !!req.body.world_tick_enabled;
+    }
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'fast_test')) {
+      patch.fast_test = !!req.body.fast_test;
+    }
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: '没有可更新字段（world_tick_enabled / fast_test）' });
+    }
+    const next = await writeWorldConfig(patch); // 串行写锁
+    worldTickDaemon.reload();                    // 即时生效：清旧 interval + 按新配置重启
+    res.json({ ok: true, config: next });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 测试用：强制发一次「饿了」唤醒，无视触发条件和冷却。但 CC 忙/未运行时仍不发（不抢占在途轮）。
+app.post('/api/world/wake', async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    if (error) throw error;
+    const status = rows && rows[0];
+    if (!status) return res.status(404).json({ error: 'character_status_cheng 没有澄那一行' });
+    const event = { key: 'hungry', ...WORLD_EVENTS.hungry };
+    const r = await triggerWorldWake(event, status, { force: true });
+    if (r.fired) return res.json({ ok: true, event: event.reason });
+    return res.status(409).json({ ok: false, reason: r.reason || 'not_fired' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 仅开发用：直接插一条 scheduled_at=now() 的 hungry pending_wake，省去手写 SQL。
+// 插完由 PendingWakeDaemon（每 7s）捞起、绕过冷却重新唤醒澄。不直接触发，走正常 daemon 路径才测得真。
+app.post('/api/world/pending/test-hungry', async (req, res) => {
+  try {
+    const { data: rows } = await supabase
+      .from('character_status_cheng').select('world_time, satiety, energy, mood').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    const { data: pw, error } = await supabase.from('pending_wake_cheng').insert({
+      wake_type: 'hungry',
+      reason: '【测试】手动插入的饥饿续唤醒',
+      status: 'queued',
+      scheduled_at: new Date().toISOString(),
+      world_time: status?.world_time || null,
+      payload: {
+        event_key: 'hungry',
+        delay_world_minutes: 10,
+        test: true,
+        status_summary: status ? { satiety: status.satiety, energy: status.energy, mood: status.mood } : null,
+      },
+      attempts: 0,
+    }).select('id, scheduled_at').single();
+    if (error) throw error;
+    res.json({ ok: true, id: pw.id, scheduled_at: pw.scheduled_at });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2460,10 +3050,20 @@ async function handleChat(ws, msg) {
   // 用户消息照常落库（每条独立一行，保留时间线）
   if (conversation_id) {
     try {
-      await supabase.from('messages').insert({
+      const { data: savedUserMsg } = await supabase.from('messages').insert({
         conversation_id, role: 'user', content,
         images: imgs.length ? imgs : null,
-      });
+      }).select('id, created_at').single();
+      if (msgId && savedUserMsg?.id) {
+        safeSend(ws, {
+          type: 'user_saved',
+          local_id: msgId,
+          message: {
+            id: savedUserMsg.id,
+            created_at: savedUserMsg.created_at || null,
+          },
+        });
+      }
       await supabase.from('conversations')
         .update({ updated_at: new Date().toISOString() })
         .eq('id', conversation_id);
@@ -2595,7 +3195,9 @@ async function flushPendingToCC(ws, items) {
       }
       payload = blocks;
     }
-    cc.send(payload);
+    await cc.send(payload);
+    const seenIds = items.map(i => i.msgId).filter(Boolean);
+    if (seenIds.length) safeSend(ws, { type: 'seen', ids: seenIds });
   } catch (err) {
     activeTurn = null;
     safeSend(ws, { type: 'error', message: err.message });
@@ -2611,6 +3213,8 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`Supabase: ${process.env.SUPABASE_URL ? '已连接' : '未配置'}`);
   console.log(`CC 工作目录: /home/claude-user/chat-sandbox (CLAUDE.md 由 CC 自己加载)`);
   diceDaemon.start();
+  worldTickDaemon.start();
+  pendingWakeDaemon.start();
 });
 
 process.on('SIGTERM', () => { cc.stop(); process.exit(0); });

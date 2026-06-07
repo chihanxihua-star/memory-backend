@@ -8,17 +8,24 @@ import { surfaceForInject } from './surfacing.js';
 // - userPortion: 折叠块下方实际放的用户内容（默认=searchText；通常传 maybeTimePrefix 后的版本）
 // 返回 { message, injectedCount }。无浮现命中时 message === userPortion 原样。
 export async function buildMessageForCC(searchText, userPortion = searchText) {
-  let fuxian = { text: '', items: [] };
+  let fx = { statusLine: '', text: '', items: [] };
   try {
-    fuxian = await surfaceForInject(searchText);
+    fx = await surfaceForInject(searchText);
   } catch (e) {
     console.error('[inject] surfaceForInject failed:', e.message);
   }
-  if (!fuxian.text) return { message: userPortion, injectedCount: 0 };
-  const block =
-    `<记忆浮现 — 仅你可见的背景，自然融入对话即可；不要直接复述，也不要把这段当成要回应的内容>\n` +
-    `${fuxian.text}\n` +
-    `</记忆浮现>\n\n` +
-    userPortion;
-  return { message: block, injectedCount: fuxian.items.length };
+  // 两个独立块：<此刻>=现实情境（每条都带）、<记忆浮现>=浮上来的旧事（冷却+命中才有）。
+  const blocks = [];
+  if (fx.statusLine) {
+    blocks.push(`<此刻 — 仅你可见的现实情境>\n${fx.statusLine}\n</此刻>`);
+  }
+  if (fx.text) {
+    blocks.push(
+      `<记忆浮现 — 仅你可见的背景，自然融入对话即可；不要直接复述，也不要把这段当成要回应的内容>\n` +
+      `${fx.text}\n</记忆浮现>`
+    );
+  }
+  if (!blocks.length) return { message: userPortion, injectedCount: 0 };
+  const message = blocks.join('\n') + '\n\n' + userPortion;
+  return { message, injectedCount: fx.items.length };
 }
