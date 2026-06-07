@@ -625,7 +625,7 @@ const lastWorldWakeAt = new Map();             // eventKey -> 上次触发时间
 const WORLD_PHONE_RATE_MS = 10 * 60 * 1000;    // WORLD_MESSAGE phone：自动唤醒 10 分钟最多 1 条
 let lastWorldPhoneAt = 0;                       // 上次 world phone 消息时间戳(ms)
 
-function buildWorldWakePrompt(event, s, pendingContext = null, user = {}) {
+function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHintLine = '') {
   const opts = event.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
   // pending_wake 续集：在完整模板的原因后加一段上下文，其余（时间/位置/天气/完整状态/选项）照常，
   // 让澄看到此刻的完整状态重新判断，而不是只收一句补充说明（补充2）。
@@ -643,7 +643,7 @@ function buildWorldWakePrompt(event, s, pendingContext = null, user = {}) {
 
 小茉莉此刻：${u.presence || '在家'}
 她在：${u.location || '家 · 客厅'}
-她正在：${u.activity || '休息'}${noteLine}
+她正在：${u.activity || '休息'}${noteLine}${todoHintLine ? `\n${todoHintLine}` : ''}
 
 你的状态：
 体力 ${s.energy}，饱腹 ${s.satiety}，清洁 ${s.cleanliness}，健康 ${s.health}，
@@ -688,6 +688,9 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
     if (data && data[0]) userStatus = { ...userStatus, ...data[0] };
   } catch (e) { console.warn('[WORLD] 读 user_status 失败，用默认:', e.message); }
 
+  // 待办急切度提醒（也在 check-and-set 之前）。line 进 prompt；remindedTodoId 等唤醒真发出后再更新时间。
+  const todoHint = await getTodoHint();
+
   if (!cc.isRunning() || activeTurn || pendingBuffer) {
     console.log('[WORLD] CC 忙或未运行，唤醒跳过');
     return { fired: false, reason: 'cc_busy' };
@@ -704,7 +707,7 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   const eventForTurn = (typeof event.optionsFor === 'function')
     ? { ...event, options: event.optionsFor(status) }
     : event;
-  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus);
+  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus, todoHint.line);
   activeTurn = {
     ws: null, conversationId: null, silent: true,
     settings: null, tools: [],
@@ -716,6 +719,14 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   try {
     cc.send(prompt);
     lastWorldWakeAt.set(event.key, Date.now());
+    // 这次明确显示了某条 urgent 待办标题 → 标记它今天已提醒（同一条一天最多明确一次）
+    if (todoHint.remindedTodoId) {
+      supabase.from('phone_todos_cheng')
+        .update({ last_explicit_reminded_at: new Date().toISOString() })
+        .eq('id', todoHint.remindedTodoId)
+        .then(() => {}, e => console.warn('[WORLD] 更新待办提醒时间失败:', e.message));
+      console.log(`[WORLD] 明确提醒了 urgent 待办 ${todoHint.remindedTodoId}`);
+    }
     console.log(`[WORLD] 已发唤醒包：${event.reason}${pendingContext ? '（pending续集）' : force ? '（手动测试）' : ''}`);
     return { fired: true };
   } catch (e) {
@@ -856,7 +867,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     const innerThought = (clean || '')
       .replace(/\[WORLD_CHOICE:\s*\d+\s*\][\s\S]*?\[\/WORLD_CHOICE\]/gi, '')
       .replace(/\[WORLD_MESSAGE:(?:phone|face)\][\s\S]*?\[\/WORLD_MESSAGE\]/gi, '') // 别把消息当小心思
-      .replace(/\[TODO\][\s\S]*?\[\/TODO\]/gi, '')                                 // 别把待办当小心思
+      .replace(/\[TODO(?::-?[\d.]+)?\][\s\S]*?\[\/TODO\]/gi, '')                     // 别把待办当小心思（含 [TODO:0.8]/[TODO:-1]）
       .trim();
     if (innerThought) {
       try {
@@ -909,19 +920,25 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
   // 9.5 步：[TODO]…[/TODO] → 写 phone_todos_cheng（source=claude）。支持多条；空跳过；
   // 简单去重（最近 open 待办里有同 title 就不重复插）；失败只 warn，不连累 WORLD_CHOICE 结算。
   try {
-    const todoRe = /\[TODO\]([\s\S]*?)\[\/TODO\]/gi;
+    // [TODO]…[/TODO] 默认 urgency=0.5；[TODO:0.8]…[/TODO] 按数字（钳 0-1）。
+    const todoRe = /\[TODO(?::(-?[\d.]+))?\]([\s\S]*?)\[\/TODO\]/gi;
     let tm;
     const seenThisTurn = new Set();
     while ((tm = todoRe.exec(clean || '')) !== null) {
-      const title = (tm[1] || '').trim();
+      const title = (tm[2] || '').trim();
       if (!title || seenThisTurn.has(title)) continue;
       seenThisTurn.add(title);
+      let urgency = 0.5;
+      if (tm[1] != null && tm[1] !== '') {
+        const u = parseFloat(tm[1]);
+        if (Number.isFinite(u)) urgency = Math.max(0, Math.min(1, u));
+      }
       try {
         const { data: dup } = await supabase
           .from('phone_todos_cheng').select('id').eq('status', 'open').eq('title', title).limit(1);
         if (dup && dup.length) { console.log(`[WORLD] TODO 已存在，跳过: ${title.slice(0, 30)}`); continue; }
-        await supabase.from('phone_todos_cheng').insert({ title, status: 'open', source: 'claude' });
-        console.log(`[WORLD] 澄记了待办: ${title.slice(0, 40)}`);
+        await supabase.from('phone_todos_cheng').insert({ title, status: 'open', source: 'claude', urgency });
+        console.log(`[WORLD] 澄记了待办(urgency=${urgency}): ${title.slice(0, 40)}`);
       } catch (e) { console.warn('[WORLD] TODO 写入失败（不连累主流程）:', e.message); }
     }
   } catch (e) { console.warn('[WORLD] TODO 处理异常:', e.message); }
@@ -1010,6 +1027,41 @@ async function getCurrentChannel() {
   } catch (e) {
     console.warn('[CHANNEL] 读位置失败，默认 phone:', e.message);
     return 'phone';
+  }
+}
+
+// 待办 urgency 提醒规则（最小版）：世界唤醒包只轻量提示手机有没有待办，不塞全文。
+// 返回 { line, remindedTodoId }。line 进 prompt；remindedTodoId 非空表示这次"明确显示了标题"，
+// 唤醒真发出后要把那条的 last_explicit_reminded_at 更新为 now()（同一条 urgent 一天最多明确一次）。
+const TODO_URGENT_THRESHOLD = 0.8;
+const TODO_EXPLICIT_CHANCE = 0.25;
+function plus8DateStr(ts) {
+  if (!ts) return '';
+  const ms = ts instanceof Date ? ts.getTime() : (typeof ts === 'number' ? ts : new Date(ts).getTime());
+  return new Date(ms + 8 * 3600000).toISOString().slice(0, 10); // 东八区 YYYY-MM-DD
+}
+async function getTodoHint() {
+  try {
+    const { data, error } = await supabase
+      .from('phone_todos_cheng')
+      .select('id, title, urgency, last_explicit_reminded_at')
+      .eq('status', 'open');
+    if (error) throw error;
+    const todos = data || [];
+    if (!todos.length) return { line: '', remindedTodoId: null };
+    const urgent = todos.filter(t => Number(t.urgency) >= TODO_URGENT_THRESHOLD);
+    if (!urgent.length) return { line: '您的手机有待办', remindedTodoId: null };
+    // 有 urgent：当天没明确显示过标题的 urgent + 25% 概率 → 这次明确显示一条标题
+    const today = plus8DateStr(Date.now());
+    const fresh = urgent.filter(t => plus8DateStr(t.last_explicit_reminded_at) !== today);
+    if (fresh.length && Math.random() < TODO_EXPLICIT_CHANCE) {
+      const pick = fresh[Math.floor(Math.random() * fresh.length)];
+      return { line: `小手机里有一条较急待办：${pick.title}。`, remindedTodoId: pick.id };
+    }
+    return { line: '您的手机有待办 Urgent', remindedTodoId: null };
+  } catch (e) {
+    console.warn('[WORLD] 读待办提示失败:', e.message);
+    return { line: '', remindedTodoId: null };
   }
 }
 
