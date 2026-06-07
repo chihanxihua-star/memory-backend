@@ -27,6 +27,7 @@ import {
 import { DiceDaemon } from './dice.js';
 import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WORLD_EVENTS } from './world-tick.js';
 import { PendingWakeDaemon } from './world-pending.js';
+import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } from './world-actions.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -694,12 +695,16 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
       return { fired: false, reason: 'cooldown' };
     }
   }
-  const prompt = buildWorldWakePrompt(event, status, pendingContext, userStatus);
+  // 第8步：选项按澄当前 location 生成（optionsFor）；存进 worldEvent，turn_done 用解析后的同一份。
+  const eventForTurn = (typeof event.optionsFor === 'function')
+    ? { ...event, options: event.optionsFor(status) }
+    : event;
+  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus);
   activeTurn = {
     ws: null, conversationId: null, silent: true,
     settings: null, tools: [],
     worldWake: true,
-    worldEvent: event,       // turn_done 要用它查 options/effects
+    worldEvent: eventForTurn, // turn_done 要用它查 options/effects（已按地点解析）
     userStatus,              // WORLD_MESSAGE face 判同地点要用
     worldForce: force,       // 手动测试：WORLD_MESSAGE phone 限频可绕过
   };
@@ -750,7 +755,11 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     console.warn(`[WORLD] 选择解析失败，默认选「${option.label}」。原文: ${(clean || '').slice(0, 100)}`);
   }
 
-  // 读-改-写：叠加 effects。普通状态 0-100 钳位；wallet_balance 只做下限 0、不封顶。
+  // 第8步：选项绑 action_id 时，effects/移动从 ACTIONS 取（单一真源）；否则用 option.effects（如「先忍」=空）。
+  const action = option.action_id ? WORLD_ACTIONS[option.action_id] : null;
+  const effects = action ? (action.effects || {}) : (option.effects || {});
+
+  // 读-改-写：叠加 effects（普通项 0-100 钳位、wallet 只封底 0）+ action 的 target_location/activity。
   let updatedStatus = null;
   try {
     const { data: rows, error } = await supabase
@@ -759,12 +768,14 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     const row = rows && rows[0];
     if (row) {
       const patch = { updated_at: new Date().toISOString() };
-      for (const [k, delta] of Object.entries(option.effects || {})) {
+      for (const [k, delta] of Object.entries(effects)) {
         const cur = Number(row[k]) || 0;
         patch[k] = k === 'wallet_balance'
           ? Math.max(0, cur + delta)
           : Math.max(0, Math.min(100, cur + delta));
       }
+      if (action?.target_location) patch.location = action.target_location;
+      if (action?.target_activity) patch.activity = action.target_activity;
       const { data: up, error: e2 } = await supabase
         .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
       if (e2) throw e2;
@@ -801,6 +812,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
           status_summary: updatedStatus
             ? { satiety: updatedStatus.satiety, energy: updatedStatus.energy, mood: updatedStatus.mood }
             : null,
+          ...(option.pending.payload_extra || {}), // 第8步：如 go_kitchen 的 from_action
         },
         attempts: 0,
       }).select('id').single();
@@ -817,14 +829,14 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → 世界唤醒解析失败，默认选择：${option.label}`,
-        detail: { choice: option.id, reason: '', effects: option.effects || {}, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
+        detail: { choice: option.id, reason: '', effects, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
         source: 'system_error',
       });
     } else {
       const { data: tl, error: te } = await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → ${option.label}`,
-        detail: { choice: option.id, reason, effects: option.effects || {}, thinking: thinking || null, pending_wake_id: pendingWakeId },
+        detail: { choice: option.id, reason, effects, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
         source: 'claude',
       }).select('id').single();
       if (te) throw te;
@@ -1133,7 +1145,8 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
   let chatChannel = 'face';
   if (!turn.silent) chatChannel = await getCurrentChannel();
 
-  if (turn.conversationId && clean && !turn.silent) {
+  const hasThinkingOnly = !clean && !!(thinking || '').trim();
+  if (turn.conversationId && (clean || hasThinkingOnly) && !turn.silent) {
     try {
       // token_input 存的是"等效 input"——按缓存类型加权后的费率等价 token 数：
       //   input_tokens         × 1.0   （未缓存，全价）
@@ -1159,7 +1172,7 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
           cache_read: usage.cache_read_input_tokens || 0,
           cache_creation: usage.cache_creation_input_tokens || 0,
         },
-        event: chatChannel === 'phone' ? 'phone_chat' : null, // 异地普通回复标手机聊天（不加 "-  "）
+        event: hasThinkingOnly ? 'empty_reply' : (chatChannel === 'phone' ? 'phone_chat' : null), // empty_reply 保留思考链；异地普通回复标手机聊天（不加 "-  "）
       }).select('id').single();
       turn.messageId = inserted?.id || null;
       broadcastChatStatus('已写入数据库', turn.messageId ? `assistant ${turn.messageId}` : 'assistant 消息已保存', {
@@ -2488,6 +2501,34 @@ app.post('/api/world/pending/test-hungry', async (req, res) => {
     if (error) throw error;
     res.json({ ok: true, id: pw.id, scheduled_at: pw.scheduled_at });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 第8步：当前澄 location 下可执行的行为列表
+app.get('/api/world/actions', async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from('character_status_cheng').select('location').eq('name', '澄').limit(1);
+    if (error) throw error;
+    const location = rows?.[0]?.location || '';
+    res.json({ location, actions: getAvailableActions(location) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 第8步：执行一个行为（澄），返回更新后的状态。位置不允许 → 400，不更新。
+app.post('/api/world/action', async (req, res) => {
+  const actionId = req.body?.action_id;
+  if (!actionId) return res.status(400).json({ error: '缺少 action_id' });
+  try {
+    const status = await executeWorldAction(actionId, { actor: 'cheng', source: 'manual' });
+    res.json({ ok: true, status });
+  } catch (e) {
+    if (e.code === 'not_allowed' || e.code === 'unknown_action') {
+      return res.status(400).json({ error: e.message, code: e.code });
+    }
     res.status(500).json({ error: e.message });
   }
 });

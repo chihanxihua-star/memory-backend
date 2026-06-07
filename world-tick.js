@@ -19,22 +19,45 @@ export const WORLD_EVENTS = {
   hungry: {
     trigger: (status) => status.satiety < 30,
     reason: '饱腹过低（饿了）',
-    options: [
-      { id: 1, label: '自己做饭', effects: { satiety: 30, energy: -8 } },
-      { id: 2, label: '吃零食',   effects: { satiety: 15, mood: 3 } },
-      { id: 3, label: '点外卖',   effects: { satiety: 25, wallet_balance: -30 } },
-      {
-        id: 4,
-        label: '先忍 10 分钟，等会儿再看',
-        effects: {},
-        // 第 5 步：选这个不是"什么都不做"，而是排一条 pending_wake，到点再唤醒澄重新判断。
-        pending: {
-          wake_type: 'hungry',
-          delay_world_minutes: 10,
-          reason: '刚才选择先忍着，10分钟后再判断要不要吃东西',
+    // 第8步：选项按澄当前 location 生成，绑定 action_id（effects/移动由 ACTIONS 在 index.js 结算）。
+    // 「先忍」走 pending（第5步逻辑不变）。「去厨房看看」只移动、不吃，且排一条3分钟短 pending 回来重判。
+    optionsFor: (status) => {
+      const loc = status.location || '';
+      const wait10 = {
+        id: 4, label: '先忍 10 分钟，等会儿再看', effects: {},
+        pending: { wake_type: 'hungry', delay_world_minutes: 10, reason: '刚才选择先忍着，10分钟后再判断要不要吃东西' },
+      };
+      if (loc.startsWith('公司')) {
+        return [
+          { id: 1, label: '吃零食', action_id: 'eat_snack' },
+          { id: 2, label: '点外卖', action_id: 'order_takeout' },
+          { id: 3, label: '去茶水间找点吃的', action_id: 'go_tea_room' },
+          wait10,
+        ];
+      }
+      if (loc === '家 · 厨房') {
+        return [
+          { id: 1, label: '自己做饭', action_id: 'cook_simple_meal' },
+          { id: 2, label: '吃零食', action_id: 'eat_snack' },
+          { id: 3, label: '点外卖', action_id: 'order_takeout' },
+          wait10,
+        ];
+      }
+      // 在家但不在厨房（卧室/客厅/浴室等）：去厨房看看（只移动）→ 3分钟后回来重判（补充1）
+      return [
+        {
+          id: 1, label: '去厨房看看', action_id: 'go_kitchen',
+          pending: {
+            wake_type: 'hungry', delay_world_minutes: 3,
+            reason: '刚才饿了，先去了厨房，现在到厨房后重新判断要不要吃东西',
+            payload_extra: { from_action: 'go_kitchen' },
+          },
         },
-      },
-    ],
+        { id: 2, label: '吃零食', action_id: 'eat_snack' },
+        { id: 3, label: '点外卖', action_id: 'order_takeout' },
+        wait10,
+      ];
+    },
   },
 };
 
