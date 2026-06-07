@@ -28,6 +28,7 @@ import { DiceDaemon } from './dice.js';
 import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WORLD_EVENTS } from './world-tick.js';
 import { PendingWakeDaemon } from './world-pending.js';
 import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } from './world-actions.js';
+import { formatWeather } from './world-env.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -625,7 +626,7 @@ const lastWorldWakeAt = new Map();             // eventKey -> 上次触发时间
 const WORLD_PHONE_RATE_MS = 10 * 60 * 1000;    // WORLD_MESSAGE phone：自动唤醒 10 分钟最多 1 条
 let lastWorldPhoneAt = 0;                       // 上次 world phone 消息时间戳(ms)
 
-function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHintLine = '') {
+function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHintLine = '', envWeather = '') {
   const opts = event.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
   // pending_wake 续集：在完整模板的原因后加一段上下文，其余（时间/位置/天气/完整状态/选项）照常，
   // 让澄看到此刻的完整状态重新判断，而不是只收一句补充说明（补充2）。
@@ -639,7 +640,7 @@ function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHi
 时间：${s.world_time}
 位置：${s.location}
 你正在：${s.activity || '工作'}
-天气：${s.weather}
+天气：${envWeather || s.weather}
 
 小茉莉此刻：${u.presence || '在家'}
 她在：${u.location || '家 · 客厅'}
@@ -691,6 +692,15 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   // 待办急切度提醒（也在 check-and-set 之前）。line 进 prompt；remindedTodoId 等唤醒真发出后再更新时间。
   const todoHint = await getTodoHint();
 
+  // 10A：天气来自 world_environment_cheng（现实同步），不暴露城市名。读不到回退 character_status.weather。
+  let envWeather = '';
+  try {
+    const { data: envRow } = await supabase
+      .from('world_environment_cheng')
+      .select('weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
+    if (envRow && envRow[0]) envWeather = formatWeather(envRow[0]);
+  } catch (e) { console.warn('[WORLD] 读环境天气失败:', e.message); }
+
   if (!cc.isRunning() || activeTurn || pendingBuffer) {
     console.log('[WORLD] CC 忙或未运行，唤醒跳过');
     return { fired: false, reason: 'cc_busy' };
@@ -707,7 +717,7 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   const eventForTurn = (typeof event.optionsFor === 'function')
     ? { ...event, options: event.optionsFor(status) }
     : event;
-  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus, todoHint.line);
+  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus, todoHint.line, envWeather);
   activeTurn = {
     ws: null, conversationId: null, silent: true,
     settings: null, tools: [],
