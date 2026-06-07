@@ -217,6 +217,28 @@ async function getUserStatusLine() {
   }
 }
 
+// ─────── 补充：读澄自己的当前状态 → 一行，注入 <此刻>（让聊天里的澄知道自己几点、在哪、在做啥）───────
+// 不然澄只知道小茉莉在哪、不知道自己已经下班到家，会靠旧上下文猜（比如以为还在加班）。只读不写。
+async function getChengStatusLine() {
+  try {
+    const { data, error } = await supabase
+      .from('character_status_cheng')
+      .select('world_time, location, activity')
+      .eq('name', '澄')
+      .limit(1);
+    if (error) throw error;
+    const c = data && data[0];
+    if (!c) return '';
+    const wt = c.world_time ? `现在 ${c.world_time}，` : '';
+    const loc = c.location || '家 · 客厅';
+    const act = c.activity || '休息';
+    return `${wt}你在 ${loc}，${act}`;
+  } catch (e) {
+    console.warn('[surfacing] 读 character_status 失败，跳过澄自身状态注入:', e.message);
+    return '';
+  }
+}
+
 // ─────── tmux 交互模式入口：返回可折进消息的浮现文本，不写 CLAUDE.md ───────
 // 返回 { statusLine, text, items }：
 //   statusLine = user 当前状态一行（总是带，绕过冷却）→ inject 端包进独立的 <此刻> 块
@@ -225,7 +247,9 @@ async function getUserStatusLine() {
 export async function surfaceForInject(userText) {
   if (!userText || typeof userText !== 'string') return { statusLine: '', text: '', items: [] };
 
-  const statusLine = await getUserStatusLine(); // 总是带上，绕过冷却
+  // 总是带上（绕过冷却）：澄自己的状态在前、小茉莉的状态在后，都进 <此刻>，实时反映世界。
+  const [chengLine, userLine] = await Promise.all([getChengStatusLine(), getUserStatusLine()]);
+  const statusLine = [chengLine, userLine].filter(Boolean).join('\n');
 
   turnsSinceLast += 1;
   if (turnsSinceLast < COOLDOWN) return { statusLine, text: '', items: [] };
