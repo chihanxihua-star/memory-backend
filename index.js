@@ -29,9 +29,9 @@ import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WOR
 import { PendingWakeDaemon } from './world-pending.js';
 import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } from './world-actions.js';
 import { formatWeather } from './world-env.js';
-import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent } from './world-random-events.js';
+import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
-import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime } from './world-workday.js';
+import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd } from './world-workday.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -539,12 +539,13 @@ const worldTickDaemon = new WorldTickDaemon({
   },
   // 10B：hungry 没命中才轮随机事件。读环境天气供「下班下雨」判定；全局限频/概率在 detectRandomEvent 里。
   detectRandom: async (status) => {
-    let envWeatherText = '';
+    let envWeatherText = '', weekday = '';
     try {
-      const { data } = await supabase.from('world_environment_cheng').select('weather_text').eq('name', 'default').limit(1);
+      const { data } = await supabase.from('world_environment_cheng').select('weather_text, weekday').eq('name', 'default').limit(1);
       envWeatherText = data?.[0]?.weather_text || '';
-    } catch { /* 读不到当无雨 */ }
-    return detectRandomEvent(status, { envWeatherText, nowMs: Date.now() });
+      weekday = data?.[0]?.weekday || '';
+    } catch { /* 读不到当无雨/非工作日 */ }
+    return detectRandomEvent(status, { envWeatherText, weekday, nowMs: Date.now() });
   },
   onMidnight: () => { onMidnightCross(); clearWorkMarks(); },
   bumpTick: () => bumpRandomTick(),
@@ -663,8 +664,26 @@ function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHi
   // 措辞用澄的口吻（"她在/她正在/她说"），不用生硬的 user/presence 标签。
   const u = user || {};
   const noteLine = u.custom_note ? `\n她说：${u.custom_note}` : '';
+  // 11B：NPC 在场提示；WORLD_MESSAGE 引导只在适合联系小茉莉的事件出现（普通工作事件不主动提醒，
+  // 澄想发后端照样解析）；含「约见」选项的事件给明确的约见出口。
+  const npcLine = event.npc ? `\n在场：${event.npc}` : '';
+  const hasMeet = (event.options || []).some(o => o.meet_request);
+  const wmBlock = hasMeet
+    ? `\n如果你想约小茉莉午休见一面，可以用 WORLD_MESSAGE 发出邀请；不想约就不写：
+[WORLD_MESSAGE:phone]消息内容[/WORLD_MESSAGE]
+（不用自己写「［手机消息］」之类的前缀，只写这一句话本身，后端会自动标记。）
+`
+    : event.wmHint === false
+      ? ''
+      : `\n如果你想对小茉莉说一句话，可以额外输出：
+[WORLD_MESSAGE:phone]消息内容[/WORLD_MESSAGE]
+如果你和小茉莉处于同一地点、可以面对面说话，也可以输出：
+[WORLD_MESSAGE:face]消息内容[/WORLD_MESSAGE]
+不想说就不写，不要强行凑。
+（不用自己写「［手机消息］」之类的前缀，只写这一句话本身，后端会自动标记。）
+`;
   return `【世界唤醒】
-原因：${event.reason}${pendingLine}
+原因：${event.reason}${npcLine}${pendingLine}
 时间：${s.world_time}${envDateWeek ? `\n日期：${envDateWeek}` : ''}
 位置：${s.location}
 你正在：${s.activity || '工作'}
@@ -683,14 +702,7 @@ ${opts}
 
 根据当前状态和你的偏好自己决定。
 用这个格式回复：[WORLD_CHOICE:选项编号]你的理由[/WORLD_CHOICE]
-
-如果你想对小茉莉说一句话，可以额外输出：
-[WORLD_MESSAGE:phone]消息内容[/WORLD_MESSAGE]
-如果你和小茉莉处于同一地点、可以面对面说话，也可以输出：
-[WORLD_MESSAGE:face]消息内容[/WORLD_MESSAGE]
-不想说就不写，不要强行凑。
-（不用自己写「［手机消息］」之类的前缀，只写这一句话本身，后端会自动标记。）
-
+${wmBlock}
 如果你想到一件稍后要做、还没完成的事，可以额外输出：
 [TODO]待办内容[/TODO]
 例如：[TODO]下班前问小茉莉有没有吃饭[/TODO]
@@ -784,6 +796,19 @@ async function firePendingWake(row) {
   if (row.wake_type === 'overtime_end') {
     try { await endOvertime(); console.log('[WORK] 加班结束 pending 到点，已结算'); }
     catch (e) { console.warn('[WORK] 加班结束结算失败:', e.message); }
+    return { fired: true, system: true };
+  }
+  // 11B：午休约见超时 — 小茉莉没回应 → 写一条 timeline，澄自己继续。不 engage、不移动 user、不改 user_status。
+  if (row.wake_type === 'meet_request') {
+    try {
+      const { data: rows } = await supabase.from('character_status_cheng').select('world_time, location').eq('name', '澄').limit(1);
+      const st = rows && rows[0];
+      await supabase.from('daily_timeline_cheng').insert({
+        world_time: st?.world_time || '', location: st?.location || null,
+        action: '午休约见超时', detail: { reason: '小茉莉可能没看到，澄自己去午休/继续当前行为' }, source: 'system',
+      });
+      console.log('[WORK] meet_request 超时，已自处理');
+    } catch (e) { console.warn('[WORK] meet_request 超时处理失败:', e.message); }
     return { fired: true, system: true };
   }
   const def = WORLD_EVENTS[row.wake_type];
@@ -897,20 +922,40 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → 世界唤醒解析失败，默认选择：${option.label}`,
-        detail: { choice: option.id, reason: '', effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
+        detail: { choice: option.id, reason: '', event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
         source: 'system_error',
       });
     } else {
       const { data: tl, error: te } = await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → ${option.label}`,
-        detail: { choice: option.id, reason, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
+        detail: { choice: option.id, reason, event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, item: option.item || null, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
         source: 'claude',
       }).select('id').single();
       if (te) throw te;
       timelineId = tl?.id || null;
     }
   } catch (e) { console.error('[WORLD] 行程表写入失败:', e.message); }
+
+  // 11B：下班前加任务选「加班」→ 进 11A 加班流程（effects 已由本事件结算，这里只挂加班结束 pending）。
+  if (!parseFailed && option.start_overtime) {
+    try { await scheduleOvertimeEnd(); } catch (e) { console.warn('[WORLD] start_overtime 失败:', e.message); }
+  }
+  // 11B：午休约小茉莉见面 → 排 meet_request pending（10-15 世界分钟）。邀请由澄输出的 WORLD_MESSAGE 照常解析；
+  // 不强制移动/改 user_status，超时由 firePendingWake 自处理。
+  if (!parseFailed && option.meet_request) {
+    try {
+      const cfg2 = readWorldConfig();
+      const delayMin = 10 + Math.floor(Math.random() * 6); // 10-15
+      const delaySec = cfg2.fast_test ? delayMin : delayMin * 60;
+      await supabase.from('pending_wake_cheng').insert({
+        wake_type: 'meet_request', reason: '约小茉莉午休见面', status: 'queued',
+        scheduled_at: new Date(Date.now() + delaySec * 1000).toISOString(),
+        payload: { delay_world_minutes: delayMin },
+      });
+      console.log('[WORLD] 排了 meet_request，等小茉莉回应');
+    } catch (e) { console.warn('[WORLD] meet_request 失败:', e.message); }
+  }
 
   // 补充任务：标签外正文 = 澄的「小心思」，单独存 world_inner_thoughts_cheng，不进行程主列表。
   // clean 已去 [MEMORY:]/[BARK:]，再去掉 [WORLD_CHOICE] 块，剩下 trim 后非空即小心思。
@@ -2682,9 +2727,9 @@ app.post('/api/world/random', async (req, res) => {
   }
 });
 
-// 10B：随机事件列表（给 DevPanel 出按钮）
+// 10B/11B：随机事件 + 工作事件列表（给 DevPanel 出按钮）
 app.get('/api/world/random/list', (req, res) => {
-  res.json(Object.values(RANDOM_EVENTS).map(e => ({ id: e.id, label: e.label })));
+  res.json(listEvents());
 });
 
 // 紧急修正：手动把 world_time 同步到当前 UTC+8。只动 world_time，不 engage 澄/不触发事件/不发消息。

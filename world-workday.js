@@ -52,13 +52,9 @@ const goLunch     = (row) => setState(row, { location: '公司 · 休息室', ac
 const goAfternoon = (row) => setState(row, { location: '公司 · 工位', activity: '工作' }, '下午上班', { reason: '午休结束，下午上班' });
 const goHomeNormal= (row) => setState(row, { location: '家 · 客厅', activity: '下班回家后休息' }, '下班回家', { overtime: false });
 
-// 加班开始：effects_hint 走 resolveEffects；挂一条 0.5-2h（30-120 世界分钟）的加班结束 pending。
-async function startOvertime(row) {
-  const ctx = buildEffectContext(row, { eventId: 'overtime', eventType: 'work' });
-  const { resolved } = computeDeltas(row, { effects_hint: OVERTIME_HINT }, ctx);
-  const patch = { location: '公司 · 工位', activity: '加班', ...applyDeltas(row, resolved) };
-  const st = await setState(row, patch, '临时加班', { overtime: true, effects_hint: OVERTIME_HINT, effects_resolved: resolved });
-
+// 挂一条 0.5-2h（30-120 世界分钟）的加班结束 pending。导出给 11B「下班前加任务→加班」复用
+// （那条选项的状态变化由事件自己的 effects_hint 结算，这里只负责排加班结束触发器）。
+export async function scheduleOvertimeEnd() {
   const delayMin = 30 + Math.floor(Math.random() * 91); // 30-120 世界分钟
   const cfg = readWorldConfig();
   const delaySec = cfg.fast_test ? delayMin : delayMin * 60; // fast_test：世界分钟=现实秒
@@ -70,6 +66,15 @@ async function startOvertime(row) {
     });
     console.log(`[WORK] 加班开始，${delayMin} 世界分钟后结束`);
   } catch (e) { console.warn('[WORK] 加班结束 pending 失败:', e.message); }
+}
+
+// 加班开始（11A 下班判断走这条）：effects_hint 走 resolveEffects + 挂加班结束 pending。
+async function startOvertime(row) {
+  const ctx = buildEffectContext(row, { eventId: 'overtime', eventType: 'work' });
+  const { resolved } = computeDeltas(row, { effects_hint: OVERTIME_HINT }, ctx);
+  const patch = { location: '公司 · 工位', activity: '加班', ...applyDeltas(row, resolved) };
+  const st = await setState(row, patch, '临时加班', { overtime: true, effects_hint: OVERTIME_HINT, effects_resolved: resolved });
+  await scheduleOvertimeEnd();
   return st;
 }
 

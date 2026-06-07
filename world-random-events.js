@@ -1,3 +1,4 @@
+import { WORK_EVENTS } from './world-work-events.js';
 // world-random-events.js — 10B：随机事件引擎（最小版）。
 // tick 后（pending_wake / hungry 都没命中且 CC 空闲时）按概率触发一个生活随机事件。
 // 系统只负责触发+给选项+结算；要不要联系小茉莉由澄自己定（prompt 不写"你应该联系"）。
@@ -71,15 +72,23 @@ export const RANDOM_EVENTS = {
   },
 };
 
+// 11B：工作事件并入同一事件池（同一套唤醒系统，不另开）。
+const ALL_EVENTS = { ...RANDOM_EVENTS, ...WORK_EVENTS };
+
 // ── 内存状态 ──────────────────────────────────────────
 const triggeredToday = new Set();   // once_per_day 标记（世界跨午夜清空）
 const lastTriggeredTick = {};       // eventId → 触发时的 tickCount（cooldown 用）
 let tickCount = 0;
 let lastRandomRealMs = 0;           // 上次普通随机事件触发的现实时间（全局限频）
+let todayWorkNpcEventSeen = false;  // 11B：当天是否已出现过 NPC(老板/同事)工作事件（跨午夜清）
 const GLOBAL_RATE_MS = 60 * 60 * 1000; // 每现实小时最多 1 次普通随机事件
 
 export function bumpRandomTick() { tickCount += 1; }
-export function onMidnightCross() { triggeredToday.clear(); console.log('[RANDOM] 跨午夜，清空 once_per_day 标记'); }
+export function onMidnightCross() {
+  triggeredToday.clear();
+  todayWorkNpcEventSeen = false;
+  console.log('[RANDOM] 跨午夜，清空 once_per_day / NPC 过场标记');
+}
 
 function toMin(hhmm) { const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || '').trim()); return m ? parseInt(m[1], 10) * 60 + parseInt(m[2], 10) : null; }
 function inTimeRange(worldTime, [a, b]) {
@@ -87,43 +96,72 @@ function inTimeRange(worldTime, [a, b]) {
   if (t == null || lo == null || hi == null) return true;
   return t >= lo && t <= hi;
 }
-function eligible(ev, status, envWeatherText) {
+// 单时段 time_range 或多时段 time_ranges（任一命中）。都没写=不限时。
+function timeOk(ev, worldTime) {
+  if (Array.isArray(ev.time_ranges)) return ev.time_ranges.some(r => inTimeRange(worldTime, r));
+  if (ev.time_range) return inTimeRange(worldTime, ev.time_range);
+  return true;
+}
+function eligible(ev, status, envWeatherText, weekday) {
   const loc = status.location || '';
   if (ev.locations && !ev.locations.includes(loc)) return false;
-  if (ev.time_range && !inTimeRange(status.world_time, ev.time_range)) return false;
+  if (!timeOk(ev, status.world_time)) return false;
   if (ev.once_per_day && triggeredToday.has(ev.id)) return false;
   if (ev.cooldown_world_minutes && lastTriggeredTick[ev.id] != null) {
     const cdTicks = Math.ceil(ev.cooldown_world_minutes / 60); // 每 tick = 1 世界小时 = 60 世界分钟
     if (tickCount - lastTriggeredTick[ev.id] < cdTicks) return false;
   }
   if (ev.weather_required && !String(envWeatherText || '').includes(ev.weather_required)) return false;
+  // 11B 工作事件额外门槛：工作日 + 活动白名单。
+  if (ev.workday_only && !WEEKDAYS_WORK.includes(String(weekday || '').trim())) return false;
+  if (ev.activity_in && !ev.activity_in.includes(status.activity || '')) return false;
   return true;
 }
+const WEEKDAYS_WORK = ['星期一', '星期二', '星期三', '星期四', '星期五'];
 
-// 检测一个随机事件（不标记，等真发出后再 markRandomEventFired）。返回 {key,isRandom,reason,options,...} 或 null。
-// 全局限频：上次触发距今不足 1 现实小时 → 不出（保护 Max 用量；fast_test 下也按现实时间限）。
-export function detectRandomEvent(status, { envWeatherText = '', nowMs = Date.now() } = {}) {
-  if (nowMs - lastRandomRealMs < GLOBAL_RATE_MS) return null;
-  const cands = Object.values(RANDOM_EVENTS).filter(ev => eligible(ev, status, envWeatherText));
-  if (!cands.length) return null;
-  const hits = cands.filter(ev => Math.random() < ev.probability);
-  if (!hits.length) return null;
-  const ev = hits[Math.floor(Math.random() * hits.length)];
-  return { key: ev.id, isRandom: true, reason: ev.reason, options: ev.options, label: ev.label };
+// 把事件对象包成 turn 用的形态（解析 npcPool → npc）。
+function pack(ev) {
+  const npc = ev.npc || (Array.isArray(ev.npcPool) && ev.npcPool.length ? ev.npcPool[Math.floor(Math.random() * ev.npcPool.length)] : null);
+  return { key: ev.id, isRandom: true, reason: ev.reason, options: ev.options, label: ev.label, event_type: ev.event_type || 'random', npc, wmHint: ev.wmHint };
 }
 
-// 真发出后标记（once_per_day / cooldown / 全局限频）。手动 force 不调这个（测试不消耗配额）。
+// 检测一个随机/工作事件（不标记，等真发出后再 markRandomEventFired）。
+// 全局限频：上次触发距今不足 1 现实小时 → 不出（保护 Max 用量；fast_test 下也按现实时间限）。
+// NPC 过场：当天还没出现过 NPC 工作事件 + 13:00-16:00 → npc_boost 事件概率提权（倾向每天一次公司社交，但不硬拉）。
+export function detectRandomEvent(status, { envWeatherText = '', weekday = '', nowMs = Date.now() } = {}) {
+  if (nowMs - lastRandomRealMs < GLOBAL_RATE_MS) return null;
+  const cands = Object.values(ALL_EVENTS).filter(ev => eligible(ev, status, envWeatherText, weekday));
+  if (!cands.length) return null;
+  const t = toMin(status.world_time);
+  const boostActive = !todayWorkNpcEventSeen && t != null && t >= 780 && t < 960; // 13:00-16:00
+  const probOf = (ev) => (boostActive && ev.npc_boost) ? Math.min(1, (ev.probability || 0) * 2) : (ev.probability || 0);
+  const hits = cands.filter(ev => Math.random() < probOf(ev));
+  if (!hits.length) return null;
+  const ev = hits[Math.floor(Math.random() * hits.length)];
+  return pack(ev);
+}
+
+// 真发出后标记（once_per_day / cooldown / 全局限频 / NPC 过场）。手动 force 不调这个（测试不消耗配额）。
 export function markRandomEventFired(eventId, nowMs = Date.now()) {
-  const ev = RANDOM_EVENTS[eventId];
+  const ev = ALL_EVENTS[eventId];
   if (!ev) return;
   if (ev.once_per_day) triggeredToday.add(eventId);
   lastTriggeredTick[eventId] = tickCount;
   lastRandomRealMs = nowMs;
+  if (ev.npc || ev.npcPool) todayWorkNpcEventSeen = true;
 }
 
 // 手动强制触发：拿到事件对象（绕过概率/once_per_day/限频），CC 忙时仍由 triggerWorldWake 挡。
 export function forceRandomEvent(eventId) {
-  const ev = RANDOM_EVENTS[eventId];
+  const ev = ALL_EVENTS[eventId];
   if (!ev) return null;
-  return { key: ev.id, isRandom: true, reason: ev.reason, options: ev.options, label: ev.label };
+  return pack(ev);
+}
+
+// 给 DevPanel 出按钮：随机事件 + 工作事件分组。
+export function listEvents() {
+  return {
+    random: Object.values(RANDOM_EVENTS).map(e => ({ id: e.id, label: e.label })),
+    work: Object.values(WORK_EVENTS).map(e => ({ id: e.id, label: e.label })),
+  };
 }
