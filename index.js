@@ -662,8 +662,13 @@ ${opts}
 不想说就不写，不要强行凑。
 （不用自己写「［手机消息］」之类的前缀，只写这一句话本身，后端会自动标记。）
 
+如果你想到一件稍后要做、还没完成的事，可以额外输出：
+[TODO]待办内容[/TODO]
+例如：[TODO]下班前问小茉莉有没有吃饭[/TODO]
+只有真的需要记下来以后处理的事才写，不要每次强行凑。
+
 如果这个瞬间值得记住，可以额外写一条 [MEMORY:diary]...[/MEMORY]。
-除了 [WORLD_CHOICE]、可选的 [WORLD_MESSAGE]、可选的 [MEMORY] 标签外，不要输出其他内容。`;
+除了 [WORLD_CHOICE]、可选的 [WORLD_MESSAGE]、可选的 [TODO]、可选的 [MEMORY] 标签外，不要输出其他内容。`;
 }
 
 // 触发一次世界唤醒。
@@ -851,6 +856,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     const innerThought = (clean || '')
       .replace(/\[WORLD_CHOICE:\s*\d+\s*\][\s\S]*?\[\/WORLD_CHOICE\]/gi, '')
       .replace(/\[WORLD_MESSAGE:(?:phone|face)\][\s\S]*?\[\/WORLD_MESSAGE\]/gi, '') // 别把消息当小心思
+      .replace(/\[TODO\][\s\S]*?\[\/TODO\]/gi, '')                                 // 别把待办当小心思
       .trim();
     if (innerThought) {
       try {
@@ -899,6 +905,26 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       }
     }
   } catch (e) { console.warn('[WORLD] WORLD_MESSAGE 处理异常（不连累主流程）:', e.message); }
+
+  // 9.5 步：[TODO]…[/TODO] → 写 phone_todos_cheng（source=claude）。支持多条；空跳过；
+  // 简单去重（最近 open 待办里有同 title 就不重复插）；失败只 warn，不连累 WORLD_CHOICE 结算。
+  try {
+    const todoRe = /\[TODO\]([\s\S]*?)\[\/TODO\]/gi;
+    let tm;
+    const seenThisTurn = new Set();
+    while ((tm = todoRe.exec(clean || '')) !== null) {
+      const title = (tm[1] || '').trim();
+      if (!title || seenThisTurn.has(title)) continue;
+      seenThisTurn.add(title);
+      try {
+        const { data: dup } = await supabase
+          .from('phone_todos_cheng').select('id').eq('status', 'open').eq('title', title).limit(1);
+        if (dup && dup.length) { console.log(`[WORLD] TODO 已存在，跳过: ${title.slice(0, 30)}`); continue; }
+        await supabase.from('phone_todos_cheng').insert({ title, status: 'open', source: 'claude' });
+        console.log(`[WORLD] 澄记了待办: ${title.slice(0, 40)}`);
+      } catch (e) { console.warn('[WORLD] TODO 写入失败（不连累主流程）:', e.message); }
+    }
+  } catch (e) { console.warn('[WORLD] TODO 处理异常:', e.message); }
 
   console.log(`[WORLD] 澄选了「${option.label}」${reason ? '：' + reason.slice(0, 40) : ''}${parseFailed ? '（解析失败默认）' : ''}`);
 }
