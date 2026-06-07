@@ -13,9 +13,9 @@ export const RANDOM_EVENTS = {
     locations: ['公司 · 工位'], time_range: ['13:00', '16:00'],
     probability: 0.25, cooldown_world_minutes: 180, once_per_day: true,
     options: [
-      { id: 1, label: '去茶水间倒杯咖啡', effects: { energy: 8, focus: 6, stress: 2 }, target_location: '公司 · 茶水间', target_activity: '倒咖啡' },
-      { id: 2, label: '去休息室眯一会儿', effects: { energy: 12, stress: -5, focus: 3 }, target_location: '公司 · 休息室', target_activity: '休息' },
-      { id: 3, label: '硬撑继续工作', effects: { energy: -6, focus: -8, stress: 5 }, target_activity: '工作' },
+      { id: 1, label: '去茶水间倒杯咖啡', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'small' }, { stat: 'focus', direction: 'up', strength: 'small' }, { stat: 'stress', direction: 'up', strength: 'tiny' }], target_location: '公司 · 茶水间', target_activity: '倒咖啡' },
+      { id: 2, label: '去休息室眯一会儿', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'focus', direction: 'up', strength: 'tiny' }], target_location: '公司 · 休息室', target_activity: '休息' },
+      { id: 3, label: '硬撑继续工作', effects_hint: [{ stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'focus', direction: 'down', strength: 'medium' }, { stat: 'stress', direction: 'up', strength: 'small' }], target_activity: '工作' },
     ],
   },
   tea_restock: {
@@ -23,9 +23,9 @@ export const RANDOM_EVENTS = {
     locations: ['公司 · 工位', '公司 · 休息室'], time_range: ['09:00', '18:00'],
     probability: 0.2, cooldown_world_minutes: 240, once_per_day: true,
     options: [
-      { id: 1, label: '去拿杯热饮', effects: { energy: 5, mood: 4, comfort: 3 }, target_location: '公司 · 茶水间', target_activity: '倒水' },
-      { id: 2, label: '顺手抓把零食垫垫', effects: { satiety: 10, mood: 3 }, target_location: '公司 · 茶水间', target_activity: '吃零食' },
-      { id: 3, label: '不去，专心干活', effects: { focus: 2 }, target_activity: '工作' },
+      { id: 1, label: '去拿杯热饮', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }, { stat: 'comfort', direction: 'up', strength: 'tiny' }], target_location: '公司 · 茶水间', target_activity: '倒水' },
+      { id: 2, label: '顺手抓把零食垫垫', effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }], target_location: '公司 · 茶水间', target_activity: '吃零食' },
+      { id: 3, label: '不去，专心干活', effects_hint: [{ stat: 'focus', direction: 'up', strength: 'tiny' }], target_activity: '工作' },
     ],
   },
   rain_offwork: {
@@ -34,9 +34,9 @@ export const RANDOM_EVENTS = {
     weather_required: '雨', // weather_text 含「雨」才自动触发（手动测试绕过）
     probability: 0.6, cooldown_world_minutes: 720, once_per_day: true,
     options: [
-      { id: 1, label: '在休息室等雨小点再走', effects: { stress: 3, energy: -2 }, target_location: '公司 · 休息室', target_activity: '等雨' },
-      { id: 2, label: '冒雨跑回家', effects: { cleanliness: -12, energy: -8, stress: 5 }, target_activity: '冒雨赶路' },
-      { id: 3, label: '打车回家', effects: { wallet_balance: -25, comfort: 6, stress: -3 }, target_activity: '打车回家' },
+      { id: 1, label: '在休息室等雨小点再走', effects_hint: [{ stat: 'stress', direction: 'up', strength: 'tiny' }, { stat: 'energy', direction: 'down', strength: 'tiny' }], target_location: '公司 · 休息室', target_activity: '等雨' },
+      { id: 2, label: '冒雨跑回家', effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'medium' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'stress', direction: 'up', strength: 'small' }], target_activity: '冒雨赶路' },
+      { id: 3, label: '打车回家', effects_hint: [{ stat: 'comfort', direction: 'up', strength: 'small' }, { stat: 'stress', direction: 'down', strength: 'tiny' }], effects: { wallet_balance: -25 }, target_activity: '打车回家' },
     ],
   },
   convenience_newproduct: {
@@ -44,9 +44,9 @@ export const RANDOM_EVENTS = {
     locations: ['外出 · 商场', '外出 · 路上', '家 · 客厅'],
     probability: 0.18, cooldown_world_minutes: 360, once_per_day: true,
     options: [
-      { id: 1, label: '买来尝尝', effects: { wallet_balance: -12, mood: 5, satiety: 8 }, target_activity: '吃东西' },
-      { id: 2, label: '拍给小茉莉看看', effects: { mood: 4 } },
-      { id: 3, label: '算了，省钱', effects: { stress: 1 } },
+      { id: 1, label: '买来尝尝', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'small' }, { stat: 'satiety', direction: 'up', strength: 'small' }], effects: { wallet_balance: -12 }, target_activity: '吃东西' },
+      { id: 2, label: '拍给小茉莉看看', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'small' }] },
+      { id: 3, label: '算了，省钱', effects_hint: [{ stat: 'stress', direction: 'up', strength: 'tiny' }] },
     ],
   },
   boss_perk: {
@@ -54,9 +54,9 @@ export const RANDOM_EVENTS = {
     locations: ['公司 · 工位', '公司 · 休息室'], time_range: ['09:00', '18:00'],
     probability: 0.12, cooldown_world_minutes: 1440, once_per_day: true,
     options: [
-      { id: 1, label: '开心收下', effects: { mood: 8, stress: -4 } },
-      { id: 2, label: '想着带回家给小茉莉', effects: { mood: 6, longing: 4 } },
-      { id: 3, label: '转手送同事', effects: { social: 5, mood: 2 } },
+      { id: 1, label: '开心收下', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }] },
+      { id: 2, label: '想着带回家给小茉莉', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'small' }, { stat: 'longing', direction: 'up', strength: 'small' }] },
+      { id: 3, label: '转手送同事', effects_hint: [{ stat: 'social', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }] },
     ],
   },
   stray_animal: {
@@ -64,9 +64,9 @@ export const RANDOM_EVENTS = {
     locations: ['公司 · 工位', '外出 · 路上', '外出 · 商场'],
     probability: 0.15, cooldown_world_minutes: 360, once_per_day: true,
     options: [
-      { id: 1, label: '蹲下喂点吃的', effects: { mood: 7, stress: -5 } },
-      { id: 2, label: '撸两下、拍张照', effects: { mood: 6 } },
-      { id: 3, label: '没带吃的，看两眼走开', effects: { mood: -2 } },
+      { id: 1, label: '蹲下喂点吃的', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'small' }, { stat: 'stress', direction: 'down', strength: 'small' }] },
+      { id: 2, label: '撸两下、拍张照', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'small' }] },
+      { id: 3, label: '没带吃的，看两眼走开', effects_hint: [{ stat: 'mood', direction: 'down', strength: 'tiny' }] },
     ],
   },
 };

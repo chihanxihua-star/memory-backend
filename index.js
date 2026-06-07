@@ -30,6 +30,7 @@ import { PendingWakeDaemon } from './world-pending.js';
 import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } from './world-actions.js';
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent } from './world-random-events.js';
+import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -802,27 +803,29 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     console.warn(`[WORLD] 选择解析失败，默认选「${option.label}」。原文: ${(clean || '').slice(0, 100)}`);
   }
 
-  // 第8步：选项绑 action_id 时 effects/移动从 ACTIONS 取；否则用 option 自带（随机事件=内联 effects/target_*）。
+  // 第8步：选项绑 action_id 时 effects/移动从 ACTIONS 取；否则用 option 自带（随机事件=内联）。
+  // 10C：effSource 的 effects_hint(生活状态走 resolveEffects) + effects(固定金额) 由全局结算器统一算。
   const action = option.action_id ? WORLD_ACTIONS[option.action_id] : null;
-  const effects = action ? (action.effects || {}) : (option.effects || {});
+  const effSource = action || option;
   const targetLoc = action?.target_location || option.target_location;
   const targetAct = action?.target_activity || option.target_activity;
 
-  // 读-改-写：叠加 effects（普通项 0-100 钳位、wallet 只封底 0）+ action 的 target_location/activity。
+  // 读-改-写：resolveEffects 算生活状态（0-100 钳位）+ 固定 effects（wallet 封底 0）+ target_location/activity。
   let updatedStatus = null;
+  let effResolved = {}, effFixed = {};
   try {
     const { data: rows, error } = await supabase
       .from('character_status_cheng').select('*').eq('name', '澄').limit(1);
     if (error) throw error;
     const row = rows && rows[0];
     if (row) {
-      const patch = { updated_at: new Date().toISOString() };
-      for (const [k, delta] of Object.entries(effects)) {
-        const cur = Number(row[k]) || 0;
-        patch[k] = k === 'wallet_balance'
-          ? Math.max(0, cur + delta)
-          : Math.max(0, Math.min(100, cur + delta));
-      }
+      const ctx = buildEffectContext(row, {
+        eventId: event.key || null,
+        eventType: turn.worldEvent?.isRandom ? 'random' : (option.action_id ? 'action' : 'wake'),
+      });
+      const { resolved, fixed, merged } = computeDeltas(row, effSource, ctx);
+      effResolved = resolved; effFixed = fixed;
+      const patch = { updated_at: new Date().toISOString(), ...applyDeltas(row, merged) };
       if (targetLoc) patch.location = targetLoc;
       if (targetAct) patch.activity = targetAct;
       const { data: up, error: e2 } = await supabase
@@ -878,14 +881,14 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → 世界唤醒解析失败，默认选择：${option.label}`,
-        detail: { choice: option.id, reason: '', effects, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
+        detail: { choice: option.id, reason: '', effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
         source: 'system_error',
       });
     } else {
       const { data: tl, error: te } = await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → ${option.label}`,
-        detail: { choice: option.id, reason, effects, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
+        detail: { choice: option.id, reason, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
         source: 'claude',
       }).select('id').single();
       if (te) throw te;

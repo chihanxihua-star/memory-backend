@@ -3,8 +3,7 @@
 // 第一版只做澄(actor=cheng)；保留 actor 字段方便以后扩展 user/both。
 // 行为瞬间完成，不消耗世界时间（行为耗时系统以后再做）。
 import { supabase } from './memory.js';
-
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 
 // 行为定义。allowed=允许执行的当前 location；target_location/activity=执行后移动到/变成；effects=状态变化。
 export const ACTIONS = {
@@ -14,11 +13,16 @@ export const ACTIONS = {
   go_breakroom:     { label: '去休息室',   allowed: ['公司 · 工位', '公司 · 茶水间'],                                           target_location: '公司 · 休息室', target_activity: '休息',  effects: {} },
   go_workstation:   { label: '回工位',     allowed: ['公司 · 休息室', '公司 · 茶水间'],                                         target_location: '公司 · 工位', target_activity: '工作',   effects: {} },
   go_tea_room:      { label: '去茶水间',   allowed: ['公司 · 工位', '公司 · 休息室'],                                           target_location: '公司 · 茶水间', target_activity: '倒水',  effects: {} },
-  eat_snack:        { label: '吃零食',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'], target_activity: '吃零食', effects: { satiety: 15, mood: 3 } },
-  order_takeout:    { label: '点外卖',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'], target_activity: '点外卖', effects: { satiety: 25, wallet_balance: -30, mood: 2 } },
-  cook_simple_meal: { label: '自己做饭',   allowed: ['家 · 厨房'],                                                             target_activity: '做饭',   effects: { satiety: 30, energy: -8, cleanliness: -3, mood: 5 } },
-  shower:           { label: '洗澡',       allowed: ['家 · 浴室'],                                                             target_activity: '洗澡',   effects: { cleanliness: 30, energy: -5, stress: -5, mood: 3 } },
-  rest:             { label: '休息一会儿', allowed: ['家 · 卧室', '家 · 客厅', '公司 · 休息室'],                                target_activity: '休息',   effects: { energy: 10, stress: -5, mood: 3 } },
+  eat_snack:        { label: '吃零食',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'], target_activity: '吃零食',
+    effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }] },
+  order_takeout:    { label: '点外卖',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'], target_activity: '点外卖',
+    effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'medium' }, { stat: 'mood', direction: 'up', strength: 'tiny' }], effects: { wallet_balance: -30 } },
+  cook_simple_meal: { label: '自己做饭',   allowed: ['家 · 厨房'],                                                             target_activity: '做饭',
+    effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'large' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'cleanliness', direction: 'down', strength: 'tiny' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
+  shower:           { label: '洗澡',       allowed: ['家 · 浴室'],                                                             target_activity: '洗澡',
+    effects_hint: [{ stat: 'cleanliness', direction: 'up', strength: 'large' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
+  rest:             { label: '休息一会儿', allowed: ['家 · 卧室', '家 · 客厅', '公司 · 休息室'],                                target_activity: '休息',
+    effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
 };
 
 // 当前 location 下可执行的行为 → [{id,label}]
@@ -28,17 +32,14 @@ export function getAvailableActions(location) {
     .map(([id, a]) => ({ id, label: a.label }));
 }
 
-// 把 action 的 effects/location/activity 算成 character_status patch（不写库）。
-// 普通项 0-100 钳位；wallet_balance 只封底 0、不封顶。
-export function computeActionPatch(action, row) {
-  const patch = { updated_at: new Date().toISOString() };
-  for (const [k, delta] of Object.entries(action.effects || {})) {
-    const cur = Number(row[k]) || 0;
-    patch[k] = k === 'wallet_balance' ? Math.max(0, cur + delta) : clamp(cur + delta, 0, 100);
-  }
+// 10C：用全局结算器把 action 的 effects_hint(生活状态) + effects(固定金额) 算成 patch（不写库）。
+// 返回 { patch, resolved, fixed }：patch 落库；resolved/fixed 进 timeline detail。普通项 0-100 钳位、wallet 封底 0。
+export function computeActionPatch(action, row, context) {
+  const { resolved, fixed, merged } = computeDeltas(row, action, context || buildEffectContext(row, { eventId: null, eventType: 'action' }));
+  const patch = { updated_at: new Date().toISOString(), ...applyDeltas(row, merged) };
   if (action.target_location) patch.location = action.target_location;
   if (action.target_activity) patch.activity = action.target_activity;
-  return patch;
+  return { patch, resolved, fixed };
 }
 
 // 执行一个行为：检查 allowed → 应用 → 写 character_status + daily_timeline(source=action)。
@@ -60,7 +61,7 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
     throw e;
   }
 
-  const patch = computeActionPatch(action, row);
+  const { patch, resolved, fixed } = computeActionPatch(action, row);
   const { data: up, error: e2 } = await supabase
     .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
   if (e2) throw e2;
@@ -72,7 +73,9 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
       action: action.label,
       detail: {
         action_id: actionId, actor,
-        effects: action.effects || {},
+        effects_hint: action.effects_hint || [],
+        effects_resolved: resolved,
+        effects_fixed: fixed,
         from_location: fromLoc, to_location: up.location, activity: up.activity,
       },
       source: 'action',
