@@ -31,6 +31,7 @@ import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } fro
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
+import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime } from './world-workday.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -545,8 +546,17 @@ const worldTickDaemon = new WorldTickDaemon({
     } catch { /* 读不到当无雨 */ }
     return detectRandomEvent(status, { envWeatherText, nowMs: Date.now() });
   },
-  onMidnight: () => onMidnightCross(),
+  onMidnight: () => { onMidnightCross(); clearWorkMarks(); },
   bumpTick: () => bumpRandomTick(),
+  // 11A：每 tick 先跑作息/工资（系统更新，不 engage）。读现实 weekday/date 供工作日判断。
+  onWorkdayTick: async (status) => {
+    let env = {};
+    try {
+      const { data } = await supabase.from('world_environment_cheng').select('weekday, date').eq('name', 'default').limit(1);
+      if (data && data[0]) env = data[0];
+    } catch { /* 读不到当非工作日处理 */ }
+    return workdayTick(status, env);
+  },
 });
 
 // world-home pending_wake daemon（第 5 步，常驻）：到点把澄"先忍 10 分钟"的续集重新唤醒。
@@ -770,6 +780,12 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
 
 // pending_wake 到点：读当前状态 → 用对应事件 + pending 上下文重新唤醒澄。给 PendingWakeDaemon 当 onDue。
 async function firePendingWake(row) {
+  // 11A：加班结束 pending — 系统结算（回家+加班费），不 engage 澄、不发 Bark。
+  if (row.wake_type === 'overtime_end') {
+    try { await endOvertime(); console.log('[WORK] 加班结束 pending 到点，已结算'); }
+    catch (e) { console.warn('[WORK] 加班结束结算失败:', e.message); }
+    return { fired: true, system: true };
+  }
   const def = WORLD_EVENTS[row.wake_type];
   if (!def) return { fired: false, reason: 'unknown_event:' + row.wake_type };
   const { data: rows, error } = await supabase
@@ -2676,6 +2692,17 @@ app.post('/api/world/sync-time', async (req, res) => {
   try {
     const status = await syncWorldTimeToRealTime();
     res.json({ ok: true, status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 11A：工作日作息手动测试（上班/午休/下午上班/下班判断/强制正常下班/强制加班/结束加班/发工资）。系统更新不 engage。
+app.post('/api/world/work', async (req, res) => {
+  const op = req.body?.op;
+  if (!op) return res.status(400).json({ error: '缺少 op' });
+  try {
+    const r = await forceWorkOp(op);
+    if (r.ok) return res.json({ ok: true, status: r.status });
+    return res.status(400).json({ ok: false, error: r.error });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

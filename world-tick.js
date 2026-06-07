@@ -171,6 +171,7 @@ export class WorldTickDaemon {
     this._detectRandom = opts.detectRandom || null; // 10B：(status)=>随机事件|null（hungry 没命中才用）
     this._onMidnight = opts.onMidnight || null;       // 世界跨午夜回调（清 once_per_day）
     this._bumpTick = opts.bumpTick || null;            // 每 tick 自增随机事件计数（cooldown 用）
+    this._onWorkdayTick = opts.onWorkdayTick || null; // 11A：(status)=>更新后status（自动作息/工资，系统更新不engage）
     this._lastHour = null;
   }
 
@@ -208,16 +209,22 @@ export class WorldTickDaemon {
       if (this._lastHour != null && !Number.isNaN(newHour) && newHour < this._lastHour && this._onMidnight) this._onMidnight();
       if (!Number.isNaN(newHour)) this._lastHour = newHour;
       if (this._bumpTick) this._bumpTick();
+      // 11A：先跑作息/工资（系统更新、不 engage），拿到可能更新过的状态再做事件检测。
+      let cur = row;
+      if (this._onWorkdayTick) {
+        try { const u = await this._onWorkdayTick(cur); if (u) cur = u; }
+        catch (e) { console.error('[WORLD] 作息 tick 异常:', e.message); }
+      }
       // 事件优先级：hungry 命中就只走 hungry；否则才轮普通随机事件。同一 tick 最多一个。
       if (this._onEvent) {
-        const ev = detectWorldEvent(row);
+        const ev = detectWorldEvent(cur);
         if (ev) {
-          try { await this._onEvent(ev, row); }
+          try { await this._onEvent(ev, cur); }
           catch (e) { console.error('[WORLD] onEvent 异常:', e.message); }
         } else if (this._detectRandom) {
           try {
-            const re = await this._detectRandom(row);
-            if (re) await this._onEvent(re, row);
+            const re = await this._detectRandom(cur);
+            if (re) await this._onEvent(re, cur);
           } catch (e) { console.error('[WORLD] 随机事件异常:', e.message); }
         }
       }
