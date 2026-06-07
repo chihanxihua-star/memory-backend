@@ -29,6 +29,7 @@ import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WOR
 import { PendingWakeDaemon } from './world-pending.js';
 import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } from './world-actions.js';
 import { formatWeather } from './world-env.js';
+import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent } from './world-random-events.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -528,7 +529,23 @@ const diceDaemon = new DiceDaemon({
 
 // world-home 世界时钟 daemon（默认关，要手动开）。tick 命中事件 → triggerWorldWake（冷却+空闲在那判）。
 const worldTickDaemon = new WorldTickDaemon({
-  onEvent: (event, status) => triggerWorldWake(event, status, { force: false }),
+  onEvent: async (event, status) => {
+    const r = await triggerWorldWake(event, status, { force: false });
+    // 随机事件真发出后才标记（once_per_day/cooldown/限频）；被挡(忙/冷却)则不消耗配额
+    if (r && r.fired && event.isRandom) markRandomEventFired(event.key);
+    return r;
+  },
+  // 10B：hungry 没命中才轮随机事件。读环境天气供「下班下雨」判定；全局限频/概率在 detectRandomEvent 里。
+  detectRandom: async (status) => {
+    let envWeatherText = '';
+    try {
+      const { data } = await supabase.from('world_environment_cheng').select('weather_text').eq('name', 'default').limit(1);
+      envWeatherText = data?.[0]?.weather_text || '';
+    } catch { /* 读不到当无雨 */ }
+    return detectRandomEvent(status, { envWeatherText, nowMs: Date.now() });
+  },
+  onMidnight: () => onMidnightCross(),
+  bumpTick: () => bumpRandomTick(),
 });
 
 // world-home pending_wake daemon（第 5 步，常驻）：到点把澄"先忍 10 分钟"的续集重新唤醒。
@@ -626,7 +643,7 @@ const lastWorldWakeAt = new Map();             // eventKey -> 上次触发时间
 const WORLD_PHONE_RATE_MS = 10 * 60 * 1000;    // WORLD_MESSAGE phone：自动唤醒 10 分钟最多 1 条
 let lastWorldPhoneAt = 0;                       // 上次 world phone 消息时间戳(ms)
 
-function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHintLine = '', envWeather = '') {
+function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHintLine = '', envWeather = '', envDateWeek = '') {
   const opts = event.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
   // pending_wake 续集：在完整模板的原因后加一段上下文，其余（时间/位置/天气/完整状态/选项）照常，
   // 让澄看到此刻的完整状态重新判断，而不是只收一句补充说明（补充2）。
@@ -637,7 +654,7 @@ function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHi
   const noteLine = u.custom_note ? `\n她说：${u.custom_note}` : '';
   return `【世界唤醒】
 原因：${event.reason}${pendingLine}
-时间：${s.world_time}
+时间：${s.world_time}${envDateWeek ? `\n日期：${envDateWeek}` : ''}
 位置：${s.location}
 你正在：${s.activity || '工作'}
 天气：${envWeather || s.weather}
@@ -693,12 +710,16 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   const todoHint = await getTodoHint();
 
   // 10A：天气来自 world_environment_cheng（现实同步），不暴露城市名。读不到回退 character_status.weather。
-  let envWeather = '';
+  // 10B：顺带带上现实日期/星期。
+  let envWeather = '', envDateWeek = '';
   try {
     const { data: envRow } = await supabase
       .from('world_environment_cheng')
-      .select('weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
-    if (envRow && envRow[0]) envWeather = formatWeather(envRow[0]);
+      .select('date, weekday, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
+    if (envRow && envRow[0]) {
+      envWeather = formatWeather(envRow[0]);
+      envDateWeek = [envRow[0].date, envRow[0].weekday].filter(Boolean).join(' ');
+    }
   } catch (e) { console.warn('[WORLD] 读环境天气失败:', e.message); }
 
   if (!cc.isRunning() || activeTurn || pendingBuffer) {
@@ -717,7 +738,7 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   const eventForTurn = (typeof event.optionsFor === 'function')
     ? { ...event, options: event.optionsFor(status) }
     : event;
-  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus, todoHint.line, envWeather);
+  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus, todoHint.line, envWeather, envDateWeek);
   activeTurn = {
     ws: null, conversationId: null, silent: true,
     settings: null, tools: [],
@@ -781,9 +802,11 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     console.warn(`[WORLD] 选择解析失败，默认选「${option.label}」。原文: ${(clean || '').slice(0, 100)}`);
   }
 
-  // 第8步：选项绑 action_id 时，effects/移动从 ACTIONS 取（单一真源）；否则用 option.effects（如「先忍」=空）。
+  // 第8步：选项绑 action_id 时 effects/移动从 ACTIONS 取；否则用 option 自带（随机事件=内联 effects/target_*）。
   const action = option.action_id ? WORLD_ACTIONS[option.action_id] : null;
   const effects = action ? (action.effects || {}) : (option.effects || {});
+  const targetLoc = action?.target_location || option.target_location;
+  const targetAct = action?.target_activity || option.target_activity;
 
   // 读-改-写：叠加 effects（普通项 0-100 钳位、wallet 只封底 0）+ action 的 target_location/activity。
   let updatedStatus = null;
@@ -800,8 +823,8 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
           ? Math.max(0, cur + delta)
           : Math.max(0, Math.min(100, cur + delta));
       }
-      if (action?.target_location) patch.location = action.target_location;
-      if (action?.target_activity) patch.activity = action.target_activity;
+      if (targetLoc) patch.location = targetLoc;
+      if (targetAct) patch.activity = targetAct;
       const { data: up, error: e2 } = await supabase
         .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
       if (e2) throw e2;
@@ -2619,6 +2642,30 @@ app.post('/api/world/action', async (req, res) => {
     }
     res.status(500).json({ error: e.message });
   }
+});
+
+// 10B：手动强制触发随机事件（绕概率/once_per_day/全局限频；CC 忙时仍不硬插，返回 cc_busy）。
+app.post('/api/world/random', async (req, res) => {
+  const eventId = req.body?.event_id;
+  const event = forceRandomEvent(eventId);
+  if (!event) return res.status(400).json({ error: '未知随机事件: ' + eventId });
+  try {
+    const { data: rows, error } = await supabase
+      .from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    if (error) throw error;
+    const status = rows && rows[0];
+    if (!status) return res.status(404).json({ error: '没有澄那一行' });
+    const r = await triggerWorldWake(event, status, { force: true }); // force 不调 markRandomEventFired
+    if (r.fired) return res.json({ ok: true, event: event.label });
+    return res.status(409).json({ ok: false, reason: r.reason || 'not_fired' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 10B：随机事件列表（给 DevPanel 出按钮）
+app.get('/api/world/random/list', (req, res) => {
+  res.json(Object.values(RANDOM_EVENTS).map(e => ({ id: e.id, label: e.label })));
 });
 
 // 第9步：小手机消息列表。只返 WORLD_MESSAGE:phone 主动消息（event=world_message），

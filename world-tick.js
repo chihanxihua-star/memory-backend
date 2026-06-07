@@ -153,6 +153,10 @@ export class WorldTickDaemon {
     this._timer = null;
     this._busy = false;
     this._onEvent = opts.onEvent || null;
+    this._detectRandom = opts.detectRandom || null; // 10B：(status)=>随机事件|null（hungry 没命中才用）
+    this._onMidnight = opts.onMidnight || null;       // 世界跨午夜回调（清 once_per_day）
+    this._bumpTick = opts.bumpTick || null;            // 每 tick 自增随机事件计数（cooldown 用）
+    this._lastHour = null;
   }
 
   // 读配置决定是否启动 + 用哪种速度。start 自带 stop，可反复调。
@@ -184,12 +188,22 @@ export class WorldTickDaemon {
     try {
       const row = await advanceOneTick();
       console.log(`[WORLD] tick → ${row.world_time} | 体力${row.energy} 饱腹${row.satiety} 清洁${row.cleanliness} 想念${row.longing}`);
-      // 检测事件命中 → 交回调（冷却 + CC 空闲都在回调里判）。同一次 tick 最多一个事件。
+      // 跨午夜（新小时 < 旧小时，如 23→00）→ 清 once_per_day；每 tick 自增随机计数。
+      const newHour = parseInt(String(row.world_time || '').split(':')[0], 10);
+      if (this._lastHour != null && !Number.isNaN(newHour) && newHour < this._lastHour && this._onMidnight) this._onMidnight();
+      if (!Number.isNaN(newHour)) this._lastHour = newHour;
+      if (this._bumpTick) this._bumpTick();
+      // 事件优先级：hungry 命中就只走 hungry；否则才轮普通随机事件。同一 tick 最多一个。
       if (this._onEvent) {
         const ev = detectWorldEvent(row);
         if (ev) {
           try { await this._onEvent(ev, row); }
           catch (e) { console.error('[WORLD] onEvent 异常:', e.message); }
+        } else if (this._detectRandom) {
+          try {
+            const re = await this._detectRandom(row);
+            if (re) await this._onEvent(re, row);
+          } catch (e) { console.error('[WORLD] 随机事件异常:', e.message); }
         }
       }
     } catch (e) {
