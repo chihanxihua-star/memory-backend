@@ -33,6 +33,7 @@ import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 import { buildNowInner, loadNarrationRules, generateChengSelfNarration } from './world-narration.js';
 import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd } from './world-workday.js';
+import { collectWorldThoughts } from './world-thoughts.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -2799,6 +2800,40 @@ app.get('/api/world/self-narration/preview', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 12B-1：念头池（shadow mode，只读/收集/dismiss；【不喂 Claude】）。
+app.get('/api/world/thoughts', async (req, res) => {
+  try {
+    let q = supabase.from('world_thoughts_cheng').select('*');
+    q = q.eq('status', req.query.status || 'active');
+    if (req.query.category) q = q.eq('category', req.query.category);
+    q = q.order('salience', { ascending: false }).order('created_at', { ascending: false }).limit(Number(req.query.limit) || 50);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/thoughts/collect', async (req, res) => {
+  try {
+    const r = await collectWorldThoughts();
+    if (r.ok) return res.json(r);
+    return res.status(r.reason === 'already_running' ? 409 : 500).json(r);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/thoughts/:id/dismiss', async (req, res) => {
+  try {
+    const { error } = await supabase.from('world_thoughts_cheng').update({ status: 'dismissed', updated_at: new Date().toISOString() }).eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/thoughts/:id/archive', async (req, res) => {
+  try {
+    const { error } = await supabase.from('world_thoughts_cheng').update({ status: 'archived', updated_at: new Date().toISOString() }).eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // 第9步：小手机消息列表。只返 WORLD_MESSAGE:phone 主动消息（event=world_message），
 // 不漏普通聊天/phone_chat——所以走后端过滤，不让 world-home 直接读 messages 表。最近 20 条。
 app.get('/api/world/phone/messages', async (req, res) => {
@@ -3573,6 +3608,8 @@ server.listen(PORT, '127.0.0.1', () => {
   diceDaemon.start();
   worldTickDaemon.start();
   pendingWakeDaemon.start();
+  // 12B-1：念头池 collector 周期触发（每 15 分钟现实时间，独立于世界时钟；shadow mode 只收集不喂 Claude）。
+  setInterval(() => { collectWorldThoughts(); }, 15 * 60 * 1000);
 });
 
 process.on('SIGTERM', () => { cc.stop(); process.exit(0); });
