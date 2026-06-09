@@ -75,13 +75,6 @@ server.on('upgrade', (req, socket, head) => {
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use(express.static(__dirname, {
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.html')) {
-      res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-    }
-  },
-}));
 
 // ==================== 鉴权 ====================
 let AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
@@ -3572,9 +3565,9 @@ async function flushPendingToCC(ws, items) {
 // ==================== 启动 ====================
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`服务器已启动: http://0.0.0.0:${PORT}`);
-  console.log(`WebSocket: ws://0.0.0.0:${PORT}`);
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`服务器已启动: http://127.0.0.1:${PORT}`);
+  console.log(`WebSocket: ws://127.0.0.1:${PORT}`);
   console.log(`Supabase: ${process.env.SUPABASE_URL ? '已连接' : '未配置'}`);
   console.log(`CC 工作目录: /home/claude-user/chat-sandbox (CLAUDE.md 由 CC 自己加载)`);
   diceDaemon.start();
