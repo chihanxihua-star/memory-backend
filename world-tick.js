@@ -136,7 +136,15 @@ export async function syncWorldTimeToRealTime() {
     .select('world_time, location, activity')
     .limit(1);
   if (error) throw error;
-  return data?.[0] || { world_time: hhmm };
+  const st = data?.[0] || { world_time: hhmm };
+  // spec 四：写一条 system 行程（不 engage 澄、不发 Bark、不触发世界事件）。
+  try {
+    await supabase.from('daily_timeline_cheng').insert({
+      world_time: hhmm, location: st.location || null,
+      action: '世界时间校正', detail: { timezone: 'Asia/Shanghai', synced_to: hhmm }, source: 'system',
+    });
+  } catch (e) { console.warn('[WORLD] sync-time 行程写入失败:', e.message); }
+  return st;
 }
 
 // ── 配置读写 ────────────────────────────────────────────
