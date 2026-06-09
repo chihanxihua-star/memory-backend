@@ -17,6 +17,11 @@ function nowISO() { return new Date().toISOString(); }
 function plus8Date(ts) { return ts ? new Date(new Date(ts).getTime() + 8 * 3600000).toISOString().slice(0, 10) : ''; }
 function shortAction(a) { const s = String(a || '').split(' → ')[0].trim(); return s.length > 26 ? s.slice(0, 26) + '…' : s; }
 function truncate(s, n) { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; }
+// 洗掉残留的世界标签([WORLD_MESSAGE]/[TODO]/[WORLD_CHOICE]/[MEMORY]，配对或单个)，保留里面的话。
+// 小心思本应是标签外散文，但偶有澄写漏闭合标签导致残留——念头 content 这里兜底洗一遍。
+function stripTags(s) {
+  return String(s || '').replace(/\[\/?(WORLD_MESSAGE|WORLD_CHOICE|TODO|MEMORY)(:[^\]]*)?\]/gi, '').replace(/\s+/g, ' ').trim();
+}
 
 // ── 水位线 ──────────────────────────────────────────
 async function getWaterline(sourceType) {
@@ -75,7 +80,7 @@ async function gatherInnerThoughts() {
     .select('id, content, timeline_id, created_at').gt('created_at', wl).order('created_at', { ascending: true }).limit(60);
   return (data || []).map(it => ({
     source_type: 'inner_thought', source_id: String(it.id), category: String(it.content || '').includes('小茉莉') ? 'relationship' : 'life_event',
-    content: `之前留下一段小心思：${truncate(it.content, 40)}`, salience: 0.55, status: 'active', created_at: it.created_at, _wl: 'inner_thought', metadata: { timeline_id: it.timeline_id },
+    content: `之前留下一段小心思：${truncate(stripTags(it.content), 40)}`, salience: 0.55, status: 'active', created_at: it.created_at, _wl: 'inner_thought', metadata: { timeline_id: it.timeline_id },
   }));
 }
 async function gatherPending() {
