@@ -174,6 +174,32 @@ async function decayThoughts(stats) {
   }
 }
 
+// ── 12B-2：小世界浮现（只读挑 1 条 active 念头进聊天 surfacing；【不改状态/不落库】）──────────────
+// denylist 只是第二层保险(主防线是 collector 写 content 时就是事实句)；命中要打日志，作为回头修 collector 的信号。
+const SURFACE_DENYLIST = ['很想', '欲望', '依恋', '焦虑', '不安', '放不下', '惦记', 'attachment', 'desire', 'libido', 'longing', 'mood', 'stress', 'salience', 'priority', 'unresolved_weight'];
+const SURFACE_COOLDOWN_MS = 10 * 60 * 1000;
+const surfaceCooldown = new Map(); // thought_id -> last_shown_at(ms)，内存级防刷屏，重启清空可接受
+
+// 返回一条自然事实 content（string）或 ''。只读，不改 thought 状态、不落库。
+export async function pickWorldThought() {
+  try {
+    const { data } = await supabase.from('world_thoughts_cheng')
+      .select('id, content').eq('status', 'active')
+      .order('salience', { ascending: false }).order('created_at', { ascending: false }).limit(15);
+    const now = Date.now();
+    for (const t of data || []) {
+      const c = String(t.content || '').trim();
+      if (!c) continue;
+      const hit = SURFACE_DENYLIST.find(w => c.includes(w));
+      if (hit) { console.warn(`[thought-surfacing] filtered thought id=${t.id} reason=unsafe_content hit="${hit}" content="${c}"`); continue; }
+      if (now - (surfaceCooldown.get(t.id) || 0) < SURFACE_COOLDOWN_MS) continue; // 10min 内已浮现过，跳过
+      surfaceCooldown.set(t.id, now);
+      return c; // 只给事实 content，不带 salience/category/source_type/metadata
+    }
+    return '';
+  } catch (e) { console.warn('[thought-surfacing] pick 失败:', e.message); return ''; }
+}
+
 // ── 入口：collector（内存锁，防 tick + 手动并发）──────────────
 let isCollecting = false;
 export async function collectWorldThoughts() {

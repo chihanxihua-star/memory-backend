@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { supabase } from './memory.js';
 import { buildNowInner, loadNarrationRules } from './world-narration.js';
+import { pickWorldThought } from './world-thoughts.js';
 
 const FUXIAN_PATH = '/home/claude-user/.claude/CLAUDE.md';
 const FUXIAN_OPEN = '<浮现>';
@@ -225,9 +226,11 @@ export async function surfaceForInject(userText) {
 
   // 12A：澄第一人称身体/环境自述 + 小茉莉第三人称，统一 buildNowInner 生成（与世界唤醒包共用逻辑）。
   const statusLine = await buildNowStatusLine();
+  // 12B-2：小世界浮现（念头池挑 1 条事实，独立于记忆浮现冷却，有自己的 10min 内存防重复）。只读不改状态。
+  const worldThought = await pickWorldThought();
 
   turnsSinceLast += 1;
-  if (turnsSinceLast < COOLDOWN) return { statusLine, text: '', items: [] };
+  if (turnsSinceLast < COOLDOWN) return { statusLine, text: '', items: [], worldThought };
 
   const items = await gatherItems(userText);
   if (items.length > 0) {
@@ -237,7 +240,7 @@ export async function surfaceForInject(userText) {
       items.map(it => `${it.source}:${String(it.id).slice(0, 8)}`).join(', '));
   }
   const text = items.length ? items.map(renderItem).join('\n') : '';
-  return { statusLine, text, items };
+  return { statusLine, text, items, worldThought };
 }
 
 // ─────── 主入口（stream-json 模式：写 CLAUDE.md）───────

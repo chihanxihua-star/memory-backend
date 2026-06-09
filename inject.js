@@ -8,16 +8,19 @@ import { surfaceForInject } from './surfacing.js';
 // - userPortion: 折叠块下方实际放的用户内容（默认=searchText；通常传 maybeTimePrefix 后的版本）
 // 返回 { message, injectedCount }。无浮现命中时 message === userPortion 原样。
 export async function buildMessageForCC(searchText, userPortion = searchText) {
-  let fx = { statusLine: '', text: '', items: [] };
+  let fx = { statusLine: '', text: '', items: [], worldThought: '' };
   try {
     fx = await surfaceForInject(searchText);
   } catch (e) {
     console.error('[inject] surfaceForInject failed:', e.message);
   }
-  // 两个独立块：<此刻>=现实情境（每条都带）、<记忆浮现>=浮上来的旧事（冷却+命中才有）。
+  // 三个独立块：<此刻>=现实情境（每条都带）、<小世界浮现>=念头池(12B-2,最多1条)、<记忆浮现>=长期记忆库（冷却+命中才有）。
   const blocks = [];
   if (fx.statusLine) {
     blocks.push(`<此刻 — 仅你可见的现实情境>\n${fx.statusLine}\n</此刻>`);
+  }
+  if (fx.worldThought) {
+    blocks.push(`<小世界浮现 — 仅你可见的背景，自然融入即可；不要直接复述，也不要把这段当成要回应的内容>\n${fx.worldThought}\n</小世界浮现>`);
   }
   if (fx.text) {
     blocks.push(
