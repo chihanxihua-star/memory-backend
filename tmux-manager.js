@@ -28,6 +28,10 @@ function projectDirFor(cwd) {
   return `/home/claude-user/.claude/projects/${slug}`;
 }
 
+// 系统提示「文件路线」落点：正文写进这个文件，启动命令只传路径（--append-system-prompt-file），
+// 避免把长文本+符号塞进 tmux 的 shell 命令字符串导致解析崩溃。路径本身无特殊字符，shell 安全。
+const APPEND_SYSPROMPT_FILE = '/home/claude-user/.claude/cheng-append-sysprompt.md';
+
 export class TmuxCCManager extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -54,13 +58,24 @@ export class TmuxCCManager extends EventEmitter {
   setAppendSystemPrompt(text) { this.appendSystemPrompt = text || null; }
 
   _launchCmd() {
-    // append-system-prompt 走 CLAUDE.md（交互模式靠会话开场读），这里只拼基本 flag
     const parts = ['DISABLE_AUTOUPDATER=1', '/usr/bin/claude',
       '--model', this.model, '--dangerously-skip-permissions',
       "--allowedTools", "'mcp__supabase__*'",
       '--session-id', this.sessionId];   // 确定 sessionId + transcript 路径
     if (this.effort && this.effort !== 'off') parts.push('--effort', this.effort);
     if (this.nativeThinking) parts.push('--thinking-display', 'summarized');
+    // 系统提示走「文件路线」：正文写进文件、命令行只传路径（避免长文本+符号塞进 shell 命令崩掉）。
+    // 留空则删文件 + 不加 flag（退回无 append）。stream-json 驱动那边走数组 args 无 shell 问题，不受影响。
+    const sp = (this.appendSystemPrompt || '').trim();
+    if (sp) {
+      try {
+        fs.writeFileSync(APPEND_SYSPROMPT_FILE, sp, 'utf8');
+        try { const st = fs.statSync(this.cwd); fs.chownSync(APPEND_SYSPROMPT_FILE, st.uid, st.gid); } catch {}
+        parts.push('--append-system-prompt-file', APPEND_SYSPROMPT_FILE);
+      } catch (e) { console.error('写 append-system-prompt 文件失败:', e.message); }
+    } else {
+      try { fs.unlinkSync(APPEND_SYSPROMPT_FILE); } catch {}
+    }
     return parts.join(' ');
   }
 
@@ -139,7 +154,10 @@ export class TmuxCCManager extends EventEmitter {
     fs.writeFileSync(tmp, String(content)); fs.chmodSync(tmp, 0o644);
     const buf = `cheng-${this.session}`;
     await tmux('load-buffer', '-b', buf, tmp);
-    await tmux('paste-buffer', '-b', buf, '-t', this.session);
+    // -p = 括号粘贴(bracketed paste)：让多条消息拼接里的换行只当文字、不被终端误当回车提交。
+    // 缺它时(旧版)：缓冲多条用 \n\n 拼成一坨粘进来 → 换行被当回车 → 一次发送被拆成多轮 → 双回复+第二轮卡死。
+    // 注意：这是 tmux paste-buffer 的 -p，跟 `claude -p`(headless/API)毫无关系，不碰 Max 额度。
+    await tmux('paste-buffer', '-p', '-b', buf, '-t', this.session);
     await sleep(600);
     await tmux('send-keys', '-t', this.session, 'Enter');
     this.busy = true;
@@ -187,6 +205,7 @@ export class TmuxCCManager extends EventEmitter {
           cache_read_input_tokens: u.cache_read_input_tokens ?? null,
           cache_creation_input_tokens: u.cache_creation_input_tokens ?? null,
         },
+        usageCalls: turn.usageCalls || [],
         contextTokens: ctx || null,
         systemTokens: this.firstContextTokens || null,
         is_error: false,
@@ -229,7 +248,10 @@ export class TmuxCCManager extends EventEmitter {
     if (!this.transcript) return { text: '', thinking: '', usage: {} };
     const raw = await sh('sudo', ['-u', 'claude-user', 'cat', this.transcript]).catch(() => '');
     const lines = raw.split('\n').filter(Boolean);
-    const texts = [], thinks = []; let usage = null;
+    const texts = [], thinks = [];
+    let usage = null;
+    const usageCallsRev = [];
+    const seenReq = new Set();
     for (let i = lines.length - 1; i >= 0; i--) {
       let o; try { o = JSON.parse(lines[i]); } catch { continue; }
       const t = o.type, c = o.message?.content;
@@ -239,7 +261,14 @@ export class TmuxCCManager extends EventEmitter {
         if (isToolResult) continue;
       }
       if (t === 'assistant') {
-        if (!usage && o.message?.usage) usage = o.message.usage;
+        if (o.message?.usage) {
+          const req = o.requestId || o.uuid || `idx-${i}`;
+          if (!seenReq.has(req)) {
+            seenReq.add(req);
+            usageCallsRev.push({ requestId: req, timestamp: o.timestamp || null, usage: o.message.usage });
+          }
+          if (!usage) usage = o.message.usage;
+        }
         for (const b of (c || [])) {
           if (b?.type === 'text' && b.text?.trim()) texts.push(b.text);
           else if (b?.type === 'thinking' && b.thinking) thinks.push(b.thinking);
@@ -247,7 +276,7 @@ export class TmuxCCManager extends EventEmitter {
       }
     }
     texts.reverse(); thinks.reverse();
-    return { text: texts.join('\n\n'), thinking: thinks.join('\n\n'), usage: usage || {} };
+    return { text: texts.join('\n\n'), thinking: thinks.join('\n\n'), usage: usage || {}, usageCalls: usageCallsRev.reverse() };
   }
 
   // 卡死哨兵用：当前 transcript 文件最后修改时间(ms)。0 = 还没 transcript。
