@@ -37,87 +37,87 @@ async function upsertThoughts(cands) {
   return rows.length;
 }
 
-// ── 各来源新增扫描（水位线增量；推进到本轮处理到的 max(created_at)）──────────────
-async function scanTimeline(stats) {
+// ── 各来源「采集候选」（不 upsert、不推水位线）。候选带 created_at(源行)+_wl(水位线源键)。──────────────
+const MAX_NEW_PER_COLLECT = 8; // 每轮最多新增 active 念头数，避免一波新事件冲掉旧念头
+
+async function gatherTimeline() {
   const wl = await getWaterline('timeline');
   const { data } = await supabase.from('daily_timeline_cheng')
-    .select('id, action, detail, world_time, location, created_at').gt('created_at', wl).order('created_at', { ascending: true }).limit(200);
-  if (!data?.length) return;
-  let maxC = wl; const cands = [];
-  for (const r of data) {
-    if (r.created_at > maxC) maxC = r.created_at;
+    .select('id, action, detail, world_time, location, created_at').gt('created_at', wl).order('created_at', { ascending: true }).limit(60);
+  const out = [];
+  for (const r of data || []) {
     const d = r.detail || {};
     const hasIgnored = d.ignored_effects && Object.keys(d.ignored_effects).length > 0;
     const hasItem = !!d.item;
-    const isEvent = !!d.event_type; // random / work_event
-    if (!hasIgnored && !hasItem && !isEvent) continue; // 跳过纯衰减/作息/工资等系统行
+    if (!hasIgnored && !hasItem && !d.event_type) continue; // 跳过纯衰减/作息/工资等系统行
     const category = hasItem ? 'object' : (d.event_type === 'work_event' ? 'work' : 'life_event');
     const salience = hasItem ? 0.5 : (hasIgnored ? 0.45 : 0.35);
     const content = hasItem ? `${d.item.name}还没有处理。` : `刚才有件事还没收尾：${shortAction(r.action)}。`;
-    cands.push({
-      source_type: 'timeline', source_id: String(r.id), category, content, salience, status: 'active',
+    out.push({
+      source_type: 'timeline', source_id: String(r.id), category, content, salience, status: 'active', created_at: r.created_at, _wl: 'timeline',
       metadata: { action: r.action, ignored_effects: d.ignored_effects || null, item: d.item || null, event_type: d.event_type || null, npc: d.npc || null, world_time: r.world_time, location: r.location },
     });
   }
-  stats.inserted += await upsertThoughts(cands);
-  await setWaterline('timeline', maxC);
+  return out;
 }
-
-async function scanTodos(stats) {
+async function gatherTodos() {
   const wl = await getWaterline('todo');
   const { data } = await supabase.from('phone_todos_cheng')
-    .select('id, title, urgency, status, created_at').eq('status', 'open').gt('created_at', wl).order('created_at', { ascending: true }).limit(100);
-  if (!data?.length) return;
-  let maxC = wl; const cands = [];
-  for (const t of data) {
-    if (t.created_at > maxC) maxC = t.created_at;
+    .select('id, title, urgency, status, created_at').eq('status', 'open').gt('created_at', wl).order('created_at', { ascending: true }).limit(60);
+  return (data || []).map(t => {
     const u = Number(t.urgency); const sal = Math.min(0.95, 0.5 + (Number.isFinite(u) ? u : 0.5) * 0.4);
-    cands.push({ source_type: 'todo', source_id: String(t.id), category: 'unresolved_intent', content: `小手机里还有一条待办：${truncate(t.title, 40)}`, salience: sal, status: 'active', metadata: { urgency: t.urgency, title: t.title } });
-  }
-  stats.inserted += await upsertThoughts(cands);
-  await setWaterline('todo', maxC);
+    return { source_type: 'todo', source_id: String(t.id), category: 'unresolved_intent', content: `小手机里还有一条待办：${truncate(t.title, 40)}`, salience: sal, status: 'active', created_at: t.created_at, _wl: 'todo', metadata: { urgency: t.urgency, title: t.title } };
+  });
 }
-
-async function scanInnerThoughts(stats) {
+async function gatherInnerThoughts() {
   const wl = await getWaterline('inner_thought');
   const { data } = await supabase.from('world_inner_thoughts_cheng')
-    .select('id, content, timeline_id, created_at').gt('created_at', wl).order('created_at', { ascending: true }).limit(100);
-  if (!data?.length) return;
-  let maxC = wl; const cands = [];
-  for (const it of data) {
-    if (it.created_at > maxC) maxC = it.created_at;
-    const category = String(it.content || '').includes('小茉莉') ? 'relationship' : 'life_event';
-    cands.push({ source_type: 'inner_thought', source_id: String(it.id), category, content: `之前留下一段小心思：${truncate(it.content, 40)}`, salience: 0.55, status: 'active', metadata: { timeline_id: it.timeline_id } });
-  }
-  stats.inserted += await upsertThoughts(cands);
-  await setWaterline('inner_thought', maxC);
+    .select('id, content, timeline_id, created_at').gt('created_at', wl).order('created_at', { ascending: true }).limit(60);
+  return (data || []).map(it => ({
+    source_type: 'inner_thought', source_id: String(it.id), category: String(it.content || '').includes('小茉莉') ? 'relationship' : 'life_event',
+    content: `之前留下一段小心思：${truncate(it.content, 40)}`, salience: 0.55, status: 'active', created_at: it.created_at, _wl: 'inner_thought', metadata: { timeline_id: it.timeline_id },
+  }));
 }
-
-async function scanPending(stats) {
+async function gatherPending() {
   const wl = await getWaterline('pending_wake');
   const { data } = await supabase.from('pending_wake_cheng')
-    .select('id, wake_type, reason, status, created_at').eq('status', 'queued').gt('created_at', wl).order('created_at', { ascending: true }).limit(100);
-  if (!data?.length) return;
-  let maxC = wl; const cands = [];
-  for (const p of data) {
-    if (p.created_at > maxC) maxC = p.created_at;
-    cands.push({ source_type: 'pending_wake', source_id: String(p.id), category: 'unresolved_intent', content: '还有一个等待中的后续事件没有完成。', salience: 0.7, status: 'active', metadata: { wake_type: p.wake_type, reason: p.reason } });
-  }
-  stats.inserted += await upsertThoughts(cands);
-  await setWaterline('pending_wake', maxC);
+    .select('id, wake_type, reason, status, created_at').eq('status', 'queued').gt('created_at', wl).order('created_at', { ascending: true }).limit(60);
+  return (data || []).map(p => ({ source_type: 'pending_wake', source_id: String(p.id), category: 'unresolved_intent', content: '还有一个等待中的后续事件没有完成。', salience: 0.7, status: 'active', created_at: p.created_at, _wl: 'pending_wake', metadata: { wake_type: p.wake_type, reason: p.reason } }));
+}
+// world_message 未回应：最近一条 world_message，发出超 30min 且其后无 user 消息。无水位线(每轮重判，靠去重)。
+async function gatherWorldMessage() {
+  const { data: wm } = await supabase.from('messages').select('id, created_at').eq('event', 'world_message').order('created_at', { ascending: false }).limit(1);
+  const m = wm?.[0];
+  if (!m || Date.now() - new Date(m.created_at).getTime() < WM_UNRESPONDED_MS) return [];
+  const { data: replies } = await supabase.from('messages').select('id').eq('role', 'user').gt('created_at', m.created_at).limit(1);
+  if (replies?.length) return [];
+  return [{ source_type: 'world_message', source_id: String(m.id), category: 'unresolved_intent', content: '刚才发给小茉莉的那条消息还没有回应。', salience: 0.7, status: 'active', created_at: m.created_at, _wl: null, metadata: { sent_at: m.created_at } }];
 }
 
-// world_message 未回应：只看最近一条 world_message，发出超 30min 且其后无 user 消息 → 一条 unresolved_intent。
-async function scanWorldMessage(stats) {
-  const { data: wm } = await supabase.from('messages')
-    .select('id, created_at').eq('event', 'world_message').order('created_at', { ascending: false }).limit(1);
-  const m = wm?.[0];
-  if (!m) return;
-  if (Date.now() - new Date(m.created_at).getTime() < WM_UNRESPONDED_MS) return; // 还没到 30min
-  const { data: replies } = await supabase.from('messages')
-    .select('id').eq('role', 'user').gt('created_at', m.created_at).limit(1);
-  if (replies?.length) return; // 已有 user 回复
-  stats.inserted += await upsertThoughts([{ source_type: 'world_message', source_id: String(m.id), category: 'unresolved_intent', content: '刚才发给小茉莉的那条消息还没有回应。', salience: 0.7, status: 'active', metadata: { sent_at: m.created_at } }]);
+// 统一处理：采集 → 按 created_at 升序 → 最多新增 8 条 active；水位线只推进到「本轮实际处理过的 max(created_at)」，
+// 没被处理的候选不推进（不丢数据）。去重靠 source_type+source_id+category，重复也算已处理(推水位线)但不占 8 名额。
+async function scanNewSources(stats) {
+  const gathered = (await Promise.all([gatherTimeline(), gatherTodos(), gatherInnerThoughts(), gatherPending(), gatherWorldMessage()])).flat();
+  if (!gathered.length) return;
+  gathered.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
+  // 现有键集合（判去重）
+  const ids = [...new Set(gathered.map(c => c.source_id))];
+  const exist = new Set();
+  if (ids.length) {
+    const { data: ex } = await supabase.from('world_thoughts_cheng').select('source_type, source_id, category').in('source_id', ids);
+    for (const r of ex || []) exist.add(`${r.source_type}|${r.source_id}|${r.category}`);
+  }
+  const toInsert = []; const processedMax = {}; let newCount = 0;
+  for (const c of gathered) {
+    if (newCount >= MAX_NEW_PER_COLLECT) break; // 够 8 条就停，后续候选留下次（水位线不推过它们）
+    if (c._wl) processedMax[c._wl] = (!processedMax[c._wl] || c.created_at > processedMax[c._wl]) ? c.created_at : processedMax[c._wl];
+    const key = `${c.source_type}|${c.source_id}|${c.category}`;
+    if (exist.has(key)) continue; // 重复：已处理（推水位线），不占名额
+    const { created_at, _wl, ...row } = c;
+    toInsert.push(row); exist.add(key); newCount++;
+  }
+  stats.inserted += await upsertThoughts(toInsert);
+  for (const [st, mx] of Object.entries(processedMax)) await setWaterline(st, mx);
 }
 
 // ── 收尾：active 念头来源已失效 → archived（active ≤50，全表扫小集合，成本低）──────────────
@@ -181,11 +181,7 @@ export async function collectWorldThoughts() {
   isCollecting = true;
   const stats = { inserted: 0, archived: 0, decayed: 0 };
   try {
-    await scanTimeline(stats);
-    await scanTodos(stats);
-    await scanInnerThoughts(stats);
-    await scanPending(stats);
-    await scanWorldMessage(stats);
+    await scanNewSources(stats); // 采集所有源 → 按 created_at 排序 → 每轮最多新增 8 条 → 按源推水位线
     await settleResolved(stats);
     await decayThoughts(stats);
     console.log(`[THOUGHTS] collect: +${stats.inserted} 新 / ${stats.archived} 收尾 / ${stats.decayed} 衰减`);
