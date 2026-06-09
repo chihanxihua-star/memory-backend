@@ -31,7 +31,7 @@ import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } fro
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
-import { buildNowInner, loadNarrationRules } from './world-narration.js';
+import { buildNowInner, loadNarrationRules, generateChengSelfNarration } from './world-narration.js';
 import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd } from './world-workday.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
@@ -2784,6 +2784,25 @@ app.patch('/api/world/narration/template/:id', async (req, res) => {
       .update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
     if (error) throw error;
     res.json({ ok: true, template: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 12A：预览当前澄自述。复用真实生成函数 generateChengSelfNarration（预览=实际，不另写一套）。
+// 可选 query energy/satiety/cleanliness/health 临时覆盖（只预览，不写库）。规则实时读表，改完即生效。
+app.get('/api/world/self-narration/preview', async (req, res) => {
+  try {
+    const [cs, env, rules] = await Promise.all([
+      supabase.from('character_status_cheng').select('world_time, location, activity, energy, satiety, cleanliness, health').eq('name', '澄').limit(1),
+      supabase.from('world_environment_cheng').select('date, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1),
+      loadNarrationRules(),
+    ]);
+    const status = { ...((cs.data && cs.data[0]) || {}) };
+    for (const k of ['energy', 'satiety', 'cleanliness', 'health']) {
+      if (req.query[k] != null && req.query[k] !== '') status[k] = Number(req.query[k]);
+    }
+    const e = (env.data && env.data[0]) || {};
+    const narration = generateChengSelfNarration(status, { date: e.date, weather: formatWeather(e) }, rules.phrases, rules.templates);
+    res.json({ narration });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
