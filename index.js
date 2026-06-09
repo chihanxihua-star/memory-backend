@@ -33,7 +33,7 @@ import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 import { buildNowInner, loadNarrationRules, generateChengSelfNarration } from './world-narration.js';
 import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd } from './world-workday.js';
-import { collectWorldThoughts } from './world-thoughts.js';
+import { collectWorldThoughts, recordWakeInjectionScan, getSurfacingDebug } from './world-thoughts.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -745,6 +745,8 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
     ? { ...event, options: event.optionsFor(status) }
     : event;
   const prompt = buildWorldWakePrompt(eventForTurn, pendingContext, todoHint.line, nowBlock);
+  // 12B-2.1 tripwire：唤醒包 build 后扫一次有没有 <小世界浮现>（正常恒 false；只观测、不读 pick、不注入）。
+  recordWakeInjectionScan(prompt);
   activeTurn = {
     ws: null, conversationId: null, silent: true,
     settings: null, tools: [],
@@ -2832,6 +2834,12 @@ app.post('/api/world/thoughts/:id/archive', async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 12B-2.1：小世界浮现观测（只读 debug；受上面 Bearer JWT 中间件保护，无 token→401；后端又 127.0.0.1-only）。
+// 不重新 pick、不触发 collector、不改 cooldown/状态/库——只返最近内存观测。
+app.get('/api/debug/world-thought-surfacing', (req, res) => {
+  res.json(getSurfacingDebug());
 });
 
 // 第9步：小手机消息列表。只返 WORLD_MESSAGE:phone 主动消息（event=world_message），

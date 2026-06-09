@@ -185,24 +185,65 @@ const SURFACE_DENYLIST = ['很想', '欲望', '依恋', '焦虑', '不安', '放
 const SURFACE_COOLDOWN_MS = 10 * 60 * 1000;
 const surfaceCooldown = new Map(); // thought_id -> last_shown_at(ms)，内存级防刷屏，重启清空可接受
 
+// ── 12B-2.1 观测（只内存、不落库、重启清空；不影响 pick 行为；不喂 Claude）──────────────
+const pickHistory = [];             // 最近 20 次聊天小世界浮现决策（不含 worldWakeInjection）
+let worldWakeInjectionLatest = false; // 最近一次世界唤醒包 build 后 tag 扫描结果（tripwire，正常恒 false）
+const wakeInjectionHistory = [];    // 最近 20 次唤醒包 tag 扫描（跟 pickHistory 分开）
+function pushPickHistory(rec) { pickHistory.push(rec); if (pickHistory.length > 20) pickHistory.shift(); }
+
 // 返回一条自然事实 content（string）或 ''。只读，不改 thought 状态、不落库。
 export async function pickWorldThought() {
+  const rec = { decidedAt: new Date().toISOString(), activeThoughtsSnapshot: [], selectedThought: null, injectedBlock: null, cooldownSkipped: [], filteredThoughts: [], notes: [] };
   try {
     const { data } = await supabase.from('world_thoughts_cheng')
-      .select('id, content').eq('status', 'active')
+      .select('id, content, salience, status, source_type, created_at').eq('status', 'active')
       .order('salience', { ascending: false }).order('created_at', { ascending: false }).limit(15);
     const now = Date.now();
+    rec.activeThoughtsSnapshot = (data || []).map(t => ({ id: t.id, content: t.content, salience: t.salience, status: t.status, source_type: t.source_type, created_at: t.created_at }));
     for (const t of data || []) {
       const c = String(t.content || '').trim();
       if (!c) continue;
       const hit = SURFACE_DENYLIST.find(w => c.includes(w));
-      if (hit) { console.warn(`[thought-surfacing] filtered thought id=${t.id} reason=unsafe_content hit="${hit}" content="${c}"`); continue; }
-      if (now - (surfaceCooldown.get(t.id) || 0) < SURFACE_COOLDOWN_MS) continue; // 10min 内已浮现过，跳过
+      if (hit) {
+        console.warn(`[thought-surfacing] filtered thought id=${t.id} reason=unsafe_content hit="${hit}" content="${c}"`);
+        rec.filteredThoughts.push({ id: t.id, content: c, filtered_reason: 'unsafe_content', matched_word: hit, log_time: new Date().toISOString() });
+        continue;
+      }
+      const last = surfaceCooldown.get(t.id) || 0;
+      if (now - last < SURFACE_COOLDOWN_MS) {
+        rec.cooldownSkipped.push({ id: t.id, content: c, last_shown_at: new Date(last).toISOString(), skipped_reason: 'cooldown_10min' });
+        continue;
+      }
       surfaceCooldown.set(t.id, now);
+      rec.selectedThought = { id: t.id, content: c, salience: t.salience, reason: 'selected_for_world_surfacing' };
+      rec.injectedBlock = c;
+      pushPickHistory(rec);
       return c; // 只给事实 content，不带 salience/category/source_type/metadata
     }
+    rec.notes.push('no_eligible_thought');
+    pushPickHistory(rec);
     return '';
-  } catch (e) { console.warn('[thought-surfacing] pick 失败:', e.message); return ''; }
+  } catch (e) { rec.notes.push('error:' + e.message); pushPickHistory(rec); console.warn('[thought-surfacing] pick 失败:', e.message); return ''; }
+}
+
+// 世界唤醒包 build 后调用：扫 package 文本里有没有 <小世界浮现>（tripwire，正常恒 false）。只观测、不读 pick、不注入。
+export function recordWakeInjectionScan(packageText) {
+  const has = /<小世界浮现>/.test(String(packageText || ''));
+  worldWakeInjectionLatest = has;
+  wakeInjectionHistory.push({ checkedAt: new Date().toISOString(), hasWorldSurfacingTag: has, matchedTag: has ? '<小世界浮现>' : null, notes: [] });
+  if (wakeInjectionHistory.length > 20) wakeInjectionHistory.shift();
+  if (has) console.warn('[thought-surfacing] ⚠️ 回归告警：世界唤醒包里出现 <小世界浮现>');
+}
+
+// 只读 debug 观测（不重新 pick、不触发 collector、不改 cooldown/状态/库）。pickHistory 只管聊天决策；
+// worldWakeInjectionLatest / wakeInjectionHistory 单独管唤醒包扫描。倒序返回。
+export function getSurfacingDebug() {
+  return {
+    pickHistory: [...pickHistory].reverse(),
+    latestPick: pickHistory[pickHistory.length - 1] || null,
+    worldWakeInjectionLatest,
+    wakeInjectionHistory: [...wakeInjectionHistory].reverse(),
+  };
 }
 
 // ── 入口：collector（内存锁，防 tick + 手动并发）──────────────
