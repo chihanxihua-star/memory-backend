@@ -31,6 +31,7 @@ import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } fro
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
+import { buildNowInner, loadNarrationRules } from './world-narration.js';
 import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd } from './world-workday.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
@@ -655,15 +656,11 @@ const lastWorldWakeAt = new Map();             // eventKey -> 上次触发时间
 const WORLD_PHONE_RATE_MS = 10 * 60 * 1000;    // WORLD_MESSAGE phone：自动唤醒 10 分钟最多 1 条
 let lastWorldPhoneAt = 0;                       // 上次 world phone 消息时间戳(ms)
 
-function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHintLine = '', envWeather = '', envDateWeek = '') {
+// 12A：唤醒包用统一 <此刻>（澄第一人称身体/环境自述 + 小茉莉第三人称，nowBlock 由调用方 buildNowInner 生成），
+// 不再展示状态栏数字、不再展示感受字段。事件/选项/标签说明仍在唤醒包里（不开放整包编辑，保解析链）。
+function buildWorldWakePrompt(event, pendingContext = null, todoHintLine = '', nowBlock = '') {
   const opts = event.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
-  // pending_wake 续集：在完整模板的原因后加一段上下文，其余（时间/位置/天气/完整状态/选项）照常，
-  // 让澄看到此刻的完整状态重新判断，而不是只收一句补充说明（补充2）。
   const pendingLine = pendingContext ? `\n补充：${pendingContext}` : '';
-  // 第 6/7 步：带上澄自己的位置+正在做什么，以及小茉莉的在家/位置/正在/备注（只传信息，不做行为限制）。
-  // 措辞用澄的口吻（"她在/她正在/她说"），不用生硬的 user/presence 标签。
-  const u = user || {};
-  const noteLine = u.custom_note ? `\n她说：${u.custom_note}` : '';
   // 11B：NPC 在场提示；WORLD_MESSAGE 引导只在适合联系小茉莉的事件出现（普通工作事件不主动提醒，
   // 澄想发后端照样解析）；含「约见」选项的事件给明确的约见出口。
   const npcLine = event.npc ? `\n在场：${event.npc}` : '';
@@ -684,18 +681,10 @@ function buildWorldWakePrompt(event, s, pendingContext = null, user = {}, todoHi
 `;
   return `【世界唤醒】
 原因：${event.reason}${npcLine}${pendingLine}
-时间：${s.world_time}${envDateWeek ? `\n日期：${envDateWeek}` : ''}
-位置：${s.location}
-你正在：${s.activity || '工作'}
-天气：${envWeather || s.weather}
 
-小茉莉此刻：${u.presence || '在家'}
-她在：${u.location || '家 · 客厅'}
-她正在：${u.activity || '休息'}${noteLine}${todoHintLine ? `\n${todoHintLine}` : ''}
-
-你的状态：
-体力 ${s.energy}，饱腹 ${s.satiety}，清洁 ${s.cleanliness}，健康 ${s.health}，
-压力 ${s.stress}，注意力 ${s.focus}，心情 ${s.mood}，想念 ${s.longing}
+<此刻 — 仅你可见的现实情境>
+${nowBlock}
+</此刻>${todoHintLine ? `\n${todoHintLine}` : ''}
 
 你可以选择：
 ${opts}
@@ -732,18 +721,18 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   // 待办急切度提醒（也在 check-and-set 之前）。line 进 prompt；remindedTodoId 等唤醒真发出后再更新时间。
   const todoHint = await getTodoHint();
 
-  // 10A：天气来自 world_environment_cheng（现实同步），不暴露城市名。读不到回退 character_status.weather。
-  // 10B：顺带带上现实日期/星期。
-  let envWeather = '', envDateWeek = '';
+  // 12A：env(现实 date + 粗天气) + 自述规则 → 统一 <此刻>（澄第一人称身体自述 + 小茉莉第三人称）。
+  // 与聊天 md 的 <此刻> 共用 world-narration.js#buildNowInner。不暴露城市/数字/感受字段。
+  let nowBlock = '';
   try {
+    let envForNarr = {};
     const { data: envRow } = await supabase
       .from('world_environment_cheng')
-      .select('date, weekday, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
-    if (envRow && envRow[0]) {
-      envWeather = formatWeather(envRow[0]);
-      envDateWeek = [envRow[0].date, envRow[0].weekday].filter(Boolean).join(' ');
-    }
-  } catch (e) { console.warn('[WORLD] 读环境天气失败:', e.message); }
+      .select('date, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
+    if (envRow && envRow[0]) envForNarr = { date: envRow[0].date, weather: formatWeather(envRow[0]) };
+    const rules = await loadNarrationRules();
+    nowBlock = buildNowInner(status, envForNarr, userStatus, rules.phrases, rules.templates);
+  } catch (e) { console.warn('[WORLD] 生成 <此刻> 失败:', e.message); }
 
   if (!cc.isRunning() || activeTurn || pendingBuffer) {
     console.log('[WORLD] CC 忙或未运行，唤醒跳过');
@@ -761,7 +750,7 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   const eventForTurn = (typeof event.optionsFor === 'function')
     ? { ...event, options: event.optionsFor(status) }
     : event;
-  const prompt = buildWorldWakePrompt(eventForTurn, status, pendingContext, userStatus, todoHint.line, envWeather, envDateWeek);
+  const prompt = buildWorldWakePrompt(eventForTurn, pendingContext, todoHint.line, nowBlock);
   activeTurn = {
     ws: null, conversationId: null, silent: true,
     settings: null, tools: [],
@@ -853,7 +842,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
 
   // 读-改-写：resolveEffects 算生活状态（0-100 钳位）+ 固定 effects（wallet 封底 0）+ target_location/activity。
   let updatedStatus = null;
-  let effResolved = {}, effFixed = {};
+  let effResolved = {}, effFixed = {}, effIgnored = {};
   try {
     const { data: rows, error } = await supabase
       .from('character_status_cheng').select('*').eq('name', '澄').limit(1);
@@ -864,8 +853,8 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
         eventId: event.key || null,
         eventType: turn.worldEvent?.isRandom ? 'random' : (option.action_id ? 'action' : 'wake'),
       });
-      const { resolved, fixed, merged } = computeDeltas(row, effSource, ctx);
-      effResolved = resolved; effFixed = fixed;
+      const { resolved, fixed, merged, ignored } = computeDeltas(row, effSource, ctx);
+      effResolved = resolved; effFixed = fixed; effIgnored = ignored;
       const patch = { updated_at: new Date().toISOString(), ...applyDeltas(row, merged) };
       if (targetLoc) patch.location = targetLoc;
       if (targetAct) patch.activity = targetAct;
@@ -922,14 +911,14 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → 世界唤醒解析失败，默认选择：${option.label}`,
-        detail: { choice: option.id, reason: '', event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
+        detail: { choice: option.id, reason: '', event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, ignored_effects: effIgnored, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
         source: 'system_error',
       });
     } else {
       const { data: tl, error: te } = await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → ${option.label}`,
-        detail: { choice: option.id, reason, event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, item: option.item || null, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
+        detail: { choice: option.id, reason, event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, ignored_effects: effIgnored, item: option.item || null, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
         source: 'claude',
       }).select('id').single();
       if (te) throw te;
@@ -2748,6 +2737,53 @@ app.post('/api/world/work', async (req, res) => {
     const r = await forceWorkOp(op);
     if (r.ok) return res.json({ ok: true, status: r.status });
     return res.status(400).json({ ok: false, error: r.error });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 12A：澄自述短语/模板 CRUD（world-home「自述规则」编辑器用；只编辑 <此刻> 自述，不开放整包唤醒模板）。
+app.get('/api/world/narration', async (req, res) => {
+  try {
+    const [ph, tpl] = await Promise.all([
+      supabase.from('world_self_narration_phrases').select('*').order('stat', { ascending: true }).order('min_value', { ascending: true }),
+      supabase.from('world_self_narration_templates').select('*').order('created_at', { ascending: true }),
+    ]);
+    res.json({ phrases: ph.data || [], templates: tpl.data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/narration/phrase', async (req, res) => {
+  const { stat, min_value, max_value, phrase, tone, enabled } = req.body || {};
+  if (!stat || phrase == null) return res.status(400).json({ error: '缺少 stat/phrase' });
+  try {
+    const { data, error } = await supabase.from('world_self_narration_phrases')
+      .insert({ stat, min_value: min_value ?? 0, max_value: max_value ?? 100, phrase, tone: tone || 'neutral', enabled: enabled !== false }).select().single();
+    if (error) throw error;
+    res.json({ ok: true, phrase: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/world/narration/phrase/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('world_self_narration_phrases')
+      .update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ ok: true, phrase: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/narration/template', async (req, res) => {
+  const { template, enabled } = req.body || {};
+  if (!template) return res.status(400).json({ error: '缺少 template' });
+  try {
+    const { data, error } = await supabase.from('world_self_narration_templates')
+      .insert({ template, enabled: enabled !== false }).select().single();
+    if (error) throw error;
+    res.json({ ok: true, template: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/world/narration/template/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('world_self_narration_templates')
+      .update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ ok: true, template: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

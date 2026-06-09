@@ -8,6 +8,7 @@
 import fs from 'fs';
 import path from 'path';
 import { supabase } from './memory.js';
+import { buildNowInner, loadNarrationRules } from './world-narration.js';
 
 const FUXIAN_PATH = '/home/claude-user/.claude/CLAUDE.md';
 const FUXIAN_OPEN = '<浮现>';
@@ -194,47 +195,22 @@ async function gatherItems(userText) {
   }).slice(0, MAX_ITEMS);
 }
 
-// ─────── 补充：读 user 当前状态 → 一行，注入浮现最前（让聊天里的澄知道小茉莉在哪、在做啥）───────
-// 只读不写，不进长期记忆。读失败/空字段都给兜底，绝不产出 undefined。
-async function getUserStatusLine() {
+// ─────── 12A：<此刻> 内容（澄第一人称身体/环境自述 + 小茉莉第三人称）───────
+// 与世界唤醒包共用 world-narration.js#buildNowInner。只读不写。读失败返回空串，不影响原本浮现。
+async function buildNowStatusLine() {
   try {
-    const { data, error } = await supabase
-      .from('user_status_cheng')
-      .select('presence, location, activity, custom_note')
-      .eq('name', 'user')
-      .limit(1);
-    if (error) throw error;
-    const u = data && data[0];
-    if (!u) return '';
-    const presence = u.presence || '在家';
-    const location = u.location || '家 · 客厅';
-    const activity = u.activity || '休息';
-    const note = u.custom_note ? `（${u.custom_note}）` : '';
-    return `小茉莉当前状态：${presence} · ${location}，正在${activity}${note}`;
-  } catch (e) {
-    console.warn('[surfacing] 读 user_status 失败，跳过状态注入:', e.message);
-    return ''; // 不影响原本浮现
-  }
-}
-
-// ─────── 补充：读澄自己的当前状态 → 一行，注入 <此刻>（让聊天里的澄知道自己几点、在哪、在做啥）───────
-// 不然澄只知道小茉莉在哪、不知道自己已经下班到家，会靠旧上下文猜（比如以为还在加班）。只读不写。
-async function getChengStatusLine() {
-  try {
-    const { data, error } = await supabase
-      .from('character_status_cheng')
-      .select('world_time, location, activity')
-      .eq('name', '澄')
-      .limit(1);
-    if (error) throw error;
-    const c = data && data[0];
-    if (!c) return '';
-    const wt = c.world_time ? `现在 ${c.world_time}，` : '';
-    const loc = c.location || '家 · 客厅';
-    const act = c.activity || '休息';
-    return `${wt}你在 ${loc}，${act}`;
-  } catch (e) {
-    console.warn('[surfacing] 读 character_status 失败，跳过澄自身状态注入:', e.message);
+    const [cs, us, env, rules] = await Promise.all([
+      supabase.from('character_status_cheng').select('world_time, location, activity, energy, satiety, cleanliness, health').eq('name', '澄').limit(1),
+      supabase.from('user_status_cheng').select('presence, location, activity').eq('name', 'user').limit(1),
+      supabase.from('world_environment_cheng').select('date').eq('name', 'default').limit(1),
+      loadNarrationRules(),
+    ]);
+    const cheng = (cs.data && cs.data[0]) || {};
+    const user = (us.data && us.data[0]) || {};
+    const e = (env.data && env.data[0]) || {};
+    return buildNowInner(cheng, e, user, rules.phrases, rules.templates);
+  } catch (err) {
+    console.warn('[surfacing] 生成 <此刻> 失败:', err.message);
     return '';
   }
 }
@@ -247,9 +223,8 @@ async function getChengStatusLine() {
 export async function surfaceForInject(userText) {
   if (!userText || typeof userText !== 'string') return { statusLine: '', text: '', items: [] };
 
-  // 总是带上（绕过冷却）：澄自己的状态在前、小茉莉的状态在后，都进 <此刻>，实时反映世界。
-  const [chengLine, userLine] = await Promise.all([getChengStatusLine(), getUserStatusLine()]);
-  const statusLine = [chengLine, userLine].filter(Boolean).join('\n');
+  // 12A：澄第一人称身体/环境自述 + 小茉莉第三人称，统一 buildNowInner 生成（与世界唤醒包共用逻辑）。
+  const statusLine = await buildNowStatusLine();
 
   turnsSinceLast += 1;
   if (turnsSinceLast < COOLDOWN) return { statusLine, text: '', items: [] };

@@ -90,12 +90,13 @@ export async function advanceOneTick() {
   const row = rows && rows[0];
   if (!row) throw new Error('character_status_cheng 没有澄那一行');
 
+  // 12A 止血：只保留身体/生活字段的物理衰减。longing 等感受字段不再每 tick 自动增长
+  //（历史值原样冻结，不 drop 字段；以后 12B 改成后台 salience/weight）。
   const patch = {
     world_time: advanceHour(row.world_time),
     energy: clamp(row.energy - 2, 0, 100),      // 体力 下限 0
     satiety: clamp(row.satiety - 3, 0, 100),    // 饱腹 下限 0
     cleanliness: clamp(row.cleanliness - 1, 0, 100), // 清洁 下限 0
-    longing: clamp(row.longing + 1, 0, 100),    // 想念 上限 100
     updated_at: new Date().toISOString(),
   };
 
@@ -115,7 +116,7 @@ export async function advanceOneTick() {
       world_time: updated.world_time,
       location: row.location,
       action: '自然衰减',
-      detail: { energy: -2, satiety: -3, cleanliness: -1, longing: 1 },
+      detail: { energy: -2, satiety: -3, cleanliness: -1 },
       source: 'tick',
     });
   if (e3) console.error('[WORLD] 行程表写入失败:', e3.message);

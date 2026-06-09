@@ -35,11 +35,11 @@ export function getAvailableActions(location) {
 // 10C：用全局结算器把 action 的 effects_hint(生活状态) + effects(固定金额) 算成 patch（不写库）。
 // 返回 { patch, resolved, fixed }：patch 落库；resolved/fixed 进 timeline detail。普通项 0-100 钳位、wallet 封底 0。
 export function computeActionPatch(action, row, context) {
-  const { resolved, fixed, merged } = computeDeltas(row, action, context || buildEffectContext(row, { eventId: null, eventType: 'action' }));
+  const { resolved, fixed, merged, ignored } = computeDeltas(row, action, context || buildEffectContext(row, { eventId: null, eventType: 'action' }));
   const patch = { updated_at: new Date().toISOString(), ...applyDeltas(row, merged) };
   if (action.target_location) patch.location = action.target_location;
   if (action.target_activity) patch.activity = action.target_activity;
-  return { patch, resolved, fixed };
+  return { patch, resolved, fixed, ignored };
 }
 
 // 执行一个行为：检查 allowed → 应用 → 写 character_status + daily_timeline(source=action)。
@@ -61,7 +61,7 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
     throw e;
   }
 
-  const { patch, resolved, fixed } = computeActionPatch(action, row);
+  const { patch, resolved, fixed, ignored } = computeActionPatch(action, row);
   const { data: up, error: e2 } = await supabase
     .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
   if (e2) throw e2;
@@ -76,6 +76,7 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
         effects_hint: action.effects_hint || [],
         effects_resolved: resolved,
         effects_fixed: fixed,
+        ignored_effects: ignored,
         from_location: fromLoc, to_location: up.location, activity: up.activity,
       },
       source: 'action',

@@ -39,15 +39,28 @@ export function resolveEffects(status, effectsHint, context = {}) {
   return out;
 }
 
-// 从事件/行为里拆出 hint + fixed，算出 resolved/fixed/merged deltas（未钳位）。
-// 优先级：有 effects_hint → resolveEffects 管生活状态；effects 只当固定值(钱包等)。无 hint → effects 当旧逻辑(全是 fixed)。
+// 12A 止血：只让身体/生活字段进状态栏结算。感受字段（mood/longing/libido/social/stress/focus/comfort）
+// 不再更新 character_status，但把原始 hint 方向收进 ignored，写 timeline.detail.ignored_effects 供 12B 回收。
+export const BODY_STATS = ['energy', 'satiety', 'cleanliness', 'health'];
+const IGNORED_STATS = ['mood', 'longing', 'libido', 'social', 'stress', 'focus', 'comfort'];
+
+// 从事件/行为里拆出 hint + fixed，算出 resolved(只身体)/fixed/merged/ignored。
+// 优先级：有 effects_hint → resolveEffects 管身体状态；effects 只当固定值(钱包等)。无 hint → effects 当旧逻辑(fixed)。
 export function computeDeltas(status, source, context = {}) {
   const hint = (source && source.effects_hint) || [];
   const fixed = (source && source.effects) || {};
-  const resolved = hint.length ? resolveEffects(status, hint, context) : {};
+  const bodyHint = hint.filter(h => h && BODY_STATS.includes(h.stat));
+  const resolved = bodyHint.length ? resolveEffects(status, bodyHint, context) : {};
+  // 被忽略的感受字段：记原始方向（不 roll、不更新状态）
+  const ignored = {};
+  for (const h of hint) if (h && IGNORED_STATS.includes(h.stat)) ignored[h.stat] = h.direction;
+  // merged 只放身体 resolved + 允许的固定值（wallet_balance / 身体字段）；感受类固定值也忽略
   const merged = { ...resolved };
-  for (const [k, v] of Object.entries(fixed)) merged[k] = (merged[k] || 0) + v;
-  return { resolved, fixed, merged };
+  for (const [k, v] of Object.entries(fixed)) {
+    if (k === 'wallet_balance' || BODY_STATS.includes(k)) merged[k] = (merged[k] || 0) + v;
+    else if (IGNORED_STATS.includes(k)) ignored[k] = v > 0 ? 'up' : 'down';
+  }
+  return { resolved, fixed, merged, ignored };
 }
 
 // deltas → character_status patch（普通项 0-100 钳位；wallet_balance 只封底 0）。
