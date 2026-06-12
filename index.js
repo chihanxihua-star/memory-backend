@@ -1232,6 +1232,15 @@ async function firePendingWake(row) {
   if (error) return { fired: false, reason: error.message };
   const status = rows && rows[0];
   if (!status) return { fired: false, reason: 'no_status_row' };
+  // 饱了别唤醒：续唤醒到点先复验事件自身的触发条件（hungry=satiety<30）。这期间她通过别的
+  // 路径吃饱了就静默作废这条 pending、不打扰澄；之后真饿了由普通 tick 自动检测重新走正常流程。
+  try {
+    if (typeof def.trigger === 'function' && !def.trigger(status)) {
+      console.log(`[PENDING] ${row.wake_type} 到点但触发条件已不满足（如已吃饱），静默作废 ${row.id}`);
+      await supabase.from('pending_wake_cheng').update({ status: 'cancelled' }).eq('id', row.id);
+      return { fired: true, system: true };
+    }
+  } catch (e) { console.warn('[PENDING] 触发条件复验异常，按原逻辑继续:', e.message); }
   const event = { key: row.wake_type, ...def };
   const delay = row.payload?.delay_world_minutes || 10;
   const pendingContext = `${delay} 分钟前你选择了先忍着，现在时间到了，需要重新判断要不要处理饥饿。`;
