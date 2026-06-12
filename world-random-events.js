@@ -29,17 +29,9 @@ export const RANDOM_EVENTS = {
       { id: 3, label: '不去，专心干活', effects_hint: [{ stat: 'focus', direction: 'up', strength: 'tiny' }], target_activity: '工作' },
     ],
   },
-  rain_offwork: {
-    id: 'rain_offwork', label: '下班下雨', reason: '到点下班了，外面正下着雨',
-    locations: ['公司 · 工位', '公司 · 休息室', '公司 · 茶水间'], time_range: ['17:30', '20:00'],
-    weather_required: '雨', // weather_text 含「雨」才自动触发（手动测试绕过）
-    probability: 0.6, cooldown_world_minutes: 720, once_per_day: true,
-    options: [
-      { id: 1, label: '在休息室等雨小点再走', effects_hint: [{ stat: 'stress', direction: 'up', strength: 'tiny' }, { stat: 'energy', direction: 'down', strength: 'tiny' }], target_location: '公司 · 休息室', target_activity: '等雨' },
-      { id: 2, label: '冒雨跑回家', effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'medium' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'stress', direction: 'up', strength: 'small' }], target_activity: '冒雨赶路' },
-      { id: 3, label: '打车回家', effects_hint: [{ stat: 'comfort', direction: 'up', strength: 'small' }, { stat: 'stress', direction: 'down', strength: 'tiny' }], effects: { wallet_balance: -25 }, target_activity: '打车回家' },
-    ],
-  },
+  // rain_offwork（下班下雨）已收编进下班链（2026-06-12）：16 点 offwork_choice 雨天版接管
+  // （打车/地铁淋雨/等雨小），避免跟系统下班判断穿帮（人已到家还弹"到点下班了"）。定义删除，
+  // 想找原版选项看 git 历史或 CHANGELOG 当日条目。
   convenience_newproduct: {
     id: 'convenience_newproduct', label: '便利店新品', reason: '路过便利店，看到上了新品',
     locations: ['外出 · 商场', '外出 · 路上', '家 · 客厅'],

@@ -32,7 +32,7 @@ import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 import { buildNowInner, loadNarrationRules, generateChengSelfNarration, realWorldTime } from './world-narration.js';
-import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd } from './world-workday.js';
+import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd, setOffWorkHandler, setEveningStarter } from './world-workday.js';
 import { collectWorldThoughts, recordWakeInjectionScan, getSurfacingDebug } from './world-thoughts.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
@@ -937,6 +937,20 @@ function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE) {
   return steps;
 }
 
+// 下班通勤链（用户 6/12 定）：选了什么工具状态栏就走那个标签；地铁多一段"从地铁站走回家"；
+// 终点=家·客厅"下班回家后休息"。复用 COMMUTE_OPTS 的时长/费用（打车 ¥30 在链里扣）。
+function buildEveningRoutine(cm = 'subway') {
+  const steps = [];
+  if (cm === 'subway') {
+    steps.push({ ...COMMUTE_OPTS.subway });                                    // 坐地铁 13-17
+    steps.push({ activity: '从地铁站走回家', location: '外出 · 路上', dur: [3, 9] });
+  } else {
+    steps.push({ ...(COMMUTE_OPTS[cm] || COMMUTE_OPTS.subway) });              // 打车 8-12(-¥30) / 走路 22-28
+  }
+  steps.push({ activity: '下班回家后休息', location: '家 · 客厅', dur: null });   // 终点
+  return steps;
+}
+
 // 午休"吃→休息"小链（等小茉莉没等到→自己吃→吃完歇会儿→回午休基线）。method 决定怎么吃。
 const LUNCH_EAT = {
   snack:   { activity: '吃零食', location: '公司 · 休息室', dur: [8, 15],  cost: 0 },
@@ -955,7 +969,17 @@ function buildLunchRoutine(method = 'snack') {
 function getRoutineSteps(routineName, opts = {}) {
   if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm);
   if (routineName === 'lunch') return buildLunchRoutine(opts.method);
+  if (routineName === 'evening') return buildEveningRoutine(opts.cm);
   return [];
+}
+
+// 现在下没下雨：读 weather-fetcher 写的真实天气（45 分钟一更）。读失败按没下雨。
+async function isRainingNow() {
+  try {
+    const { data } = await supabase.from('world_environment_cheng')
+      .select('weather_text').eq('name', 'default').limit(1);
+    return /雨/.test((data && data[0] && data[0].weather_text) || '');
+  } catch { return false; }
 }
 
 // 吃一份成品早餐：先清过期，再从有货的里按"最快到期"扣一份（扣到 0 删行）。返回吃的成品名；没货返回 null。
@@ -1148,6 +1172,42 @@ async function firePendingWake(row) {
     await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method });
     return { fired: true, system: true };
   }
+  // 下班选择包（用户 6/12 定）：16 点没骰中加班 → 排这条 pending（daemon 自带 cc_busy 重试）。
+  // 晴天=地铁/走路；雨天=打车/地铁淋雨/等雨小（等过一次就不再给"等"，防循环）。选完 start_routine 进 evening 链。
+  if (row.wake_type === 'offwork_choice') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    if (!String(status.location || '').startsWith('公司')) {
+      console.log('[OFFWORK] 人已不在公司，下班选择作废');
+      return { fired: true, system: true };
+    }
+    const raining = await isRainingNow();
+    const waited = !!(row.payload && row.payload.waited);
+    let options;
+    if (raining) {
+      options = [
+        { id: 1, label: '打车回家（¥30）', start_routine: 'evening', routine_opts: { cm: 'taxi' } },
+        { id: 2, label: '坐地铁，淋一段路', start_routine: 'evening', routine_opts: { cm: 'subway' },
+          effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }] },
+      ];
+      if (!waited) options.push({
+        id: 3, label: '在公司等雨小一点', effects: {},
+        pending: { wake_type: 'offwork_choice', delay_world_minutes: 25, reason: '等了一阵雨，差不多该回家了', payload_extra: { waited: true } },
+      });
+    } else {
+      options = [
+        { id: 1, label: '坐地铁回家', start_routine: 'evening', routine_opts: { cm: 'subway' } },
+        { id: 2, label: '走路回家', start_routine: 'evening', routine_opts: { cm: 'walk' } },
+      ];
+    }
+    const event = {
+      key: raining ? 'offwork_choice_rain' : 'offwork_choice',
+      reason: raining ? '到点下班了，外面正下着雨' : '到点下班了，收拾收拾回家吧',
+      options, wmHint: false,
+    };
+    return await triggerWorldWake(event, status, { force: true });
+  }
   // 第1块·作息弹选择 — 早晨起床（工作日约 8:00 触发；现在靠手动/pending 测，自动到点要等第0块开 tick）。
   // 起床=1次 engage：①起床洗漱（→洗漱走流程，后续接早饭/通勤=下个增量）②再睡10分钟（排 pending 重问）
   // ③翘班（扣 120≈一天工资，留在家）。force=确保到点必发、不被 30min 冷却挡（每天就这一下）。
@@ -1246,6 +1306,30 @@ async function firePendingWake(row) {
   const pendingContext = `${delay} 分钟前你选择了先忍着，现在时间到了，需要重新判断要不要处理饥饿。`;
   return await triggerWorldWake(event, status, { pendingContext });
 }
+
+// 下班链钩子注入（world-workday 不 import index，靠注入避免循环依赖）。
+// 加班：提示型唤醒（单确认项，没得选；CC 忙就不提示，加班照走）。
+// 正常下班：排 offwork_choice pending——daemon 自带 cc_busy 重试，不用自己兜。
+setOffWorkHandler(async (row, { overtime }) => {
+  if (overtime) {
+    const event = {
+      key: 'overtime_notice', reason: '老板发话，今天的活得收个尾才能走',
+      options: [{ id: 1, label: '知道了，继续干', effects: {} }], wmHint: false,
+    };
+    return await triggerWorldWake(event, row, { force: true });
+  }
+  await supabase.from('pending_wake_cheng').insert({
+    wake_type: 'offwork_choice', reason: '到点下班，选怎么回家', status: 'queued',
+    scheduled_at: new Date().toISOString(), payload: {}, attempts: 0,
+  });
+  console.log('[OFFWORK] 已排下班选择包');
+  return { fired: true };
+});
+// 加班结束：静默走 evening 链回家，雨天自动偏成打车（不再问）。
+setEveningStarter(async () => {
+  const cm = (await isRainingNow()) ? 'taxi' : 'subway';
+  await advanceRoutine('evening', 0, { cm });
+});
 
 // 世界唤醒轮收尾：解析澄的选择 → 读-改-写状态结算 effects → 写行程表。
 // [MEMORY:] 已在 turn_done 上方 parseMemoryTags 自动入库，这里不处理。

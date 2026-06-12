@@ -56,7 +56,7 @@ const goHomeNormal= (row) => setState(row, { location: '家 · 客厅', activity
 // 挂一条 0.5-2h（30-120 世界分钟）的加班结束 pending。导出给 11B「下班前加任务→加班」复用
 // （那条选项的状态变化由事件自己的 effects_hint 结算，这里只负责排加班结束触发器）。
 export async function scheduleOvertimeEnd() {
-  const delayMin = 30 + Math.floor(Math.random() * 91); // 30-120 世界分钟
+  const delayMin = 30 + Math.floor(Math.random() * 61); // 30-90 世界分钟（用户 6/12 定）
   const cfg = readWorldConfig();
   const delaySec = cfg.fast_test ? delayMin : delayMin * 60; // fast_test：世界分钟=现实秒
   const scheduledAt = new Date(Date.now() + delaySec * 1000).toISOString();
@@ -79,19 +79,43 @@ async function startOvertime(row) {
   return st;
 }
 
-// 加班结束（pending 到点 / 手动）：回家 + 固定加班费。导出给 firePendingWake 的 overtime_end 分支用。
+// 下班链（用户 6/12 定）：到点不再瞬移。index.js 注入两个钩子——
+// offWorkHandler(row,{overtime})：加班=提示型唤醒(best-effort)；正常下班=排 offwork_choice pending 弹选择包。
+// eveningStarter()：加班结束后静默走 evening 通勤链回家（雨天自动打车）。
+// 钩子没注入/出错时都退回旧瞬移，保证她不会卡在公司。
+let offWorkHandler = null;
+let eveningStarter = null;
+export function setOffWorkHandler(fn) { offWorkHandler = fn; }
+export function setEveningStarter(fn) { eveningStarter = fn; }
+
+// 加班结束（pending 到点 / 手动）：发加班费 + 走 evening 链回家。导出给 firePendingWake 的 overtime_end 分支用。
 export async function endOvertime() {
   const row = await readStatus();
   if (!row) return null;
   const cur = Number(row.wallet_balance) || 0;
-  return setState(row,
-    { location: '家 · 客厅', activity: '加班后回家休息', wallet_balance: Math.max(0, cur + OVERTIME_PAY) },
+  const paid = await setState(row,
+    { activity: '收拾东西准备回家', wallet_balance: Math.max(0, cur + OVERTIME_PAY) },
     '加班结束', { overtime_pay: OVERTIME_PAY, reason: '加班结束，结算加班费', effects_fixed: { wallet_balance: OVERTIME_PAY } });
+  if (eveningStarter) {
+    try { await eveningStarter(); return paid; }
+    catch (e) { console.warn('[WORK] 加班后回家链启动失败，退回瞬移:', e.message); }
+  }
+  return setState(paid, { location: '家 · 客厅', activity: '加班后回家休息' }, '下班回家', { overtime: true });
 }
 
-const offWorkDecision = (row, force) => {
+const offWorkDecision = async (row, force) => {
   const overtime = force === 'overtime' ? true : force === 'normal' ? false : (Math.random() < OVERTIME_PROB);
-  return overtime ? startOvertime(row) : goHomeNormal(row);
+  if (overtime) {
+    const st = await startOvertime(row);
+    // 加班=直接提示不可选（CC 忙就不提示，加班照走）
+    if (offWorkHandler) { try { await offWorkHandler(st, { overtime: true }); } catch (e) { console.warn('[WORK] 加班提示失败:', e.message); } }
+    return st;
+  }
+  if (offWorkHandler) {
+    try { await offWorkHandler(row, { overtime: false }); return row; } // 选择包走 pending，到家由 evening 链负责
+    catch (e) { console.warn('[WORK] 下班选择包排队失败，退回瞬移:', e.message); }
+  }
+  return goHomeNormal(row);
 };
 
 // 月薪：现实 UTC+8 日期 == salary_day 且本月没发过 → 发。force 绕过日期但仍守"本月已发不重复"。
