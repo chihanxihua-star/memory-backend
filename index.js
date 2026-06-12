@@ -1226,21 +1226,24 @@ async function firePendingWake(row) {
     const kind = await badWeatherKind(); // '' | '雨' | '雪'
     const waited = !!(row.payload && row.payload.waited);
     let options;
+    // 顺序有讲究：解析失败兜底=最后一项，所以「坐地铁」垫底当安全默认（start_routine 解析失败也执行，能真回家）。
     if (kind) {
       options = [
         { id: 1, label: '打车回家（¥30）', start_routine: 'evening', routine_opts: { cm: 'taxi', bad_weather: true } },
-        { id: 2, label: kind === '雪' ? '坐地铁，踩着雪走一段' : '坐地铁，淋一段路',
-          start_routine: 'evening', routine_opts: { cm: 'subway', bad_weather: true },
-          effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }] },
       ];
       if (!waited) options.push({
-        id: 3, label: `在公司等${kind}小一点`, effects: {},
+        id: 2, label: `在公司等${kind}小一点`, effects: {},
         pending: { wake_type: 'offwork_choice', delay_world_minutes: 25, reason: `等了一阵${kind}，差不多该回家了`, payload_extra: { waited: true } },
+      });
+      options.push({
+        id: options.length + 1, label: kind === '雪' ? '坐地铁，踩着雪走一段' : '坐地铁，淋一段路',
+        start_routine: 'evening', routine_opts: { cm: 'subway', bad_weather: true },
+        effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }],
       });
     } else {
       options = [
-        { id: 1, label: '坐地铁回家', start_routine: 'evening', routine_opts: { cm: 'subway' } },
-        { id: 2, label: '走路回家', start_routine: 'evening', routine_opts: { cm: 'walk' } },
+        { id: 1, label: '走路回家', start_routine: 'evening', routine_opts: { cm: 'walk' } },
+        { id: 2, label: '坐地铁回家', start_routine: 'evening', routine_opts: { cm: 'subway' } },
       ];
     }
     const event = {
@@ -1322,6 +1325,8 @@ async function firePendingWake(row) {
           payload_extra: { dish: dsh.name, qty: QTY, shelf } },
       };
     });
+    // 垫底安全默认（6/12）：解析失败会真扣备料钱但 pending 锁着菜做不出来——加一个无副作用的"先不预制"垫底。
+    options.push({ id: options.length + 1, label: '这周先不预制，到时候再说', effects: {} });
     const event = { key: 'cook_prep', reason: '这周早饭想做点啥？做好了放冰箱，平时热着吃', options, wmHint: false };
     return await triggerWorldWake(event, status, { force: true });
   }
@@ -1517,8 +1522,10 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       await advanceRoutine(option.start_routine, 0, opts);
     } catch (e) { console.warn('[WORLD] start_routine 失败:', e.message); }
   }
-  // engage 步（便利店选吃的）：选项带 continue_routine → 她选完后继续早晨链的下一步。
-  if (!parseFailed && option.continue_routine) {
+  // engage 步（便利店选吃的/交通选择）：选项带 continue_routine → 她选完后继续链的下一步。
+  // 6/12：去掉 !parseFailed 枷锁（同 start_routine 理由）——续链=纯移动，解析失败时链不该原地卡死；
+  // 便利店解析失败默认"不买了"（无扣钱）续链、交通选择默认"地铁"续链，都安全。
+  if (option.continue_routine) {
     const cr = option.continue_routine;
     try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm, bad_weather: cr.bad_weather }); }
     catch (e) { console.warn('[WORLD] continue_routine 失败:', e.message); }
