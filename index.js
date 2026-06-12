@@ -911,15 +911,21 @@ function computeIdleState(location) {
 const COMMUTE_OPTS = {
   subway: { activity: '坐地铁', location: '外出 · 路上', dur: [13, 17], cost: 0 },
   taxi:   { activity: '打车',   location: '外出 · 路上', dur: [8, 12],  cost: 30 },
-  walk:   { activity: '走路',   location: '外出 · 路上', dur: [22, 28], cost: 0 },
+  walk:   { activity: '走路',   location: '外出 · 路上', dur: [35, 46], cost: 0 }, // 6/12 基准 22-28→35-46
 };
+// 雨天通勤时长（6/12 用户定）：地铁+15-25、打车+5-10、走路+20-25。rain 标志随链 opts/payload 透传。
+const COMMUTE_RAIN_DUR = { subway: [28, 42], taxi: [13, 22], walk: [55, 71] };
+function commuteStep(cmKey, rain) {
+  const base = COMMUTE_OPTS[cmKey] || COMMUTE_OPTS.subway;
+  return rain ? { ...base, dur: COMMUTE_RAIN_DUR[cmKey] || base.dur } : { ...base };
+}
 const DEFAULT_BREAKFAST = 'cook';   // 自己做（周末预制，平时在家吃现成）
 const DEFAULT_COMMUTE   = 'subway';
 
 // 按早饭计划 bk + 通勤方式 cm 组出早晨链。cook：在家吃完再走；buy：路上买、到工位再吃（到岗早、开工晚）。
-function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE) {
+function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, rain = false) {
   const cmKey = COMMUTE_OPTS[cm] ? cm : DEFAULT_COMMUTE;
-  const commute = COMMUTE_OPTS[cmKey];
+  const commute = commuteStep(cmKey, rain);
   // 公司侧步行（6/12 加）：出地铁→公司 3-9 分，跟家侧"去地铁站"对称。仅地铁版，打车/走路门到门。
   const walkToCompany = { activity: '从地铁站走到公司', location: '外出 · 路上', dur: [3, 9] };
   const steps = [
@@ -944,14 +950,14 @@ function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE) {
 
 // 下班通勤链（用户 6/12 定）：选了什么工具状态栏就走那个标签；地铁多一段"从地铁站走回家"；
 // 终点=家·客厅"下班回家后休息"。复用 COMMUTE_OPTS 的时长/费用（打车 ¥30 在链里扣）。
-function buildEveningRoutine(cm = 'subway') {
+function buildEveningRoutine(cm = 'subway', rain = false) {
   const steps = [];
   if (cm === 'subway') {
     steps.push({ activity: '从公司走到地铁站', location: '外出 · 路上', dur: [3, 9] }); // 公司侧步行，跟早晨对称
-    steps.push({ ...COMMUTE_OPTS.subway });                                    // 坐地铁 13-17
+    steps.push(commuteStep('subway', rain));                                   // 晴 13-17 / 雨 28-42
     steps.push({ activity: '从地铁站走回家', location: '外出 · 路上', dur: [3, 9] });
   } else {
-    steps.push({ ...(COMMUTE_OPTS[cm] || COMMUTE_OPTS.subway) });              // 打车 8-12(-¥30) / 走路 22-28
+    steps.push(commuteStep(COMMUTE_OPTS[cm] ? cm : 'subway', rain));           // 打车 8-12/雨13-22(-¥30)、走路 35-46/雨55-71
   }
   steps.push({ activity: '下班回家后休息', location: '家 · 客厅', dur: null });   // 终点
   return steps;
@@ -973,9 +979,9 @@ function buildLunchRoutine(method = 'snack') {
 }
 
 function getRoutineSteps(routineName, opts = {}) {
-  if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm);
+  if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm, opts.rain);
   if (routineName === 'lunch') return buildLunchRoutine(opts.method);
-  if (routineName === 'evening') return buildEveningRoutine(opts.cm);
+  if (routineName === 'evening') return buildEveningRoutine(opts.cm, opts.rain);
   return [];
 }
 
@@ -1053,7 +1059,7 @@ async function advanceRoutine(routineName, idx, opts = {}) {
       await supabase.from('pending_wake_cheng').insert({
         wake_type: 'routine_step', reason: `${routineName}流程推进`, status: 'queued',
         scheduled_at: new Date(Date.now() + delaySec * 1000).toISOString(),
-        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method },
+        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method, rain: opts.rain },
         attempts: 0,
       });
     }
@@ -1073,7 +1079,7 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       if (!pool.length) { console.log('[BUY_FOOD] 食物表没"便利店成品"，跳过选购'); return false; }
       // Fisher-Yates 洗牌取最多 3 个
       for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-      const cont = { routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm };
+      const cont = { routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm, rain: opts.rain };
       const options = pool.slice(0, 3).map((f, i) => {
         const price = Number(f.price) || 0;
         return { id: i + 1, label: `${f.name}（¥${price}）`, effects: price ? { wallet_balance: -price } : {}, continue_routine: cont };
@@ -1175,7 +1181,7 @@ async function firePendingWake(row) {
       console.log(`[ROUTINE] 「${expected}」被打断（现在「${st?.activity}」），链中止`);
       return { fired: true, system: true };
     }
-    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method });
+    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method, rain: p.rain });
     return { fired: true, system: true };
   }
   // 下班选择包（用户 6/12 定）：16 点没骰中加班 → 排这条 pending（daemon 自带 cc_busy 重试）。
@@ -1331,10 +1337,10 @@ setOffWorkHandler(async (row, { overtime }) => {
   console.log('[OFFWORK] 已排下班选择包');
   return { fired: true };
 });
-// 加班结束：静默走 evening 链回家，雨天自动偏成打车（不再问）。
+// 加班结束：静默走 evening 链回家，雨天自动偏成打车（不再问），时长也按雨天加成。
 setEveningStarter(async () => {
-  const cm = (await isRainingNow()) ? 'taxi' : 'subway';
-  await advanceRoutine('evening', 0, { cm });
+  const rain = await isRainingNow();
+  await advanceRoutine('evening', 0, { cm: rain ? 'taxi' : 'subway', rain });
 });
 
 // 世界唤醒轮收尾：解析澄的选择 → 读-改-写状态结算 effects → 写行程表。
@@ -1460,13 +1466,15 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
   if (!parseFailed && option.start_routine) {
     try {
       const opts = option.routine_opts || await readWorldPlan(); // 午休带 method；早晨读周计划
+      // 雨况在链启动时定一次，随 opts/payload 透传整条链（雨天通勤时长加成；午休链无通勤步不受影响）
+      if (opts.rain === undefined) opts.rain = await isRainingNow();
       await advanceRoutine(option.start_routine, 0, opts);
     } catch (e) { console.warn('[WORLD] start_routine 失败:', e.message); }
   }
   // engage 步（便利店选吃的）：选项带 continue_routine → 她选完后继续早晨链的下一步。
   if (!parseFailed && option.continue_routine) {
     const cr = option.continue_routine;
-    try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm }); }
+    try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm, rain: cr.rain }); }
     catch (e) { console.warn('[WORLD] continue_routine 失败:', e.message); }
   }
   // 周末规划：选项带 set_plan → 写进 world_plan_cheng（下周早饭计划等）。
