@@ -2,6 +2,7 @@
 // 让小世界"自己会动"——时间在走、4 项基础状态在变。
 // 不接 AI、不加事件、不加地点、不做复杂联动。
 import { supabase } from './memory.js';
+import { realWorldTime } from './world-narration.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -113,7 +114,7 @@ export async function advanceOneTick() {
   const { error: e3 } = await supabase
     .from('daily_timeline_cheng')
     .insert({
-      world_time: updated.world_time,
+      world_time: realWorldTime(),
       location: row.location,
       action: '自然衰减',
       detail: { energy: -2, satiety: -3, cleanliness: -1 },

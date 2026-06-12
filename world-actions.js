@@ -4,6 +4,46 @@
 // 行为瞬间完成，不消耗世界时间（行为耗时系统以后再做）。
 import { supabase } from './memory.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
+import { realWorldTime } from './world-narration.js';
+import { readWorldConfig } from './world-tick.js';
+
+// ── 行为自动结束（第二步·地基）────────────────────────────
+// 她进入的「行为」（activity）会有时长，到点静默收尾（清成闲着/工作），治"卡死在一个行为上"。
+// 时长分长/中/短三桶（世界分钟≈现实分钟），随机抽；豁免=作息/加班自管的状态，不自动结束。
+const ACTIVITY_EXEMPT = new Set(['工作', '午休', '加班', '加班处理任务', '等小茉莉', '预制早餐']);
+const ACTIVITY_LONG  = new Set(['休息', '做饭', '点外卖', '开会', '走神开会', '下班回家后休息', '加班后回家休息']);
+const ACTIVITY_SHORT = new Set(['吃零食', '倒水', '倒咖啡', '泡茶', '拿饼干', '吃小蛋糕', '看小手机', '挑选公司福利', '记录福利信息', '记录新品想法', '和老板确认任务', '在厨房']);
+// 其余 → 默认「中」。
+
+// 返回 [min,max] 世界分钟；豁免/空 → null（不排结束）。
+export function activityDuration(activity) {
+  const a = String(activity || '').trim();
+  if (!a || ACTIVITY_EXEMPT.has(a)) return null;
+  if (ACTIVITY_LONG.has(a)) return [30, 50];
+  if (ACTIVITY_SHORT.has(a)) return [3, 9];
+  return [10, 29]; // 中（默认）
+}
+
+// 给"她进入的行为"排一条 action_end 续唤醒：到点静默收尾。防串档=把 expected_activity 塞进 payload，
+// 到点比对当前 activity 没变才收（变了说明被别的行为/作息顶替，跳过）。豁免行为直接不排。
+export async function scheduleActivityEnd(activity) {
+  const range = activityDuration(activity);
+  if (!range) return;
+  const [lo, hi] = range;
+  const delayMin = lo + Math.floor(Math.random() * (hi - lo + 1));
+  const cfg = readWorldConfig();
+  const delaySec = cfg.fast_test ? delayMin : delayMin * 60; // fast_test：世界分钟=现实秒
+  const scheduledAt = new Date(Date.now() + delaySec * 1000).toISOString();
+  try {
+    await supabase.from('pending_wake_cheng').insert({
+      wake_type: 'action_end', reason: '行为结束', status: 'queued',
+      scheduled_at: scheduledAt,
+      payload: { expected_activity: String(activity).trim(), delay_world_minutes: delayMin },
+      attempts: 0,
+    });
+    console.log(`[ACTION_END] 排了「${activity}」结束，${delayMin} 世界分钟后`);
+  } catch (e) { console.warn('[ACTION_END] 排程失败:', e.message); }
+}
 
 // 行为定义。allowed=允许执行的当前 location；target_location/activity=执行后移动到/变成；effects=状态变化。
 export const ACTIONS = {
@@ -68,7 +108,7 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
 
   try {
     await supabase.from('daily_timeline_cheng').insert({
-      world_time: up.world_time,
+      world_time: realWorldTime(),
       location: up.location,
       action: action.label,
       detail: {
@@ -84,5 +124,7 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
   } catch (e) { console.error('[ACTION] 行程写入失败（不连累主流程）:', e.message); }
 
   console.log(`[ACTION] ${actor} 执行「${action.label}」(${source}): ${fromLoc} → ${up.location}`);
+  // 第二步：给这个新行为排自动结束（豁免行为内部会跳过）。失败不连累主流程。
+  if (actor === 'cheng') await scheduleActivityEnd(up.activity);
   return up;
 }

@@ -17,16 +17,15 @@ export async function buildMessageForCC(searchText, userPortion = searchText) {
   // 三个独立块：<此刻>=现实情境（每条都带）、<小世界浮现>=念头池(12B-2,最多1条)、<记忆浮现>=长期记忆库（冷却+命中才有）。
   const blocks = [];
   if (fx.statusLine) {
-    blocks.push(`<此刻 — 仅你可见的现实情境>\n${fx.statusLine}\n</此刻>`);
+    blocks.push(`<此刻>\n${fx.statusLine}\n</此刻>`);
   }
+  // 标签精简（2026-06-12）：「仅你可见的背景，别复述别当成要回应」的叮嘱挪进了 sysprompt
+  // （documents_cheng system_prompt 的 <世界唤醒区>③），这里不再每条重复，省 token。
   if (fx.worldThought) {
-    blocks.push(`<小世界浮现 — 仅你可见的背景，自然融入即可；不要直接复述，也不要把这段当成要回应的内容>\n${fx.worldThought}\n</小世界浮现>`);
+    blocks.push(`<小世界浮现>\n${fx.worldThought}\n</小世界浮现>`);
   }
   if (fx.text) {
-    blocks.push(
-      `<记忆浮现 — 仅你可见的背景，自然融入对话即可；不要直接复述，也不要把这段当成要回应的内容>\n` +
-      `${fx.text}\n</记忆浮现>`
-    );
+    blocks.push(`<记忆浮现>\n${fx.text}\n</记忆浮现>`);
   }
   if (!blocks.length) return { message: userPortion, injectedCount: 0 };
   const message = blocks.join('\n') + '\n\n' + userPortion;

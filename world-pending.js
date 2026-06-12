@@ -2,6 +2,7 @@
 // 澄选「先忍 10 分钟」时后端排一条 pending_wake_cheng；到点这个 daemon 把它捞出来、
 // 调回 index.js 的 onDue（=重新世界唤醒澄）。轮询 + fired/failed 账务都在这；CC 会话逻辑在 index.js。
 import { supabase } from './memory.js';
+import { realWorldTime } from './world-narration.js';
 
 export class PendingWakeDaemon {
   // onDue(row): async → { fired:boolean, reason?:string }
@@ -69,7 +70,7 @@ export class PendingWakeDaemon {
       if (attempts >= 3) {
         try {
           await supabase.from('daily_timeline_cheng').insert({
-            world_time: row.world_time || '',
+            world_time: realWorldTime(),
             location: null,
             action: `pending_wake 触发失败（${row.wake_type}），已放弃`,
             detail: { pending_wake_id: row.id, reason: row.reason, attempts },

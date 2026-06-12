@@ -5,6 +5,7 @@
 import { supabase } from './memory.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 import { readWorldConfig } from './world-tick.js';
+import { realWorldTime } from './world-narration.js';
 
 const OVERTIME_HINT = [
   { stat: 'energy', direction: 'down', strength: 'small' },
@@ -41,7 +42,7 @@ async function setState(row, patch, action, detail) {
   const st = up || row;
   try {
     await supabase.from('daily_timeline_cheng').insert({
-      world_time: st.world_time, location: st.location, action, detail, source: 'system',
+      world_time: realWorldTime(), location: st.location, action, detail, source: 'system',
     });
   } catch (e) { console.warn('[WORK] 行程写入失败:', e.message); }
   return st;

@@ -14,9 +14,15 @@ export function formatNaturalLocation(location) {
   return loc || '家的客厅';
 }
 
+// world_time 现算：始终取现实 Asia/Shanghai 当前 HH:mm（不再依赖 tick 累加进库的旧值）。
+// 时间来源 = 真时间；存库的 world_time 不再作为显示/自述的依据。
+export function realWorldTime() {
+  return new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+}
+
 // activity 已是中文就直接用；万一存了英文枚举给个映射，绝不输出 "正在 resting"。
 const ACT_MAP = { resting: '休息', working: '工作', lunch_break: '午休', overtime: '加班', showering: '洗澡', eating: '吃东西' };
-function mapActivity(a) { return ACT_MAP[a] || a || '休息'; }
+function mapActivity(a) { return ACT_MAP[a] || a || '闲着'; }
 
 // 读启用的短语规则 + 模板（小表，调用频率低，每次读一份即可，编辑后立即生效）。
 export async function loadNarrationRules() {
@@ -56,7 +62,7 @@ export function generateChengSelfNarration(status, env, phrases, templates) {
     ? tpls[Math.floor(Math.random() * tpls.length)].template
     : '现在是 {date} {time}。我在{location_natural}，正在{activity}。{phrases}';
   const date = (env && env.date) || '';
-  const time = status?.world_time || '';
+  const time = realWorldTime();
   const locN = formatNaturalLocation(status?.location);
   const act = mapActivity(status?.activity);
   const ph = pickPhrases(status, phrases);
@@ -82,5 +88,6 @@ export function formatUserStatus(user) {
 export function buildNowInner(chengStatus, env, user, phrases, templates) {
   const cheng = generateChengSelfNarration(chengStatus, env, phrases, templates);
   const mol = formatUserStatus(user);
-  return `澄：${cheng}\n\n小茉莉：${mol}`;
+  // 不带「澄：」前缀（自述本来就是第一人称「我」）；小茉莉行去冒号拼成一句话（2026-06-12 用户定的格式）
+  return `${cheng}\n\n小茉莉${mol}`;
 }

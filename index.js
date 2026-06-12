@@ -27,11 +27,11 @@ import {
 import { DiceDaemon } from './dice.js';
 import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WORLD_EVENTS, syncWorldTimeToRealTime } from './world-tick.js';
 import { PendingWakeDaemon } from './world-pending.js';
-import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction } from './world-actions.js';
+import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction, scheduleActivityEnd } from './world-actions.js';
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
-import { buildNowInner, loadNarrationRules, generateChengSelfNarration } from './world-narration.js';
+import { buildNowInner, loadNarrationRules, generateChengSelfNarration, realWorldTime } from './world-narration.js';
 import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd } from './world-workday.js';
 import { collectWorldThoughts, recordWakeInjectionScan, getSurfacingDebug } from './world-thoughts.js';
 
@@ -567,12 +567,20 @@ let pendingSummary = null; // { conversationId, summaryLength }
 let lastActiveConvId = null; // bark 主动消息存到最近活跃的对话
 (async () => {
   try {
-    const { data } = await supabase.from('messages').select('conversation_id')
+    const { data } = await supabase.from('messages').select('conversation_id, created_at')
       .order('created_at', { ascending: false }).limit(1);
-    if (data?.[0]?.conversation_id) {
-      lastActiveConvId = data[0].conversation_id;
-      console.log('[INIT] lastActiveConvId =', lastActiveConvId);
+    const { data: convs } = await supabase.from('conversations').select('id, created_at')
+      .order('created_at', { ascending: false }).limit(1);
+    const lastMsg = data?.[0];
+    const lastConv = convs?.[0];
+    // 取"最后一条消息所在对话"和"最新建的对话"里更晚的：新建的空对话（用户还没说话）也算活跃，
+    // 否则重启后唤醒消息（bark/dice/world phone）又会跑回旧对话
+    if (lastConv && (!lastMsg || new Date(lastConv.created_at) > new Date(lastMsg.created_at))) {
+      lastActiveConvId = lastConv.id;
+    } else if (lastMsg?.conversation_id) {
+      lastActiveConvId = lastMsg.conversation_id;
     }
+    if (lastActiveConvId) console.log('[INIT] lastActiveConvId =', lastActiveConvId);
   } catch (e) { console.warn('[INIT] 获取 lastActiveConvId 失败:', e.message); }
 })();
 
@@ -652,47 +660,37 @@ let lastWorldPhoneAt = 0;                       // 上次 world phone 消息时�
 
 // 12A：唤醒包用统一 <此刻>（澄第一人称身体/环境自述 + 小茉莉第三人称，nowBlock 由调用方 buildNowInner 生成），
 // 不再展示状态栏数字、不再展示感受字段。事件/选项/标签说明仍在唤醒包里（不开放整包编辑，保解析链）。
+// 唤醒原因变体：world_wake_reasons_cheng 按 event_key 抽一条启用的（多条随机）；
+// 表里没有/读失败 → 退回代码里的默认文案。pending 续唤醒的"补充"行走 pendingContext，不受影响。
+async function pickWakeReason(eventKey, fallback) {
+  try {
+    const { data } = await supabase.from('world_wake_reasons_cheng')
+      .select('text').eq('event_key', eventKey).eq('enabled', true);
+    if (data && data.length) return data[Math.floor(Math.random() * data.length)].text;
+  } catch (e) { console.warn('[WORLD] 读唤醒原因变体失败，用默认:', e.message); }
+  return fallback;
+}
+
 function buildWorldWakePrompt(event, pendingContext = null, todoHintLine = '', nowBlock = '') {
   const opts = event.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
   const pendingLine = pendingContext ? `\n补充：${pendingContext}` : '';
-  // 11B：NPC 在场提示；WORLD_MESSAGE 引导只在适合联系小茉莉的事件出现（普通工作事件不主动提醒，
-  // 澄想发后端照样解析）；含「约见」选项的事件给明确的约见出口。
+  // 标签格式说明（WORLD_CHOICE/WORLD_MESSAGE/TODO + 记忆）已搬进系统提示「世界唤醒·回复协议」，
+  // 这里不再每次重发，唤醒包只留必要信息 + 一行格式提醒（省 token）。
+  // NPC 在场仍提示；「约见」是情境而非语法，含约见选项的事件保留一句上下文出口。
   const npcLine = event.npc ? `\n在场：${event.npc}` : '';
   const hasMeet = (event.options || []).some(o => o.meet_request);
-  const wmBlock = hasMeet
-    ? `\n如果你想约小茉莉午休见一面，可以用 WORLD_MESSAGE 发出邀请；不想约就不写：
-[WORLD_MESSAGE:phone]消息内容[/WORLD_MESSAGE]
-（不用自己写「［手机消息］」之类的前缀，只写这一句话本身，后端会自动标记。）
-`
-    : event.wmHint === false
-      ? ''
-      : `\n如果你想对小茉莉说一句话，可以额外输出：
-[WORLD_MESSAGE:phone]消息内容[/WORLD_MESSAGE]
-如果你和小茉莉处于同一地点、可以面对面说话，也可以输出：
-[WORLD_MESSAGE:face]消息内容[/WORLD_MESSAGE]
-不想说就不写，不要强行凑。
-（不用自己写「［手机消息］」之类的前缀，只写这一句话本身，后端会自动标记。）
-`;
+  const meetLine = hasMeet ? `\n（想约小茉莉午休见面的话，用 [WORLD_MESSAGE:phone] 发出邀请。）` : '';
   return `【世界唤醒】
 原因：${event.reason}${npcLine}${pendingLine}
 
-<此刻 — 仅你可见的现实情境>
+<此刻>
 ${nowBlock}
 </此刻>${todoHintLine ? `\n${todoHintLine}` : ''}
 
 你可以选择：
 ${opts}
 
-根据当前状态和你的偏好自己决定。
-用这个格式回复：[WORLD_CHOICE:选项编号]你的理由[/WORLD_CHOICE]
-${wmBlock}
-如果你想到一件稍后要做、还没完成的事，可以额外输出：
-[TODO]待办内容[/TODO]
-例如：[TODO]下班前问小茉莉有没有吃饭[/TODO]
-只有真的需要记下来以后处理的事才写，不要每次强行凑。
-
-如果这个瞬间值得记住，可以额外写一条 [MEMORY:diary]...[/MEMORY]。
-除了 [WORLD_CHOICE]、可选的 [WORLD_MESSAGE]、可选的 [TODO]、可选的 [MEMORY] 标签外，不要输出其他内容。`;
+自己拿主意。回复格式：[WORLD_CHOICE:选项编号]你的理由[/WORLD_CHOICE]（其余标签格式见系统提示「世界唤醒区」）${meetLine}`;
 }
 
 // 触发一次世界唤醒。
@@ -700,7 +698,7 @@ ${wmBlock}
 //   pendingContext= pending_wake 续集：绕过冷却（是上次"先忍着"的延续，不是新自动检测，补充1）+ 在原因后加上下文。
 // 两者都仍受 CC 空闲约束（CC 忙时不发、不抢占在途轮）。普通 tick 自动检测（都不传）才受 30min 冷却。
 // 返回 { fired:boolean, reason?:string }。check-and-set activeTurn 之间无 await，原子。
-async function triggerWorldWake(event, status, { force = false, pendingContext = null } = {}) {
+async function triggerWorldWake(event, status, { force = false, pendingContext = null, skipTodoHint = false } = {}) {
   // 第 6/7 步：读 user 的在家/位置/正在/备注。放在 check-and-set activeTurn 之前（这个 await 不夹在
   // 空闲检查与 activeTurn 赋值之间，原子性不破）。读失败给默认值。
   let userStatus = { presence: '在家', location: '家 · 客厅', activity: '休息', custom_note: null };
@@ -713,7 +711,7 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   } catch (e) { console.warn('[WORLD] 读 user_status 失败，用默认:', e.message); }
 
   // 待办急切度提醒（也在 check-and-set 之前）。line 进 prompt；remindedTodoId 等唤醒真发出后再更新时间。
-  const todoHint = await getTodoHint();
+  const todoHint = skipTodoHint ? { line: '', remindedTodoId: null } : await getTodoHint();
 
   // 12A：env(现实 date + 粗天气) + 自述规则 → 统一 <此刻>（澄第一人称身体自述 + 小茉莉第三人称）。
   // 与聊天 md 的 <此刻> 共用 world-narration.js#buildNowInner。不暴露城市/数字/感受字段。
@@ -728,6 +726,9 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
     nowBlock = buildNowInner(status, envForNarr, userStatus, rules.phrases, rules.templates);
   } catch (e) { console.warn('[WORLD] 生成 <此刻> 失败:', e.message); }
 
+  // 唤醒原因变体抽取（await 必须在 check-and-set activeTurn 之前，保住原子性）。
+  const reasonText = await pickWakeReason(event.key, event.reason);
+
   if (!cc.isRunning() || activeTurn || pendingBuffer) {
     console.log('[WORLD] CC 忙或未运行，唤醒跳过');
     return { fired: false, reason: 'cc_busy' };
@@ -741,9 +742,11 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
     }
   }
   // 第8步：选项按澄当前 location 生成（optionsFor）；存进 worldEvent，turn_done 用解析后的同一份。
-  const eventForTurn = (typeof event.optionsFor === 'function')
-    ? { ...event, options: event.optionsFor(status) }
-    : event;
+  const eventForTurn = {
+    ...event,
+    reason: reasonText,
+    options: (typeof event.optionsFor === 'function') ? event.optionsFor(status) : event.options,
+  };
   const prompt = buildWorldWakePrompt(eventForTurn, pendingContext, todoHint.line, nowBlock);
   // 12B-2.1 tripwire：唤醒包 build 后扫一次有没有 <小世界浮现>（正常恒 false；只观测、不读 pick、不注入）。
   recordWakeInjectionScan(prompt);
@@ -775,6 +778,285 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   }
 }
 
+// 「打开待办」每日上限：一天最多真打开 2 次（用户定）。内存计数、按 UTC+8 日界，重启清空（可接受，同作息标记惯例）。
+const OPEN_TODOS_DAILY_MAX = 2;
+let _openTodosDaily = { date: '', n: 0 };
+
+// [TODO_DONE]标题[/TODO_DONE] → 把对应 open 待办标记 done（世界唤醒轮 + 聊天轮共用）。
+// 按标题匹配：先精确（title 全等），不中再找"唯一"的去空格包含匹配兜底；0 条或多条歧义就跳过不猜，只 warn。
+// 支持多条；失败不连累主流程。clean 里要不要剥掉标签由调用方决定（聊天轮要剥，免得漏给用户看）。
+async function processTodoDoneTags(clean) {
+  try {
+    const doneRe = /\[TODO_DONE\]([\s\S]*?)\[\/TODO_DONE\]/gi;
+    let dm;
+    const doneSeen = new Set();
+    while ((dm = doneRe.exec(clean || '')) !== null) {
+      const title = (dm[1] || '').trim();
+      if (!title || doneSeen.has(title)) continue;
+      doneSeen.add(title);
+      try {
+        const { data: opens } = await supabase
+          .from('phone_todos_cheng').select('id, title').eq('status', 'open');
+        const list = opens || [];
+        let hit = list.filter(t => (t.title || '').trim() === title);
+        if (hit.length !== 1) {
+          const norm = title.replace(/\s+/g, '');
+          hit = list.filter(t => {
+            const tn = (t.title || '').replace(/\s+/g, '');
+            return tn && (tn.includes(norm) || norm.includes(tn));
+          });
+        }
+        if (hit.length === 1) {
+          await supabase.from('phone_todos_cheng')
+            .update({ status: 'done', updated_at: new Date().toISOString() }).eq('id', hit[0].id);
+          console.log(`[TODO_DONE] 澄完成待办: ${hit[0].title.slice(0, 40)}`);
+        } else {
+          console.warn(`[TODO_DONE] 没唯一匹配（${hit.length} 条），跳过: ${title.slice(0, 30)}`);
+        }
+      } catch (e) { console.warn('[TODO_DONE] 处理失败（不连累主流程）:', e.message); }
+    }
+  } catch (e) { console.warn('[TODO_DONE] 异常:', e.message); }
+}
+
+// [MOVE:地点] / [MOVE:地点·行为] → 聊天里澄移动（仅聊天轮；世界唤醒里移动走选项/行为系统）。
+// 只改 location/activity 两个描述字段，不结算任何数值——带后果的事（吃饭/花钱）仍走世界系统。
+// 规则：地点白名单 + 只许同栋楼内移动（跨楼忽略）；一条回复里出现多个 MOVE 只认最后一个；
+// 地点可省「家/公司」前缀（房间名在两栋楼里不重名）。行为复用 scheduleActivityEnd 自动收尾。
+const CHAT_MOVE_LOCATIONS = ['家 · 卧室', '家 · 客厅', '家 · 厨房', '家 · 浴室', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'];
+async function processChatMoveTag(text) {
+  try {
+    const re = /\[MOVE:([^\]]+)\]/gi;
+    let m, last = null;
+    while ((m = re.exec(text || '')) !== null) last = m[1];
+    if (!last) return;
+    const parts = last.split(/[·・]/).map(s => s.trim()).filter(Boolean);
+    if (parts[0] === '家' || parts[0] === '公司') parts.shift();
+    const room = parts.shift();
+    const activity = parts.join(' · ') || null;
+    const target = CHAT_MOVE_LOCATIONS.find(l => l.split(' · ')[1] === room);
+    if (!target) { console.log(`[MOVE] 不认识的地点「${last}」，忽略`); return; }
+
+    const { data: rows, error } = await supabase
+      .from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    if (error) throw error;
+    const row = rows && rows[0];
+    if (!row) return;
+    const fromLoc = row.location || '';
+    if (fromLoc.split(' · ')[0] !== target.split(' · ')[0]) {
+      console.log(`[MOVE] 跨楼移动不认（${fromLoc} → ${target}），忽略`);
+      return;
+    }
+    if (fromLoc === target && !activity) return; // 原地且没换行为，没事干
+
+    const newActivity = activity || `在${room}`;
+    const patch = { location: target, activity: newActivity, updated_at: new Date().toISOString() };
+    const { data: up, error: e2 } = await supabase
+      .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
+    if (e2) throw e2;
+
+    try {
+      await supabase.from('daily_timeline_cheng').insert({
+        world_time: realWorldTime(),
+        location: up.location,
+        action: fromLoc === target ? `${newActivity}（聊天中）` : `去了${room}（聊天中）`,
+        detail: { via: 'chat_move', from_location: fromLoc, to_location: target, activity: newActivity },
+        source: 'action',
+      });
+    } catch (e) { console.error('[MOVE] 行程写入失败（不连累主流程）:', e.message); }
+
+    console.log(`[MOVE] 聊天移动: ${fromLoc} → ${target} · ${newActivity}`);
+    await scheduleActivityEnd(newActivity);
+  } catch (e) { console.warn('[MOVE] 处理失败（不连累主流程）:', e.message); }
+}
+
+// 「打开待办」续唤醒的上下文：列出全部 open 待办，按 urgency（轻重缓急）降序，urgency≥阈值标「急」。
+// 不设条数上限（用户定：打开就全显）；给 [OPEN_TODOS] 用，塞进唤醒包「补充：」让澄读 + 可 [TODO_DONE]。
+async function buildOpenTodosContext() {
+  try {
+    const { data } = await supabase
+      .from('phone_todos_cheng').select('title, urgency')
+      .eq('status', 'open').order('urgency', { ascending: false });
+    const todos = data || [];
+    if (!todos.length) return '你打开手机看了看待办，发现是空的，没有要做的事。';
+    const lines = todos.map(t => {
+      const u = Number(t.urgency);
+      const flag = (Number.isFinite(u) && u >= TODO_URGENT_THRESHOLD) ? '（急）' : '';
+      return `· ${t.title}${flag}`;
+    }).join('\n');
+    return `你打开手机看了看待办（按轻重缓急排）：\n${lines}\n做完的可以用 [TODO_DONE]标题[/TODO_DONE] 划掉。`;
+  } catch (e) {
+    console.warn('[WORLD] 读 open 待办失败:', e.message);
+    return '你想打开手机看待办，但一时没读出来。';
+  }
+}
+
+// 行为结束后的「讲究版」闲置态：工作日 + 在公司 + 上班时段(9-11/13-16) → 回「工作」；否则 → 「闲着」。
+// 时间/星期都按现实 Asia/Shanghai。读不出来就保守给「闲着」。
+function computeIdleState(location) {
+  try {
+    const wd = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', weekday: 'short' }).format(new Date());
+    const isWorkday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(wd);
+    const m = /^(\d{1,2}):(\d{2})$/.exec(realWorldTime());
+    const t = m ? parseInt(m[1], 10) * 60 + parseInt(m[2], 10) : null;
+    const inWorkHours = t != null && ((t >= 540 && t < 660) || (t >= 780 && t < 960));
+    if (isWorkday && inWorkHours && String(location || '').startsWith('公司')) return '工作';
+  } catch { /* 保守退闲着 */ }
+  return '闲着';
+}
+
+// ── 第1块·早晨流程：行为链（一步接一步、静默走，靠 routine_step pending 推进）────────────
+// 活动名只写动作不带地点（地点由 location 显示）。时长 [min,max] 世界分钟；终点(工作,dur=null)不再排。
+// 目录 + 默认 key 写法：早饭/通勤的选项摆成目录，平时走默认 key；以后接"周末周计划"只需把默认 key
+// 换成"从偏好表读 key"，目录/链条/扣钱逻辑都不用动（插槽已留好）。
+const COMMUTE_OPTS = {
+  subway: { activity: '坐地铁', location: '外出 · 路上', dur: [13, 17], cost: 0 },
+  taxi:   { activity: '打车',   location: '外出 · 路上', dur: [8, 12],  cost: 30 },
+  walk:   { activity: '走路',   location: '外出 · 路上', dur: [22, 28], cost: 0 },
+};
+const DEFAULT_BREAKFAST = 'cook';   // 自己做（周末预制，平时在家吃现成）
+const DEFAULT_COMMUTE   = 'subway';
+
+// 按早饭计划 bk + 通勤方式 cm 组出早晨链。cook：在家吃完再走；buy：路上买、到工位再吃（到岗早、开工晚）。
+function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE) {
+  const commute = COMMUTE_OPTS[cm] || COMMUTE_OPTS[DEFAULT_COMMUTE];
+  const steps = [
+    { activity: '穿衣服', location: '家 · 卧室', dur: [3, 9] },
+    { activity: '洗漱',   location: '家 · 浴室', dur: [10, 15] },
+  ];
+  if (bk === 'buy') {
+    steps.push({ activity: '去便利店', location: '外出 · 路上',   dur: [3, 9] });
+    steps.push({ engage: 'buy_food', activity: '挑早餐', location: '外出 · 便利店' }); // 到店→engage选吃的(食物表)
+    steps.push({ ...commute });                                              // 坐地铁/打车/走路
+    steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17] }); // 到岗后在工位吃
+  } else { // cook（默认）
+    steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true }); // 吃冰箱里预制的成品
+    steps.push({ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] });
+    steps.push({ ...commute });                                              // 坐地铁/打车/走路
+  }
+  steps.push({ activity: '工作', location: '公司 · 工位', dur: null });          // 终点（工作=豁免）
+  return steps;
+}
+
+// 午休"吃→休息"小链（等小茉莉没等到→自己吃→吃完歇会儿→回午休基线）。method 决定怎么吃。
+const LUNCH_EAT = {
+  snack:   { activity: '吃零食', location: '公司 · 休息室', dur: [8, 15],  cost: 0 },
+  takeout: { activity: '吃外卖', location: '公司 · 休息室', dur: [13, 17], cost: 25 },
+  tearoom: { activity: '吃东西', location: '公司 · 茶水间', dur: [10, 15], cost: 0 },
+};
+function buildLunchRoutine(method = 'snack') {
+  const eat = LUNCH_EAT[method] || LUNCH_EAT.snack;
+  return [
+    { ...eat },                                                      // 吃
+    { activity: '休息', location: eat.location, dur: [20, 40] },     // 吃完接休息
+    { activity: '午休', location: '公司 · 休息室', dur: null },        // 终点（回午休基线，豁免不再推）
+  ];
+}
+
+function getRoutineSteps(routineName, opts = {}) {
+  if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm);
+  if (routineName === 'lunch') return buildLunchRoutine(opts.method);
+  return [];
+}
+
+// 吃一份成品早餐：先清过期，再从有货的里按"最快到期"扣一份（扣到 0 删行）。返回吃的成品名；没货返回 null。
+async function consumePrepped() {
+  try {
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+    await supabase.from('world_fridge_cheng').delete().eq('kind', 'prepped').not('expiry_date', 'is', null).lt('expiry_date', today);
+    const { data } = await supabase.from('world_fridge_cheng').select('*')
+      .eq('kind', 'prepped').gt('quantity', 0).order('expiry_date', { ascending: true, nullsFirst: false }).limit(1);
+    const row = data && data[0];
+    if (!row) return null;
+    const nq = row.quantity - 1;
+    if (nq <= 0) await supabase.from('world_fridge_cheng').delete().eq('id', row.id);
+    else await supabase.from('world_fridge_cheng').update({ quantity: nq, updated_at: new Date().toISOString() }).eq('id', row.id);
+    console.log(`[FRIDGE] 吃了一份「${row.item_name}」，剩 ${Math.max(0, nq)} 份`);
+    return row.item_name;
+  } catch (e) { console.warn('[FRIDGE] consumePrepped 失败:', e.message); return null; }
+}
+
+// 读她的周计划（单行 world_plan_cheng）→ 早饭计划 bk + 通勤默认 cm。读不到退默认。
+async function readWorldPlan() {
+  try {
+    const { data } = await supabase.from('world_plan_cheng').select('breakfast_plan, commute_default').eq('name', 'default').limit(1);
+    const p = data && data[0];
+    return { bk: p?.breakfast_plan || DEFAULT_BREAKFAST, cm: p?.commute_default || DEFAULT_COMMUTE };
+  } catch { return { bk: DEFAULT_BREAKFAST, cm: DEFAULT_COMMUTE }; }
+}
+
+// 进入 routine 第 idx 步：改状态(+按 step.cost 扣钱) + 写 system 行程 + 给下一步排 routine_step pending。
+// opts 带 {bk,cm}（计划 key），随 pending 透传，保证重建链条确定性。
+async function advanceRoutine(routineName, idx, opts = {}) {
+  const steps = getRoutineSteps(routineName, opts);
+  if (!steps.length || idx < 0 || idx >= steps.length) return;
+  const step = steps[idx];
+  try {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const row = rows && rows[0];
+    if (!row) return;
+    // cook 的"吃早餐"步：从冰箱扣一份成品；没现成的就退成"随便吃了点"。
+    let act = step.activity;
+    if (step.consume_prepped) {
+      const dish = await consumePrepped();
+      if (!dish) act = '随便吃了点';
+    }
+    const patch = { activity: act, location: step.location, updated_at: new Date().toISOString() };
+    if (step.cost) patch.wallet_balance = Math.max(0, (Number(row.wallet_balance) || 0) - step.cost);
+    await supabase.from('character_status_cheng').update(patch).eq('id', row.id);
+    await supabase.from('daily_timeline_cheng').insert({
+      world_time: realWorldTime(), location: step.location,
+      action: act, detail: { routine: routineName, step: idx, cost: step.cost || 0 }, source: 'system',
+    });
+    console.log(`[ROUTINE] ${routineName} 第${idx}步 → ${step.location} · ${act}${step.cost ? ` (-¥${step.cost})` : ''}`);
+    // engage 步（如便利店选吃的）：弹选项让她挑，链在她选完(continue_routine)后续，这里不排 routine_step。
+    // CC 忙没弹成 → 不卡链，直接往下走（算她没挑/随便拿）。
+    if (step.engage) {
+      const fired = await fireRoutineEngage(step.engage, routineName, idx, opts);
+      if (!fired) await advanceRoutine(routineName, idx + 1, opts);
+      return;
+    }
+    if (step.dur && idx + 1 < steps.length) {
+      const [lo, hi] = step.dur;
+      const delayMin = lo + Math.floor(Math.random() * (hi - lo + 1));
+      const cfg = readWorldConfig();
+      const delaySec = cfg.fast_test ? delayMin : delayMin * 60;
+      await supabase.from('pending_wake_cheng').insert({
+        wake_type: 'routine_step', reason: `${routineName}流程推进`, status: 'queued',
+        scheduled_at: new Date(Date.now() + delaySec * 1000).toISOString(),
+        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method },
+        attempts: 0,
+      });
+    }
+  } catch (e) { console.warn('[ROUTINE] advance 失败:', e.message); }
+}
+
+// engage 步：按 engageType 从食物表建选项弹给澄选；她选完由 continue_routine 续链。返回是否真弹了(CC忙=false)。
+async function fireRoutineEngage(engageType, routineName, idx, opts) {
+  try {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return false;
+    if (engageType === 'buy_food') {
+      const { data: foods } = await supabase.from('world_items_cheng')
+        .select('name, price').eq('enabled', true).eq('category', '便利店成品');
+      const pool = (foods || []).slice();
+      if (!pool.length) { console.log('[BUY_FOOD] 食物表没"便利店成品"，跳过选购'); return false; }
+      // Fisher-Yates 洗牌取最多 3 个
+      for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+      const cont = { routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm };
+      const options = pool.slice(0, 3).map((f, i) => {
+        const price = Number(f.price) || 0;
+        return { id: i + 1, label: `${f.name}（¥${price}）`, effects: price ? { wallet_balance: -price } : {}, continue_routine: cont };
+      });
+      options.push({ id: options.length + 1, label: '不买了，到公司再说', continue_routine: cont });
+      const event = { key: 'buy_food', reason: '到便利店了，买点啥当早饭？', options, wmHint: false };
+      const r = await triggerWorldWake(event, status, { force: true });
+      return !!(r && r.fired);
+    }
+    return false;
+  } catch (e) { console.warn('[ROUTINE] fireRoutineEngage 失败:', e.message); return false; }
+}
+
 // pending_wake 到点：读当前状态 → 用对应事件 + pending 上下文重新唤醒澄。给 PendingWakeDaemon 当 onDue。
 async function firePendingWake(row) {
   // 11A：加班结束 pending — 系统结算（回家+加班费），不 engage 澄、不发 Bark。
@@ -784,16 +1066,163 @@ async function firePendingWake(row) {
     return { fired: true, system: true };
   }
   // 11B：午休约见超时 — 小茉莉没回应 → 写一条 timeline，澄自己继续。不 engage、不移动 user、不改 user_status。
+  // 午休约见到点：看这段时间小茉莉回没回。回了=见上(不弹吃啥)；没回=她在忙→弹"中午吃啥"→选了走午休链(吃→休息)。
   if (row.wake_type === 'meet_request') {
     try {
-      const { data: rows } = await supabase.from('character_status_cheng').select('world_time, location').eq('name', '澄').limit(1);
+      const since = row.created_at || new Date(Date.now() - 20 * 60 * 1000).toISOString(); // 邀请时间≈本 pending 创建
+      const { data: replies } = await supabase.from('messages')
+        .select('id').eq('role', 'user').gt('created_at', since).limit(1);
+      const userReplied = !!(replies && replies.length);
+      const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+      const status = rows && rows[0];
+      if (userReplied) {
+        await supabase.from('daily_timeline_cheng').insert({
+          world_time: realWorldTime(), location: status?.location || null,
+          action: '午休见到小茉莉', detail: { reason: '小茉莉回应了，两人午休碰上' }, source: 'system',
+        });
+        console.log('[WORK] meet_request：小茉莉回了，算见上');
+        return { fired: true, system: true };
+      }
+      if (!status) return { fired: true, system: true };
+      const event = {
+        key: 'lunch_solo',
+        reason: '等了一会儿，小茉莉好像在忙，没回你。午休还是得吃点，你想吃啥？',
+        options: [
+          { id: 1, label: '吃点零食垫垫', start_routine: 'lunch', routine_opts: { method: 'snack' } },
+          { id: 2, label: '点个外卖（¥25）', start_routine: 'lunch', routine_opts: { method: 'takeout' } },
+          { id: 3, label: '去茶水间找点吃的', start_routine: 'lunch', routine_opts: { method: 'tearoom' } },
+        ],
+        wmHint: false,
+      };
+      return await triggerWorldWake(event, status, { force: true });
+    } catch (e) { console.warn('[WORK] meet_request 处理失败:', e.message); return { fired: true, system: true }; }
+  }
+  // 第二步·行为自动结束：到点静默收尾。防串档=当前 activity 跟当初排的不一样（被别的行为/作息顶替）→ 跳过。
+  // 收尾回到「讲究版」闲置态：工作日+在公司+上班时段(9-11/13-16)→工作；否则→闲着。不 engage、不 Bark。
+  if (row.wake_type === 'action_end') {
+    try {
+      const { data: rows } = await supabase.from('character_status_cheng').select('id, activity, location').eq('name', '澄').limit(1);
       const st = rows && rows[0];
+      if (!st) return { fired: true, system: true };
+      const expected = (row.payload?.expected_activity || '').trim();
+      if ((st.activity || '').trim() !== expected) {
+        console.log(`[ACTION_END] 「${expected}」已被「${st.activity}」顶替，跳过收尾`);
+        return { fired: true, system: true };
+      }
+      const idle = computeIdleState(st.location);
+      await supabase.from('character_status_cheng')
+        .update({ activity: idle, updated_at: new Date().toISOString() }).eq('id', st.id);
       await supabase.from('daily_timeline_cheng').insert({
-        world_time: st?.world_time || '', location: st?.location || null,
-        action: '午休约见超时', detail: { reason: '小茉莉可能没看到，澄自己去午休/继续当前行为' }, source: 'system',
+        world_time: realWorldTime(), location: st.location,
+        action: `${expected}结束`, detail: { from_activity: expected, to_activity: idle }, source: 'system',
       });
-      console.log('[WORK] meet_request 超时，已自处理');
-    } catch (e) { console.warn('[WORK] meet_request 超时处理失败:', e.message); }
+      console.log(`[ACTION_END] 「${expected}」结束 → ${idle}`);
+    } catch (e) { console.warn('[ACTION_END] 收尾失败:', e.message); }
+    return { fired: true, system: true };
+  }
+  // [OPEN_TODOS]：澄打开手机看待办 → 拉 open 待办做成续唤醒上下文，engage 她读 + 可 [TODO_DONE]。
+  if (row.wake_type === 'open_todos') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    const ctx = await buildOpenTodosContext();
+    const event = {
+      key: 'open_todos',
+      reason: '你打开了小手机的待办',
+      options: [{ id: 1, label: '看完了，继续手头的事', effects: {} }],
+      wmHint: false,
+    };
+    return await triggerWorldWake(event, status, { pendingContext: ctx, skipTodoHint: true });
+  }
+  // 早晨流程链推进：到点把她从上一步推进到下一步（静默）。
+  // 防打断：当前 activity 跟"上一步"对不上 = 被事件/作息顶替过 → 停链，不硬推。
+  if (row.wake_type === 'routine_step') {
+    const p = row.payload || {};
+    const { data: rows } = await supabase.from('character_status_cheng').select('activity').eq('name', '澄').limit(1);
+    const st = rows && rows[0];
+    const expected = (p.expected_activity || '').trim();
+    if (!st || (st.activity || '').trim() !== expected) {
+      console.log(`[ROUTINE] 「${expected}」被打断（现在「${st?.activity}」），链中止`);
+      return { fired: true, system: true };
+    }
+    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method });
+    return { fired: true, system: true };
+  }
+  // 第1块·作息弹选择 — 早晨起床（工作日约 8:00 触发；现在靠手动/pending 测，自动到点要等第0块开 tick）。
+  // 起床=1次 engage：①起床洗漱（→洗漱走流程，后续接早饭/通勤=下个增量）②再睡10分钟（排 pending 重问）
+  // ③翘班（扣 120≈一天工资，留在家）。force=确保到点必发、不被 30min 冷却挡（每天就这一下）。
+  if (row.wake_type === 'morning_wakeup') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    const event = {
+      key: 'morning_wakeup',
+      reason: '闹钟响了，该起床准备上班了',
+      options: [
+        { id: 1, label: '起床，开始准备上班', start_routine: 'morning' },
+        { id: 2, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '又赖了一会儿，现在真得起了' } },
+        { id: 3, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
+      ],
+      wmHint: false,
+    };
+    return await triggerWorldWake(event, status, { force: true });
+  }
+  // 周末规划：定下周早饭计划（自己做/买）。写进 world_plan_cheng，早晨链 start 时读它决定走哪条。
+  // 「自己做」的"选做啥+预制+存预制库存"用食物表，是下个增量；这里先只定 cook/buy 顶层。
+  if (row.wake_type === 'weekend_plan') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    const event = {
+      key: 'weekend_plan',
+      reason: '周末了，定一下下周早饭怎么解决',
+      options: [
+        { id: 1, label: '下周自己做早饭（周末先备好）', set_plan: { breakfast_plan: 'cook' }, pending: { wake_type: 'cook_prep', delay_world_minutes: 0, reason: '定了自己做，得想想做点啥、备料' } },
+        { id: 2, label: '下周路上买着吃', set_plan: { breakfast_plan: 'buy' } },
+      ],
+      wmHint: false,
+    };
+    return await triggerWorldWake(event, status, { force: true });
+  }
+  // 周末「自己做」→ 选做啥菜（从食物表 category=早餐 列选项）。选了 → 备料扣钱 + 进「预制早餐」+ 排 prep_done。
+  if (row.wake_type === 'cook_prep') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    const { data: dishes } = await supabase.from('world_items_cheng')
+      .select('name, price, shelf_life_days').eq('enabled', true).eq('category', '早餐').limit(4);
+    const list = dishes || [];
+    if (!list.length) { console.log('[PREP] 食物表没"早餐"类菜，cook_prep 跳过'); return { fired: true, system: true }; }
+    const QTY = 5; // v1：预制一周 5 份
+    const options = list.map((dsh, i) => {
+      const cost = Number(dsh.price) || 0;
+      const shelf = dsh.shelf_life_days || 5;
+      const delayMin = 30 + Math.floor(Math.random() * 21); // 预制 30-50 世界分钟
+      return {
+        id: i + 1, label: `做「${dsh.name}」（备料 ¥${cost}，预制 ${QTY} 份）`,
+        effects: cost ? { wallet_balance: -cost } : {},
+        target_activity: '预制早餐',
+        pending: { wake_type: 'prep_done', delay_world_minutes: delayMin, reason: '预制好了',
+          payload_extra: { dish: dsh.name, qty: QTY, shelf } },
+      };
+    });
+    const event = { key: 'cook_prep', reason: '这周早饭想做点啥？做好了放冰箱，平时热着吃', options, wmHint: false };
+    return await triggerWorldWake(event, status, { force: true });
+  }
+  // 预制结束：把成品 ×N 入冰箱（带保质期），她回闲着。静默。
+  if (row.wake_type === 'prep_done') {
+    const p = row.payload || {};
+    const dish = p.dish, qty = Number(p.qty) || 5, shelf = Number(p.shelf) || 5;
+    try {
+      const d = new Date(Date.now() + 8 * 3600000); // 调到 +8 算日期
+      d.setUTCDate(d.getUTCDate() + shelf);
+      const expiry = d.toISOString().slice(0, 10);
+      if (dish) {
+        await supabase.from('world_fridge_cheng').insert({ item_name: dish, kind: 'prepped', quantity: qty, expiry_date: expiry, note: '澄周末预制' });
+        console.log(`[PREP] 预制好「${dish}」×${qty}，${shelf}天后(${expiry})过期，已入冰箱`);
+      }
+      await supabase.from('character_status_cheng').update({ activity: '闲着', updated_at: new Date().toISOString() }).eq('name', '澄');
+    } catch (e) { console.warn('[PREP] prep_done 失败:', e.message); }
     return { fired: true, system: true };
   }
   const def = WORLD_EVENTS[row.wake_type];
@@ -858,12 +1287,14 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
         .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
       if (e2) throw e2;
       updatedStatus = up;
+      // 第二步：事件/唤醒里选出的行为也排自动结束（只在确实进入了新行为=targetAct 时）。
+      if (targetAct) await scheduleActivityEnd(up.activity);
     }
   } catch (e) {
     console.error('[WORLD] 结算状态失败:', e.message);
   }
 
-  const wt = (updatedStatus && updatedStatus.world_time) || (turn.worldEvent.world_time || '');
+  const wt = realWorldTime(); // ③：行程/pending 时间戳统一盖现实 +8，不再用 tick 累加的存库值
   const loc = updatedStatus ? updatedStatus.location : null;
 
   // 第 5 步：选中带 pending 的选项（如「先忍 10 分钟」）→ 先排一条 pending_wake，到点 daemon 再唤醒。
@@ -926,6 +1357,27 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
   if (!parseFailed && option.start_overtime) {
     try { await scheduleOvertimeEnd(); } catch (e) { console.warn('[WORLD] start_overtime 失败:', e.message); }
   }
+  // 第1块：选项带 start_routine（如起床洗漱）→ 启动早晨流程链。从周计划读 bk/cm（她周末定的，没定退默认）。
+  if (!parseFailed && option.start_routine) {
+    try {
+      const opts = option.routine_opts || await readWorldPlan(); // 午休带 method；早晨读周计划
+      await advanceRoutine(option.start_routine, 0, opts);
+    } catch (e) { console.warn('[WORLD] start_routine 失败:', e.message); }
+  }
+  // engage 步（便利店选吃的）：选项带 continue_routine → 她选完后继续早晨链的下一步。
+  if (!parseFailed && option.continue_routine) {
+    const cr = option.continue_routine;
+    try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm }); }
+    catch (e) { console.warn('[WORLD] continue_routine 失败:', e.message); }
+  }
+  // 周末规划：选项带 set_plan → 写进 world_plan_cheng（下周早饭计划等）。
+  if (!parseFailed && option.set_plan) {
+    try {
+      await supabase.from('world_plan_cheng')
+        .update({ ...option.set_plan, updated_at: new Date().toISOString() }).eq('name', 'default');
+      console.log(`[PLAN] 更新周计划: ${JSON.stringify(option.set_plan)}`);
+    } catch (e) { console.warn('[WORLD] set_plan 失败:', e.message); }
+  }
   // 11B：午休约小茉莉见面 → 排 meet_request pending（10-15 世界分钟）。邀请由澄输出的 WORLD_MESSAGE 照常解析；
   // 不强制移动/改 user_status，超时由 firePendingWake 自处理。
   if (!parseFailed && option.meet_request) {
@@ -950,6 +1402,9 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       .replace(/\[WORLD_CHOICE:\s*\d+\s*\][\s\S]*?\[\/WORLD_CHOICE\]/gi, '')
       .replace(/\[WORLD_MESSAGE:(?:phone|face)\][\s\S]*?\[\/WORLD_MESSAGE\]/gi, '') // 别把消息当小心思
       .replace(/\[TODO(?::-?[\d.]+)?\][\s\S]*?\[\/TODO\]/gi, '')                     // 别把待办当小心思（含 [TODO:0.8]/[TODO:-1]）
+      .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')                          // 别把"完成待办"标签当小心思
+      .replace(/\[OPEN_TODOS\]/gi, '')                                                // 别把"打开待办"标记当小心思
+      .replace(/\[MOVE:[^\]]*\]/gi, '')                                               // MOVE 是聊天专属，世界轮误出现只剥掉防泄漏
       .trim();
     if (innerThought) {
       try {
@@ -1024,6 +1479,28 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       } catch (e) { console.warn('[WORLD] TODO 写入失败（不连累主流程）:', e.message); }
     }
   } catch (e) { console.warn('[WORLD] TODO 处理异常:', e.message); }
+
+  // ②：[TODO_DONE] → 标记对应待办完成（世界唤醒 + 聊天 共用 processTodoDoneTags）。
+  await processTodoDoneTags(clean);
+
+  // 「打开待办」：澄输出 [OPEN_TODOS] → 排一条即时 open_todos 续唤醒（daemon ≤7s 捞起，列清单给她看+可划）。
+  // 防自循环：已经在 open_todos 唤醒里就不再排。每日上限 2 次：超了静默忽略（只 log，不再多花一轮）。
+  if (!parseFailed && event.key !== 'open_todos' && /\[OPEN_TODOS\]/i.test(clean || '')) {
+    const today = plus8DateStr(Date.now());
+    if (_openTodosDaily.date !== today) { _openTodosDaily.date = today; _openTodosDaily.n = 0; }
+    if (_openTodosDaily.n >= OPEN_TODOS_DAILY_MAX) {
+      console.log(`[WORLD] 今日打开待办已达上限 ${OPEN_TODOS_DAILY_MAX} 次，忽略本次 [OPEN_TODOS]`);
+    } else {
+      _openTodosDaily.n++;
+      try {
+        await supabase.from('pending_wake_cheng').insert({
+          wake_type: 'open_todos', reason: '打开手机待办', status: 'queued',
+          scheduled_at: new Date().toISOString(), payload: {}, attempts: 0,
+        });
+        console.log(`[WORLD] 澄打开待办（今日第 ${_openTodosDaily.n} 次），已排 open_todos 续唤醒`);
+      } catch (e) { console.warn('[WORLD] 排 open_todos 失败:', e.message); }
+    }
+  }
 
   console.log(`[WORLD] 澄选了「${option.label}」${reason ? '：' + reason.slice(0, 40) : ''}${parseFailed ? '（解析失败默认）' : ''}`);
 }
@@ -1232,7 +1709,7 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
     }
   }
 
-  const clean = removeBarkTags(removeMemoryTags(text || ''));
+  let clean = removeBarkTags(removeMemoryTags(text || ''));
 
   // barkFire 轮：推到手机 + 存 DB + 广播 ws
   if (turn.barkFire) {
@@ -1298,6 +1775,18 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
     flushOrGrace();
     tryFireBark();
     return;
+  }
+
+  // 聊天轮也支持 [TODO_DONE]（她在聊天里说做完了某条待办，照样能划掉）：先标记完成，再从展示文本剥掉标签，
+  // 免得标签漏进对话框给小茉莉看到。[OPEN_TODOS] 是世界专属、聊天不做，但若误出现也剥掉防泄漏。silent 轮(上下文加载)不处理。
+  if (!turn.silent) {
+    await processTodoDoneTags(clean);
+    await processChatMoveTag(clean);
+    clean = clean
+      .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')
+      .replace(/\[OPEN_TODOS\]/gi, '')
+      .replace(/\[MOVE:[^\]]*\]/gi, '')
+      .trim();
   }
 
   // 普通聊天回复的"当前互动通道"：澄和小茉莉同地点=face（普通气泡），异地=phone（手机气泡）。
@@ -2783,6 +3272,41 @@ app.patch('/api/world/narration/template/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 唤醒原因变体编辑器（world-home WakeReasonsPanel）。结构照 narration 的 CRUD。
+app.get('/api/world/wake-reasons', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('world_wake_reasons_cheng')
+      .select('*').order('event_key', { ascending: true }).order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json({ reasons: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/wake-reasons', async (req, res) => {
+  const { event_key, label, text, enabled } = req.body || {};
+  if (!event_key || !text) return res.status(400).json({ error: '缺少 event_key/text' });
+  try {
+    const { data, error } = await supabase.from('world_wake_reasons_cheng')
+      .insert({ event_key, label: label || null, text, enabled: enabled !== false }).select().single();
+    if (error) throw error;
+    res.json({ ok: true, reason: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/world/wake-reasons/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('world_wake_reasons_cheng')
+      .update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ ok: true, reason: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/world/wake-reasons/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('world_wake_reasons_cheng').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // 12A：预览当前澄自述。复用真实生成函数 generateChengSelfNarration（预览=实际，不另写一套）。
 // 可选 query energy/satiety/cleanliness/health 临时覆盖（只预览，不写库）。规则实时读表，改完即生效。
 app.get('/api/world/self-narration/preview', async (req, res) => {
@@ -2940,6 +3464,9 @@ app.post('/api/conversations', async (req, res) => {
     .select()
     .single();
   if (error) return res.status(500).json({ error: error.message });
+  // 新建即登记为活跃对话：用户还没说话时的唤醒消息（bark/dice/world phone）也发到这里，
+  // 不然会落进上一个对话、当前界面看不见
+  if (data?.id) lastActiveConvId = data.id;
   res.json(data);
 });
 
@@ -3576,7 +4103,9 @@ async function flushPendingToCC(ws, items) {
   activeTurn = { ws, conversationId: conversation_id, settings, tools: [] };
 
   try {
-    const prefixed = maybeTimePrefix(combinedText, conversation_id);
+    // [时间标记] 前缀已停用（2026-06-12 用户要求）：<此刻> 每条都带现算时间，这行和它重复。
+    // 想恢复（或改成"距澄最后回复"计时）→ 换回 maybeTimePrefix(combinedText, conversation_id)。
+    const prefixed = combinedText;
     // 浮现：tmux 交互模式折进消息（长驻会话不重读 CLAUDE.md）；stream-json 仍写 CLAUDE.md。
     let textForCC = prefixed;
     if (USE_TMUX) {
