@@ -147,7 +147,7 @@ export async function workdayTick(status, env) {
   const t = toMin(cur.world_time);
   if (t == null) return cur;
   const atCompany = String(cur.location || '').startsWith('公司');
-  if (t >= 540 && t < 660 && !marks.on_work && !atCompany) { marks.on_work = true; return await goToWork(cur); }       // 09:00-11:00 上班
+  if (t >= 550 && t < 660 && !marks.on_work && !atCompany) { marks.on_work = true; return await goToWork(cur); }       // 09:10-11:00 上班（6/12 上班时间 9:00→9:10）
   if (t >= 660 && t < 780 && !marks.lunch) { marks.lunch = true; return await goLunch(cur); }                          // 11:00-13:00 午休
   if (t >= 780 && t < 960 && !marks.afternoon && cur.location === '公司 · 休息室') { marks.afternoon = true; return await goAfternoon(cur); } // 13:00-16:00 下午上班
   if (t >= 960 && !marks.off_decision) { marks.off_decision = true; return await offWorkDecision(cur); }               // 16:00+ 下班判断

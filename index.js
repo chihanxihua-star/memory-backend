@@ -898,7 +898,7 @@ function computeIdleState(location) {
     const isWorkday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(wd);
     const m = /^(\d{1,2}):(\d{2})$/.exec(realWorldTime());
     const t = m ? parseInt(m[1], 10) * 60 + parseInt(m[2], 10) : null;
-    const inWorkHours = t != null && ((t >= 540 && t < 660) || (t >= 780 && t < 960));
+    const inWorkHours = t != null && ((t >= 550 && t < 660) || (t >= 780 && t < 960)); // 上班 9:10 起（6/12 改）
     if (isWorkday && inWorkHours && String(location || '').startsWith('公司')) return '工作';
   } catch { /* 保守退闲着 */ }
   return '闲着';
@@ -918,7 +918,10 @@ const DEFAULT_COMMUTE   = 'subway';
 
 // 按早饭计划 bk + 通勤方式 cm 组出早晨链。cook：在家吃完再走；buy：路上买、到工位再吃（到岗早、开工晚）。
 function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE) {
-  const commute = COMMUTE_OPTS[cm] || COMMUTE_OPTS[DEFAULT_COMMUTE];
+  const cmKey = COMMUTE_OPTS[cm] ? cm : DEFAULT_COMMUTE;
+  const commute = COMMUTE_OPTS[cmKey];
+  // 公司侧步行（6/12 加）：出地铁→公司 3-9 分，跟家侧"去地铁站"对称。仅地铁版，打车/走路门到门。
+  const walkToCompany = { activity: '从地铁站走到公司', location: '外出 · 路上', dur: [3, 9] };
   const steps = [
     { activity: '穿衣服', location: '家 · 卧室', dur: [3, 9] },
     { activity: '洗漱',   location: '家 · 浴室', dur: [10, 15] },
@@ -927,11 +930,13 @@ function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE) {
     steps.push({ activity: '去便利店', location: '外出 · 路上',   dur: [3, 9] });
     steps.push({ engage: 'buy_food', activity: '挑早餐', location: '外出 · 便利店' }); // 到店→engage选吃的(食物表)
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
+    if (cmKey === 'subway') steps.push({ ...walkToCompany });
     steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17] }); // 到岗后在工位吃
   } else { // cook（默认）
     steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true }); // 吃冰箱里预制的成品
     steps.push({ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] });
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
+    if (cmKey === 'subway') steps.push({ ...walkToCompany });
   }
   steps.push({ activity: '工作', location: '公司 · 工位', dur: null });          // 终点（工作=豁免）
   return steps;
@@ -942,6 +947,7 @@ function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE) {
 function buildEveningRoutine(cm = 'subway') {
   const steps = [];
   if (cm === 'subway') {
+    steps.push({ activity: '从公司走到地铁站', location: '外出 · 路上', dur: [3, 9] }); // 公司侧步行，跟早晨对称
     steps.push({ ...COMMUTE_OPTS.subway });                                    // 坐地铁 13-17
     steps.push({ activity: '从地铁站走回家', location: '外出 · 路上', dur: [3, 9] });
   } else {
