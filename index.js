@@ -1269,12 +1269,13 @@ async function firePendingWake(row) {
     const event = {
       key: 'morning_wakeup',
       reason: '闹钟响了，该起床准备上班了',
+      // 顺序有讲究（6/12）：解析失败兜底=最后一项，所以「起床」垫底当安全默认（原来垫底的是翘班，会误扣120）。
       options: [
-        { id: 1, label: '起床，开始准备上班', start_routine: 'morning' },
         cuddle
-          ? { id: 2, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '抱着小茉莉贴贴赖了十分钟，再不起要迟到了' } }
-          : { id: 2, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '又赖了一会儿，现在真得起了' } },
-        { id: 3, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
+          ? { id: 1, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '抱着小茉莉贴贴赖了十分钟，再不起要迟到了' } }
+          : { id: 1, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '又赖了一会儿，现在真得起了' } },
+        { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
+        { id: 3, label: '起床，开始准备上班', start_routine: 'morning' },
       ],
       wmHint: false,
     };
@@ -1506,7 +1507,9 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     try { await scheduleOvertimeEnd(); } catch (e) { console.warn('[WORLD] start_overtime 失败:', e.message); }
   }
   // 第1块：选项带 start_routine（如起床洗漱）→ 启动早晨流程链。从周计划读 bk/cm（她周末定的，没定退默认）。
-  if (!parseFailed && option.start_routine) {
+  // 6/12：去掉 !parseFailed 枷锁——启动链=纯移动不花钱，是安全默认动作；解析失败兜底选中带链的选项
+  //（起床/走路回家）时链要真启动，否则她原地卡住。pending/扣钱/翘班等其他钩子仍只在解析成功时执行。
+  if (option.start_routine) {
     try {
       const opts = option.routine_opts || await readWorldPlan(); // 午休带 method；早晨读周计划
       // 天气好坏在链启动时定一次，随 opts/payload 透传整条链（坏天气通勤时长加成；午休链无通勤步不受影响）
