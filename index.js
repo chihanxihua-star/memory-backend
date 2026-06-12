@@ -913,41 +913,40 @@ const COMMUTE_OPTS = {
   taxi:   { activity: '打车',   location: '外出 · 路上', dur: [8, 12],  cost: 30 },
   walk:   { activity: '走路',   location: '外出 · 路上', dur: [35, 46], cost: 0 }, // 6/12 基准 22-28→35-46
 };
-// 雨天通勤时长（6/12 用户定）：地铁+15-25、打车+5-10、走路+20-25。rain 标志随链 opts/payload 透传。
-const COMMUTE_RAIN_DUR = { subway: [28, 42], taxi: [13, 22], walk: [55, 71] };
-function commuteStep(cmKey, rain) {
+// 坏天气（雨/雪）通勤时长（6/12 用户定）：地铁+15-25、打车+5-10、走路+20-25。
+// bad_weather 标志随链 opts/payload 透传，链启动时定一次。
+const COMMUTE_BADWX_DUR = { subway: [28, 42], taxi: [13, 22], walk: [55, 71] };
+function commuteStep(cmKey, badWeather) {
   const base = COMMUTE_OPTS[cmKey] || COMMUTE_OPTS.subway;
-  return rain ? { ...base, dur: COMMUTE_RAIN_DUR[cmKey] || base.dur } : { ...base };
+  return badWeather ? { ...base, dur: COMMUTE_BADWX_DUR[cmKey] || base.dur } : { ...base };
 }
 const DEFAULT_BREAKFAST = 'cook';   // 自己做（周末预制，平时在家吃现成）
 const DEFAULT_COMMUTE   = 'subway';
 
 // 按早饭计划 bk + 通勤方式 cm 组出早晨链。cook：在家吃完再走；buy：路上买、到工位再吃（到岗早、开工晚）。
-function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, rain = false) {
+function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, badWeather = false) {
   const cmKey = COMMUTE_OPTS[cm] ? cm : DEFAULT_COMMUTE;
-  const commute = commuteStep(cmKey, rain);
+  const commute = commuteStep(cmKey, badWeather);
   // 公司侧步行（6/12 加）：出地铁→公司 3-9 分，跟家侧"去地铁站"对称。仅地铁版，打车/走路门到门。
   const walkToCompany = { activity: '从地铁站走到公司', location: '外出 · 路上', dur: [3, 9] };
   const steps = [
     { activity: '穿衣服', location: '家 · 卧室', dur: [3, 9] },
     { activity: '洗漱',   location: '家 · 浴室', dur: [10, 15] },
   ];
-  // 早晨下雨改打车（6/12，跟下班同款）：雨天出门前 engage 一次「打车/地铁淋雨」。
-  // ⚠️ 雨天时这个 engage 步必须无论 cm 都在数组里（保持链形状一致）——她选打车后链会用
-  // cm=taxi 重建，engage 步若消失 next_index 会错位跳过通勤步。"已是打车不用问"在
-  // fireRoutineEngage 里判（返回 false 链自动继续）。CC 忙没弹成 → 照走默认地铁（雨天时长），不卡。
-  const rainAsk = !!rain;
+  // 「交通工具选择」步（6/12 重构）：恒在链里、不分天气/不分 cm——链形状永远一致，
+  // 选完用新 cm 重建 next_index 不会错位。弹不弹在 fireRoutineEngage 触发时现查：
+  // 天气好 or 已是打车 → 静默跳过走默认；坏天气(雨/雪) → 弹「打车/地铁」。以后"快迟到"也挂这步。
   if (bk === 'buy') {
     steps.push({ activity: '去便利店', location: '外出 · 路上',   dur: [3, 9] });
     steps.push({ engage: 'buy_food', activity: '挑早餐', location: '外出 · 便利店' }); // 到店→engage选吃的(食物表)
-    if (rainAsk) steps.push({ engage: 'rain_commute', activity: '准备去公司', location: '外出 · 便利店' });
+    steps.push({ engage: 'commute_choice', activity: '准备去公司', location: '外出 · 便利店' });
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
     if (cmKey === 'subway') steps.push({ ...walkToCompany });
     steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17] }); // 到岗后在工位吃
   } else { // cook（默认）
     steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true }); // 吃冰箱里预制的成品
-    if (rainAsk) steps.push({ engage: 'rain_commute', activity: '准备出门', location: '家 · 客厅' });
-    steps.push({ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] });
+    steps.push({ engage: 'commute_choice', activity: '准备出门', location: '家 · 客厅' });
+    if (cmKey === 'subway') steps.push({ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] }); // 打车/走路门到门不用去站
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
     if (cmKey === 'subway') steps.push({ ...walkToCompany });
   }
@@ -957,14 +956,14 @@ function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, rain 
 
 // 下班通勤链（用户 6/12 定）：选了什么工具状态栏就走那个标签；地铁多一段"从地铁站走回家"；
 // 终点=家·客厅"下班回家后休息"。复用 COMMUTE_OPTS 的时长/费用（打车 ¥30 在链里扣）。
-function buildEveningRoutine(cm = 'subway', rain = false) {
+function buildEveningRoutine(cm = 'subway', badWeather = false) {
   const steps = [];
   if (cm === 'subway') {
     steps.push({ activity: '从公司走到地铁站', location: '外出 · 路上', dur: [3, 9] }); // 公司侧步行，跟早晨对称
-    steps.push(commuteStep('subway', rain));                                   // 晴 13-17 / 雨 28-42
+    steps.push(commuteStep('subway', badWeather));                             // 好 13-17 / 坏 28-42
     steps.push({ activity: '从地铁站走回家', location: '外出 · 路上', dur: [3, 9] });
   } else {
-    steps.push(commuteStep(COMMUTE_OPTS[cm] ? cm : 'subway', rain));           // 打车 8-12/雨13-22(-¥30)、走路 35-46/雨55-71
+    steps.push(commuteStep(COMMUTE_OPTS[cm] ? cm : 'subway', badWeather));     // 打车 8-12/坏13-22(-¥30)、走路 35-46/坏55-71
   }
   steps.push({ activity: '下班回家后休息', location: '家 · 客厅', dur: null });   // 终点
   return steps;
@@ -986,19 +985,23 @@ function buildLunchRoutine(method = 'snack') {
 }
 
 function getRoutineSteps(routineName, opts = {}) {
-  if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm, opts.rain);
+  if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm, opts.bad_weather);
   if (routineName === 'lunch') return buildLunchRoutine(opts.method);
-  if (routineName === 'evening') return buildEveningRoutine(opts.cm, opts.rain);
+  if (routineName === 'evening') return buildEveningRoutine(opts.cm, opts.bad_weather);
   return [];
 }
 
-// 现在下没下雨：读 weather-fetcher 写的真实天气（45 分钟一更）。读失败按没下雨。
-async function isRainingNow() {
+// 现在天气坏不坏：读 weather-fetcher 写的真实天气（45 分钟一更）。
+// 返回 '雪' | '雨' | ''（雨夹雪按雪算，文案更贴）。读失败按天气好。
+async function badWeatherKind() {
   try {
     const { data } = await supabase.from('world_environment_cheng')
       .select('weather_text').eq('name', 'default').limit(1);
-    return /雨/.test((data && data[0] && data[0].weather_text) || '');
-  } catch { return false; }
+    const t = (data && data[0] && data[0].weather_text) || '';
+    if (/雪/.test(t)) return '雪';
+    if (/雨/.test(t)) return '雨';
+    return '';
+  } catch { return ''; }
 }
 
 // 吃一份成品早餐：先清过期，再从有货的里按"最快到期"扣一份（扣到 0 删行）。返回吃的成品名；没货返回 null。
@@ -1066,7 +1069,7 @@ async function advanceRoutine(routineName, idx, opts = {}) {
       await supabase.from('pending_wake_cheng').insert({
         wake_type: 'routine_step', reason: `${routineName}流程推进`, status: 'queued',
         scheduled_at: new Date(Date.now() + delaySec * 1000).toISOString(),
-        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method, rain: opts.rain },
+        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method, bad_weather: opts.bad_weather },
         attempts: 0,
       });
     }
@@ -1086,7 +1089,7 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       if (!pool.length) { console.log('[BUY_FOOD] 食物表没"便利店成品"，跳过选购'); return false; }
       // Fisher-Yates 洗牌取最多 3 个
       for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-      const cont = { routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm, rain: opts.rain };
+      const cont = { routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm, bad_weather: opts.bad_weather };
       const options = pool.slice(0, 3).map((f, i) => {
         const price = Number(f.price) || 0;
         return { id: i + 1, label: `${f.name}（¥${price}）`, effects: price ? { wallet_balance: -price } : {}, continue_routine: cont };
@@ -1096,16 +1099,22 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       const r = await triggerWorldWake(event, status, { force: true });
       return !!(r && r.fired);
     }
-    // 早晨下雨改打车（跟下班雨天版同款选项；时长/钱同一张表）。已经是打车计划就不用问。
-    if (engageType === 'rain_commute') {
-      if (opts.cm === 'taxi') return false; // 链自动继续走打车步
-      const cont = (cm) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm, rain: true });
+    // 「交通工具选择」步（跟下班坏天气版同款选项；时长/钱同一张表）。
+    // 天气好 or 已是打车 → 返回 false 静默走默认；坏天气(雨/雪)按种类换文案。以后"快迟到"也在这判。
+    if (engageType === 'commute_choice') {
+      if (opts.cm === 'taxi') return false;       // 已是打车，不用问
+      const kind = await badWeatherKind();        // 弹不弹按触发当下的真实天气
+      if (!kind) return false;                    // 天气好：静默走默认地铁
+      const cont = (cm) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm, bad_weather: true });
       const options = [
         { id: 1, label: '打车去公司（¥30）', continue_routine: cont('taxi') },
-        { id: 2, label: '坐地铁，淋一段路', continue_routine: cont('subway'),
+        { id: 2, label: kind === '雪' ? '坐地铁，踩着雪走一段' : '坐地铁，淋一段路', continue_routine: cont('subway'),
           effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }] },
       ];
-      const event = { key: 'morning_rain_commute', reason: '出门时发现外面在下雨，去公司怎么走？', options, wmHint: false };
+      const event = {
+        key: kind === '雪' ? 'morning_commute_snow' : 'morning_commute_rain',
+        reason: `出门时发现外面在下${kind}，去公司怎么走？`, options, wmHint: false,
+      };
       const r = await triggerWorldWake(event, status, { force: true });
       return !!(r && r.fired);
     }
@@ -1201,7 +1210,7 @@ async function firePendingWake(row) {
       console.log(`[ROUTINE] 「${expected}」被打断（现在「${st?.activity}」），链中止`);
       return { fired: true, system: true };
     }
-    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method, rain: p.rain });
+    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method, bad_weather: p.bad_weather });
     return { fired: true, system: true };
   }
   // 下班选择包（用户 6/12 定）：16 点没骰中加班 → 排这条 pending（daemon 自带 cc_busy 重试）。
@@ -1214,18 +1223,19 @@ async function firePendingWake(row) {
       console.log('[OFFWORK] 人已不在公司，下班选择作废');
       return { fired: true, system: true };
     }
-    const raining = await isRainingNow();
+    const kind = await badWeatherKind(); // '' | '雨' | '雪'
     const waited = !!(row.payload && row.payload.waited);
     let options;
-    if (raining) {
+    if (kind) {
       options = [
-        { id: 1, label: '打车回家（¥30）', start_routine: 'evening', routine_opts: { cm: 'taxi' } },
-        { id: 2, label: '坐地铁，淋一段路', start_routine: 'evening', routine_opts: { cm: 'subway' },
+        { id: 1, label: '打车回家（¥30）', start_routine: 'evening', routine_opts: { cm: 'taxi', bad_weather: true } },
+        { id: 2, label: kind === '雪' ? '坐地铁，踩着雪走一段' : '坐地铁，淋一段路',
+          start_routine: 'evening', routine_opts: { cm: 'subway', bad_weather: true },
           effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }] },
       ];
       if (!waited) options.push({
-        id: 3, label: '在公司等雨小一点', effects: {},
-        pending: { wake_type: 'offwork_choice', delay_world_minutes: 25, reason: '等了一阵雨，差不多该回家了', payload_extra: { waited: true } },
+        id: 3, label: `在公司等${kind}小一点`, effects: {},
+        pending: { wake_type: 'offwork_choice', delay_world_minutes: 25, reason: `等了一阵${kind}，差不多该回家了`, payload_extra: { waited: true } },
       });
     } else {
       options = [
@@ -1234,8 +1244,8 @@ async function firePendingWake(row) {
       ];
     }
     const event = {
-      key: raining ? 'offwork_choice_rain' : 'offwork_choice',
-      reason: raining ? '到点下班了，外面正下着雨' : '到点下班了，收拾收拾回家吧',
+      key: kind === '雪' ? 'offwork_choice_snow' : kind === '雨' ? 'offwork_choice_rain' : 'offwork_choice',
+      reason: kind ? `到点下班了，外面正下着${kind}` : '到点下班了，收拾收拾回家吧',
       options, wmHint: false,
     };
     return await triggerWorldWake(event, status, { force: true });
@@ -1357,10 +1367,10 @@ setOffWorkHandler(async (row, { overtime }) => {
   console.log('[OFFWORK] 已排下班选择包');
   return { fired: true };
 });
-// 加班结束：静默走 evening 链回家，雨天自动偏成打车（不再问），时长也按雨天加成。
+// 加班结束：静默走 evening 链回家，坏天气(雨/雪)自动偏成打车（不再问），时长也按坏天气加成。
 setEveningStarter(async () => {
-  const rain = await isRainingNow();
-  await advanceRoutine('evening', 0, { cm: rain ? 'taxi' : 'subway', rain });
+  const bad = !!(await badWeatherKind());
+  await advanceRoutine('evening', 0, { cm: bad ? 'taxi' : 'subway', bad_weather: bad });
 });
 
 // 世界唤醒轮收尾：解析澄的选择 → 读-改-写状态结算 effects → 写行程表。
@@ -1486,15 +1496,15 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
   if (!parseFailed && option.start_routine) {
     try {
       const opts = option.routine_opts || await readWorldPlan(); // 午休带 method；早晨读周计划
-      // 雨况在链启动时定一次，随 opts/payload 透传整条链（雨天通勤时长加成；午休链无通勤步不受影响）
-      if (opts.rain === undefined) opts.rain = await isRainingNow();
+      // 天气好坏在链启动时定一次，随 opts/payload 透传整条链（坏天气通勤时长加成；午休链无通勤步不受影响）
+      if (opts.bad_weather === undefined) opts.bad_weather = !!(await badWeatherKind());
       await advanceRoutine(option.start_routine, 0, opts);
     } catch (e) { console.warn('[WORLD] start_routine 失败:', e.message); }
   }
   // engage 步（便利店选吃的）：选项带 continue_routine → 她选完后继续早晨链的下一步。
   if (!parseFailed && option.continue_routine) {
     const cr = option.continue_routine;
-    try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm, rain: cr.rain }); }
+    try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm, bad_weather: cr.bad_weather }); }
     catch (e) { console.warn('[WORLD] continue_routine 失败:', e.message); }
   }
   // 周末规划：选项带 set_plan → 写进 world_plan_cheng（下周早饭计划等）。
