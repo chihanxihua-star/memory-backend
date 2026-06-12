@@ -854,18 +854,18 @@ async function processChatMoveTag(text) {
       .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
     if (e2) throw e2;
 
+    const moveDurationMin = await scheduleActivityEnd(newActivity); // 先排收尾拿时长，行程表记「持续多久」
     try {
       await supabase.from('daily_timeline_cheng').insert({
         world_time: realWorldTime(),
         location: up.location,
         action: fromLoc === target ? `${newActivity}（聊天中）` : `去了${room}（聊天中）`,
-        detail: { via: 'chat_move', from_location: fromLoc, to_location: target, activity: newActivity },
+        detail: { via: 'chat_move', from_location: fromLoc, to_location: target, activity: newActivity, duration_min: moveDurationMin },
         source: 'action',
       });
     } catch (e) { console.error('[MOVE] 行程写入失败（不连累主流程）:', e.message); }
 
     console.log(`[MOVE] 聊天移动: ${fromLoc} → ${target} · ${newActivity}`);
-    await scheduleActivityEnd(newActivity);
   } catch (e) { console.warn('[MOVE] 处理失败（不连累主流程）:', e.message); }
 }
 
@@ -1049,9 +1049,12 @@ async function advanceRoutine(routineName, idx, opts = {}) {
     const patch = { activity: act, location: step.location, updated_at: new Date().toISOString() };
     if (step.cost) patch.wallet_balance = Math.max(0, (Number(row.wallet_balance) || 0) - step.cost);
     await supabase.from('character_status_cheng').update(patch).eq('id', row.id);
+    // 时长先 roll（行程表记「持续多久」），下面排 pending 复用同一个值。终点/engage 步无时长=null。
+    let durationMin = null;
+    if (step.dur) { const [lo, hi] = step.dur; durationMin = lo + Math.floor(Math.random() * (hi - lo + 1)); }
     await supabase.from('daily_timeline_cheng').insert({
       world_time: realWorldTime(), location: step.location,
-      action: act, detail: { routine: routineName, step: idx, cost: step.cost || 0 }, source: 'system',
+      action: act, detail: { routine: routineName, step: idx, cost: step.cost || 0, duration_min: durationMin }, source: 'system',
     });
     console.log(`[ROUTINE] ${routineName} 第${idx}步 → ${step.location} · ${act}${step.cost ? ` (-¥${step.cost})` : ''}`);
     // engage 步（如便利店选吃的）：弹选项让她挑，链在她选完(continue_routine)后续，这里不排 routine_step。
@@ -1062,8 +1065,7 @@ async function advanceRoutine(routineName, idx, opts = {}) {
       return;
     }
     if (step.dur && idx + 1 < steps.length) {
-      const [lo, hi] = step.dur;
-      const delayMin = lo + Math.floor(Math.random() * (hi - lo + 1));
+      const delayMin = durationMin;
       const cfg = readWorldConfig();
       const delaySec = cfg.fast_test ? delayMin : delayMin * 60;
       await supabase.from('pending_wake_cheng').insert({
@@ -1421,6 +1423,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
 
   // 读-改-写：resolveEffects 算生活状态（0-100 钳位）+ 固定 effects（wallet 封底 0）+ target_location/activity。
   let updatedStatus = null;
+  let choiceDurationMin = null; // 选中行为 roll 出的持续时长（行程表「持续多久」）
   let effResolved = {}, effFixed = {}, effIgnored = {};
   try {
     const { data: rows, error } = await supabase
@@ -1441,8 +1444,8 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
         .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
       if (e2) throw e2;
       updatedStatus = up;
-      // 第二步：事件/唤醒里选出的行为也排自动结束（只在确实进入了新行为=targetAct 时）。
-      if (targetAct) await scheduleActivityEnd(up.activity);
+      // 第二步：事件/唤醒里选出的行为也排自动结束（只在确实进入了新行为=targetAct 时）。时长记给行程表。
+      if (targetAct) choiceDurationMin = await scheduleActivityEnd(up.activity);
     }
   } catch (e) {
     console.error('[WORLD] 结算状态失败:', e.message);
@@ -1492,14 +1495,14 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → 世界唤醒解析失败，默认选择：${option.label}`,
-        detail: { choice: option.id, reason: '', event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, ignored_effects: effIgnored, action_id: option.action_id || null, thinking: thinking || null, raw: (clean || '').slice(0, 200) },
+        detail: { choice: option.id, reason: '', event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, ignored_effects: effIgnored, action_id: option.action_id || null, thinking: thinking || null, duration_min: choiceDurationMin, raw: (clean || '').slice(0, 200) },
         source: 'system_error',
       });
     } else {
       const { data: tl, error: te } = await supabase.from('daily_timeline_cheng').insert({
         world_time: wt, location: loc,
         action: `${event.reason} → ${option.label}`,
-        detail: { choice: option.id, reason, event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, ignored_effects: effIgnored, item: option.item || null, action_id: option.action_id || null, thinking: thinking || null, pending_wake_id: pendingWakeId },
+        detail: { choice: option.id, reason, event_type: event.event_type || null, npc: event.npc || null, effects_hint: effSource.effects_hint || [], effects_resolved: effResolved, effects_fixed: effFixed, ignored_effects: effIgnored, item: option.item || null, action_id: option.action_id || null, thinking: thinking || null, duration_min: choiceDurationMin, pending_wake_id: pendingWakeId },
         source: 'claude',
       }).select('id').single();
       if (te) throw te;

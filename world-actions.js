@@ -26,9 +26,10 @@ export function activityDuration(activity) {
 
 // 给"她进入的行为"排一条 action_end 续唤醒：到点静默收尾。防串档=把 expected_activity 塞进 payload，
 // 到点比对当前 activity 没变才收（变了说明被别的行为/作息顶替，跳过）。豁免行为直接不排。
+// 返回 roll 出的世界分钟数（行程表记「持续多久」用）；豁免行为/失败返回 null。
 export async function scheduleActivityEnd(activity) {
   const range = activityDuration(activity);
-  if (!range) return;
+  if (!range) return null;
   const [lo, hi] = range;
   const delayMin = lo + Math.floor(Math.random() * (hi - lo + 1));
   const cfg = readWorldConfig();
@@ -42,7 +43,8 @@ export async function scheduleActivityEnd(activity) {
       attempts: 0,
     });
     console.log(`[ACTION_END] 排了「${activity}」结束，${delayMin} 世界分钟后`);
-  } catch (e) { console.warn('[ACTION_END] 排程失败:', e.message); }
+    return delayMin;
+  } catch (e) { console.warn('[ACTION_END] 排程失败:', e.message); return null; }
 }
 
 // 行为定义。allowed=允许执行的当前 location；target_location/activity=执行后移动到/变成；effects=状态变化。
@@ -106,6 +108,10 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
     .from('character_status_cheng').update(patch).eq('id', row.id).select().single();
   if (e2) throw e2;
 
+  // 第二步：先排自动结束，拿到 roll 出的时长给行程表记「持续多久」（豁免行为=null）。失败不连累主流程。
+  let durationMin = null;
+  if (actor === 'cheng') durationMin = await scheduleActivityEnd(up.activity);
+
   try {
     await supabase.from('daily_timeline_cheng').insert({
       world_time: realWorldTime(),
@@ -118,13 +124,12 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
         effects_fixed: fixed,
         ignored_effects: ignored,
         from_location: fromLoc, to_location: up.location, activity: up.activity,
+        duration_min: durationMin,
       },
       source: 'action',
     });
   } catch (e) { console.error('[ACTION] 行程写入失败（不连累主流程）:', e.message); }
 
   console.log(`[ACTION] ${actor} 执行「${action.label}」(${source}): ${fromLoc} → ${up.location}`);
-  // 第二步：给这个新行为排自动结束（豁免行为内部会跳过）。失败不连累主流程。
-  if (actor === 'cheng') await scheduleActivityEnd(up.activity);
   return up;
 }
