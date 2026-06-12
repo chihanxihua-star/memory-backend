@@ -1257,17 +1257,30 @@ async function firePendingWake(row) {
     const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
     const status = rows && rows[0];
     if (!status) return { fired: false, reason: 'no_status_row' };
+    // 贴贴变体（6/12）：小茉莉在家、跟澄同一个房间、还躺着（睡/休息）→「再睡」变「抱着小茉莉贴贴」。
+    // 每次到点现查——十分钟后她起床走了，选项就变回普通再睡。
+    let cuddle = false;
+    try {
+      const { data: us } = await supabase.from('user_status_cheng')
+        .select('presence, location, activity').eq('name', 'user').limit(1);
+      const u = us && us[0];
+      cuddle = !!(u && u.presence === '在家' && u.location === status.location && /睡|躺|休息/.test(u.activity || ''));
+    } catch { /* 读不到按普通再睡 */ }
     const event = {
       key: 'morning_wakeup',
       reason: '闹钟响了，该起床准备上班了',
       options: [
         { id: 1, label: '起床，开始准备上班', start_routine: 'morning' },
-        { id: 2, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '又赖了一会儿，现在真得起了' } },
+        cuddle
+          ? { id: 2, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '抱着小茉莉贴贴赖了十分钟，再不起要迟到了' } }
+          : { id: 2, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '又赖了一会儿，现在真得起了' } },
         { id: 3, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
       ],
       wmHint: false,
     };
-    return await triggerWorldWake(event, status, { force: true });
+    // 赖床续唤醒（payload 带 option_id=上一轮的选择）带上补充行，跟第一次响铃区分开。
+    const snoozed = !!(row.payload && row.payload.option_id);
+    return await triggerWorldWake(event, status, { force: true, pendingContext: snoozed ? row.reason : null });
   }
   // 周末规划：定下周早饭计划（自己做/买）。写进 world_plan_cheng，早晨链 start 时读它决定走哪条。
   // 「自己做」的"选做啥+预制+存预制库存"用食物表，是下个增量；这里先只定 cook/buy 顶层。

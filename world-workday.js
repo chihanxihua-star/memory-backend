@@ -19,10 +19,21 @@ const WEEKDAYS_WORK = ['星期一', '星期二', '星期三', '星期四', '星�
 export function isWorkday(weekday) { return WEEKDAYS_WORK.includes(String(weekday || '').trim()); }
 
 // 当日作息内存标记（跨午夜清空，重启清空可接受，不改 world_time）。
-const marks = { on_work: false, lunch: false, afternoon: false, off_decision: false };
+const marks = { alarm: false, on_work: false, lunch: false, afternoon: false, off_decision: false };
 export function clearWorkMarks() {
-  marks.on_work = marks.lunch = marks.afternoon = marks.off_decision = false;
+  marks.alarm = marks.on_work = marks.lunch = marks.afternoon = marks.off_decision = false;
   console.log('[WORK] 跨午夜，清空当日作息标记');
+}
+
+// 早晨流程是否在途：队列里有 morning_wakeup（含赖床续）或早晨链的 routine_step。
+// 用途：①闹钟去重（重启清 marks 后别二次上闹钟）②9:10 上班瞬移让位给链。
+async function hasMorningFlow() {
+  try {
+    const { data } = await supabase.from('pending_wake_cheng')
+      .select('wake_type, payload').eq('status', 'queued')
+      .in('wake_type', ['morning_wakeup', 'routine_step']).limit(10);
+    return (data || []).some(r => r.wake_type === 'morning_wakeup' || r.payload?.routine === 'morning');
+  } catch { return false; }
 }
 
 function toMin(hhmm) {
@@ -147,7 +158,26 @@ export async function workdayTick(status, env) {
   const t = toMin(cur.world_time);
   if (t == null) return cur;
   const atCompany = String(cur.location || '').startsWith('公司');
-  if (t >= 550 && t < 660 && !marks.on_work && !atCompany) { marks.on_work = true; return await goToWork(cur); }       // 09:10-11:00 上班（6/12 上班时间 9:00→9:10）
+  // 自动闹钟（6/12）：8:00-9:10 窗口、当天没响过、人在家、没有在途早晨流程 → 排 morning_wakeup pending
+  // （起床/贴贴或再睡/翘班三选在 firePendingWake 弹）。pending daemon 自带 CC 忙重试。
+  if (t >= 480 && t < 550 && !marks.alarm && String(cur.location || '').startsWith('家')) {
+    marks.alarm = true;
+    if (!(await hasMorningFlow())) {
+      try {
+        await supabase.from('pending_wake_cheng').insert({
+          wake_type: 'morning_wakeup', reason: '闹钟到点', status: 'queued',
+          scheduled_at: new Date().toISOString(), payload: {}, attempts: 0,
+        });
+        console.log('[WORK] 已上闹钟（morning_wakeup pending）');
+      } catch (e) { console.warn('[WORK] 上闹钟失败:', e.message); }
+    }
+    return cur;
+  }
+  if (t >= 550 && t < 660 && !marks.on_work && !atCompany) {                                                          // 09:10-11:00 上班（6/12 9:00→9:10）
+    if ((cur.activity || '') === '翘班在家') { marks.on_work = true; return cur; }  // 翘班=花了120买的，别瞬移去公司
+    if (await hasMorningFlow()) return cur;  // 早晨链在途：不瞬移不耗 mark，她自己会到岗（链断档时下个tick自然兜底）
+    marks.on_work = true; return await goToWork(cur);
+  }
   if (t >= 660 && t < 780 && !marks.lunch) { marks.lunch = true; return await goLunch(cur); }                          // 11:00-13:00 午休
   if (t >= 780 && t < 960 && !marks.afternoon && cur.location === '公司 · 休息室') { marks.afternoon = true; return await goAfternoon(cur); } // 13:00-16:00 下午上班
   if (t >= 960 && !marks.off_decision) { marks.off_decision = true; return await offWorkDecision(cur); }               // 16:00+ 下班判断
