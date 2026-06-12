@@ -932,14 +932,21 @@ function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, rain 
     { activity: '穿衣服', location: '家 · 卧室', dur: [3, 9] },
     { activity: '洗漱',   location: '家 · 浴室', dur: [10, 15] },
   ];
+  // 早晨下雨改打车（6/12，跟下班同款）：雨天出门前 engage 一次「打车/地铁淋雨」。
+  // ⚠️ 雨天时这个 engage 步必须无论 cm 都在数组里（保持链形状一致）——她选打车后链会用
+  // cm=taxi 重建，engage 步若消失 next_index 会错位跳过通勤步。"已是打车不用问"在
+  // fireRoutineEngage 里判（返回 false 链自动继续）。CC 忙没弹成 → 照走默认地铁（雨天时长），不卡。
+  const rainAsk = !!rain;
   if (bk === 'buy') {
     steps.push({ activity: '去便利店', location: '外出 · 路上',   dur: [3, 9] });
     steps.push({ engage: 'buy_food', activity: '挑早餐', location: '外出 · 便利店' }); // 到店→engage选吃的(食物表)
+    if (rainAsk) steps.push({ engage: 'rain_commute', activity: '准备去公司', location: '外出 · 便利店' });
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
     if (cmKey === 'subway') steps.push({ ...walkToCompany });
     steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17] }); // 到岗后在工位吃
   } else { // cook（默认）
     steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true }); // 吃冰箱里预制的成品
+    if (rainAsk) steps.push({ engage: 'rain_commute', activity: '准备出门', location: '家 · 客厅' });
     steps.push({ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] });
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
     if (cmKey === 'subway') steps.push({ ...walkToCompany });
@@ -1086,6 +1093,19 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       });
       options.push({ id: options.length + 1, label: '不买了，到公司再说', continue_routine: cont });
       const event = { key: 'buy_food', reason: '到便利店了，买点啥当早饭？', options, wmHint: false };
+      const r = await triggerWorldWake(event, status, { force: true });
+      return !!(r && r.fired);
+    }
+    // 早晨下雨改打车（跟下班雨天版同款选项；时长/钱同一张表）。已经是打车计划就不用问。
+    if (engageType === 'rain_commute') {
+      if (opts.cm === 'taxi') return false; // 链自动继续走打车步
+      const cont = (cm) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm, rain: true });
+      const options = [
+        { id: 1, label: '打车去公司（¥30）', continue_routine: cont('taxi') },
+        { id: 2, label: '坐地铁，淋一段路', continue_routine: cont('subway'),
+          effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }] },
+      ];
+      const event = { key: 'morning_rain_commute', reason: '出门时发现外面在下雨，去公司怎么走？', options, wmHint: false };
       const r = await triggerWorldWake(event, status, { force: true });
       return !!(r && r.fired);
     }
