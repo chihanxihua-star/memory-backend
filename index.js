@@ -931,49 +931,52 @@ const DEFAULT_BREAKFAST = 'cook';   // 自己做（周末预制，平时在家�
 const DEFAULT_COMMUTE   = 'subway';
 
 // 按早饭计划 bk + 通勤方式 cm 组出早晨链。cook：在家吃完再走；buy：路上买、到工位再吃（到岗早、开工晚）。
+// 整段通勤步（6/13 用户定，给搭配合并固定形状）。dir: 'to'去公司 / 'home'回家。
+//   地铁=去地铁站/从公司走到地铁站 + 坐地铁 + 从地铁站走到公司/回家（三步整串合并"坐地铁到公司/回家"）
+//   打车=出门/走到公司楼下 + 打车(等车5-10) + 乘车(晴8-12/坏13-22 + 打车费)（三步合并"打车到公司/回家"）
+//   走路=单步门到门
+function commuteSteps(cmKey, badWeather, dir) {
+  const key = COMMUTE_OPTS[cmKey] ? cmKey : 'subway';
+  if (key === 'taxi') {
+    const ride = commuteStep('taxi', badWeather); // {dur, cost}
+    return [
+      dir === 'home' ? { activity: '走到公司楼下', location: '外出 · 路上', dur: [3, 9] }
+                     : { activity: '出门', location: '外出 · 路上', dur: [3, 9] },
+      { activity: '打车', location: '外出 · 路上', dur: [5, 10] },                       // 等车
+      { activity: '乘车', location: '外出 · 路上', dur: ride.dur, cost: ride.cost },       // 路上 + 打车费
+    ];
+  }
+  if (key === 'walk') return [commuteStep('walk', badWeather)];
+  return dir === 'home'
+    ? [{ activity: '从公司走到地铁站', location: '外出 · 路上', dur: [3, 9] }, commuteStep('subway', badWeather), { activity: '从地铁站走回家', location: '外出 · 路上', dur: [3, 9] }]
+    : [{ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] }, commuteStep('subway', badWeather), { activity: '从地铁站走到公司', location: '外出 · 路上', dur: [3, 9] }];
+}
+
 function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, badWeather = false) {
   const cmKey = COMMUTE_OPTS[cm] ? cm : DEFAULT_COMMUTE;
-  const commute = commuteStep(cmKey, badWeather);
-  // 公司侧步行（6/12 加）：出地铁→公司 3-9 分，跟家侧"去地铁站"对称。仅地铁版，打车/走路门到门。
-  const walkToCompany = { activity: '从地铁站走到公司', location: '外出 · 路上', dur: [3, 9] };
   const steps = [
     { activity: '穿衣服', location: '家 · 卧室', dur: [3, 9] },
     { activity: '洗漱',   location: '家 · 浴室', dur: [10, 15] },
   ];
-  // 「交通工具选择」步（6/12 重构）：恒在链里、不分天气/不分 cm——链形状永远一致，
-  // 选完用新 cm 重建 next_index 不会错位。弹不弹在 fireRoutineEngage 触发时现查：
-  // 天气好 or 已是打车 → 静默跳过走默认；坏天气(雨/雪) → 弹「打车/地铁」。以后"快迟到"也挂这步。
+  // 「交通工具选择」步：恒在链里、不分天气/不分 cm——链形状一致，选完用新 cm 重建 next_index 不错位。
   if (bk === 'buy') {
     steps.push({ activity: '去便利店', location: '外出 · 路上',   dur: [3, 9] });
-    steps.push({ engage: 'buy_food', activity: '挑早餐', location: '外出 · 便利店' }); // 到店→engage选吃的(食物表)
+    steps.push({ engage: 'buy_food', activity: '挑早餐', location: '外出 · 便利店' });
     steps.push({ engage: 'commute_choice', activity: '准备去公司', location: '外出 · 便利店' });
-    steps.push({ ...commute });                                              // 坐地铁/打车/走路
-    if (cmKey === 'subway') steps.push({ ...walkToCompany });
-    steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17], is_meal: true, satiety_gain: [16, 19] }); // 到岗后在工位吃便利店买的
+    steps.push(...commuteSteps(cmKey, badWeather, 'to'));
+    steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17], is_meal: true, satiety_gain: [16, 19] });
   } else { // cook（默认）
-    steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true, is_meal: true, satiety_gain: [12, 15] }); // 吃冰箱里预制的成品
+    steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true, is_meal: true, satiety_gain: [12, 15] });
     steps.push({ engage: 'commute_choice', activity: '准备出门', location: '家 · 客厅' });
-    if (cmKey === 'subway') steps.push({ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] }); // 打车/走路门到门不用去站
-    steps.push({ ...commute });                                              // 坐地铁/打车/走路
-    if (cmKey === 'subway') steps.push({ ...walkToCompany });
+    steps.push(...commuteSteps(cmKey, badWeather, 'to'));
   }
   steps.push({ activity: '工作', location: '公司 · 工位', dur: null });          // 终点（工作=豁免）
   return steps;
 }
 
-// 下班通勤链（用户 6/12 定）：选了什么工具状态栏就走那个标签；地铁多一段"从地铁站走回家"；
-// 终点=家·客厅"下班回家后休息"。复用 COMMUTE_OPTS 的时长/费用（打车 ¥30 在链里扣）。
+// 下班通勤链：整段通勤(commuteSteps home) + 终点"下班回家后休息"。
 function buildEveningRoutine(cm = 'subway', badWeather = false) {
-  const steps = [];
-  if (cm === 'subway') {
-    steps.push({ activity: '从公司走到地铁站', location: '外出 · 路上', dur: [3, 9] }); // 公司侧步行，跟早晨对称
-    steps.push(commuteStep('subway', badWeather));                             // 好 13-17 / 坏 28-42
-    steps.push({ activity: '从地铁站走回家', location: '外出 · 路上', dur: [3, 9] });
-  } else {
-    steps.push(commuteStep(COMMUTE_OPTS[cm] ? cm : 'subway', badWeather));     // 打车 8-12/坏13-22(-¥30)、走路 35-46/坏55-71
-  }
-  steps.push({ activity: '下班回家后休息', location: '家 · 客厅', dur: null });   // 终点
-  return steps;
+  return [...commuteSteps(cm, badWeather, 'home'), { activity: '下班回家后休息', location: '家 · 客厅', dur: null }];
 }
 
 // 午休吃饭链（6/13 重构）。method 决定吃法+地点；外卖扣钱在选择结算时按份数做，不走 step.cost。
