@@ -3654,11 +3654,11 @@ app.patch('/api/world/narration/phrase/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/world/narration/template', async (req, res) => {
-  const { template, enabled } = req.body || {};
+  const { template, enabled, kind } = req.body || {};
   if (!template) return res.status(400).json({ error: '缺少 template' });
   try {
     const { data, error } = await supabase.from('world_self_narration_templates')
-      .insert({ template, enabled: enabled !== false }).select().single();
+      .insert({ template, enabled: enabled !== false, kind: kind === 'action' ? 'action' : 'normal' }).select().single();
     if (error) throw error;
     res.json({ ok: true, template: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
