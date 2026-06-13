@@ -29,13 +29,59 @@ export function realWorldTime() {
 const ACT_MAP = { resting: '休息', working: '工作', lunch_break: '午休', overtime: '加班', showering: '洗澡', eating: '吃东西' };
 function mapActivity(a) { return ACT_MAP[a] || a || '闲着'; }
 
-// 读启用的短语规则 + 模板（小表，调用频率低，每次读一份即可，编辑后立即生效）。
+// 读启用的短语规则 + 模板 + 动作短语（小表，调用频率低，每次读一份即可，编辑后立即生效）。
 export async function loadNarrationRules() {
-  const [ph, tpl] = await Promise.all([
+  const [ph, tpl, act] = await Promise.all([
     supabase.from('world_self_narration_phrases').select('*').eq('enabled', true),
     supabase.from('world_self_narration_templates').select('*').eq('enabled', true),
+    supabase.from('world_self_narration_actions').select('*').eq('enabled', true),
   ]);
-  return { phrases: ph.data || [], templates: tpl.data || [] };
+  return { phrases: ph.data || [], templates: tpl.data || [], actions: act.data || [] };
+}
+
+// 待补叙队列：silent 动作（链步骤/作息切换）执行时入队，<此刻> 生成消费后清空。
+// item = { action: activity名, meal?: 菜名 }。最多留最近 15 个防爆。
+export async function appendNarration(actionName, meal = null) {
+  if (!actionName) return;
+  try {
+    const { data } = await supabase.from('character_status_cheng').select('pending_narration').eq('name', '澄').limit(1);
+    const cur = Array.isArray(data?.[0]?.pending_narration) ? data[0].pending_narration : [];
+    cur.push(meal ? { action: actionName, meal } : { action: actionName });
+    await supabase.from('character_status_cheng').update({ pending_narration: cur.slice(-15) }).eq('name', '澄');
+  } catch (e) { console.warn('[NAR] appendNarration 失败:', e.message); }
+}
+// 生成 <此刻> 后清空队列（调用方在拿到 nowBlock 后调）。
+export async function clearNarration() {
+  try { await supabase.from('character_status_cheng').update({ pending_narration: [] }).eq('name', '澄'); }
+  catch (e) { console.warn('[NAR] clearNarration 失败:', e.message); }
+}
+
+// 把队列动作串成「我A，B，C」回顾句。每个动作从 actions 库随机抽一句（含 {meal} 替换），避连抽同句。
+const recentActionPhraseIds = new Set();
+function buildRecentActions(pending, actions) {
+  const items = Array.isArray(pending) ? pending : [];
+  if (!items.length) return '';
+  const parts = [];
+  for (const it of items) {
+    const actName = typeof it === 'string' ? it : it?.action;
+    if (!actName) continue;
+    const meal = (it && typeof it === 'object' && it.meal) ? it.meal : '';
+    const matches = (actions || []).filter(a => a.action === actName);
+    let phrase;
+    if (matches.length) {
+      const fresh = matches.filter(a => !recentActionPhraseIds.has(a.id));
+      const pool = fresh.length ? fresh : matches;
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      recentActionPhraseIds.add(pick.id);
+      phrase = pick.phrase;
+    } else {
+      phrase = actName; // 没配短语兜底用动作名
+    }
+    parts.push(phrase.replace(/\{meal\}/g, meal || '点东西'));
+  }
+  recentActionPhraseIds.clear();
+  if (!parts.length) return '';
+  return '我' + parts.join('，');
 }
 
 // 避免连续两次抽到同一句。
@@ -60,25 +106,37 @@ function pickPhrases(status, phrases) {
   return strs.length ? strs.join('，') + '。' : '';
 }
 
-// 澄第一人称自述。env 给 date；空 phrases 收干净不留多余标点。
-export function generateChengSelfNarration(status, env, phrases, templates) {
-  const tpls = (templates || []).filter(t => t.template);
+// 澄第一人称自述。rules = { phrases, templates, actions }。
+// 队列非空 → 动作版（kind=action 模板 + {recent_actions} 回顾串）；空 → 普通版（kind=normal）。
+// 注意：本函数纯生成不清队列，清空由调用方拿到 nowBlock 后调 clearNarration()。
+export function generateChengSelfNarration(status, env, rules) {
+  const phrases = rules?.phrases || [];
+  const allTpls = (rules?.templates || []).filter(t => t.template);
+  const actions = rules?.actions || [];
+  const pending = Array.isArray(status?.pending_narration) ? status.pending_narration : [];
+  const useAction = pending.length > 0;
+  const kind = useAction ? 'action' : 'normal';
+  let tpls = allTpls.filter(t => (t.kind || 'normal') === kind);
+  if (!tpls.length) tpls = allTpls.filter(t => (t.kind || 'normal') === 'normal'); // 动作模板没配就退普通
   const tpl = tpls.length
     ? tpls[Math.floor(Math.random() * tpls.length)].template
-    : '现在是 {date} {time}。我在{location_natural}，正在{activity}。{phrases}';
+    : (useAction ? '现在是 {date} {time}。{recent_actions}，在{location_natural}。{phrases}'
+                 : '现在是 {date} {time}。我在{location_natural}，正在{activity}。{phrases}');
   const date = (env && env.date) || '';
   const time = realWorldTime();
   const locN = formatNaturalLocation(status?.location);
   const act = mapActivity(status?.activity);
   const ph = pickPhrases(status, phrases);
+  const recentActions = useAction ? buildRecentActions(pending, actions) : '';
   let s = tpl
     .replace(/\{date\}/g, date)
     .replace(/\{time\}/g, time)
-    .replace(/\{weather\}/g, (env && env.weather) || '') // 默认 seed 模板不含；想让澄提天气就在模板加 {weather}
+    .replace(/\{weather\}/g, (env && env.weather) || '')
     .replace(/\{location_natural\}/g, locN)
     .replace(/\{activity\}/g, act)
+    .replace(/\{recent_actions\}/g, recentActions)
     .replace(/\{phrases\}/g, ph);
-  return s.replace(/ {2,}/g, ' ').trim();
+  return s.replace(/ {2,}/g, ' ').replace(/，。/g, '。').trim();
 }
 
 // 小茉莉第三人称客观描述。activity 是用户手填，允许长/换行/引号，原样拼，不清洗。
@@ -90,8 +148,8 @@ export function formatUserStatus(user) {
 }
 
 // <此刻> 内层内容（不含 <此刻> 标签壳）：澄自述 + 空行 + 小茉莉。两个入口共用。
-export function buildNowInner(chengStatus, env, user, phrases, templates) {
-  const cheng = generateChengSelfNarration(chengStatus, env, phrases, templates);
+export function buildNowInner(chengStatus, env, user, rules) {
+  const cheng = generateChengSelfNarration(chengStatus, env, rules);
   const mol = formatUserStatus(user);
   // 不带「澄：」前缀（自述本来就是第一人称「我」）；小茉莉行去冒号拼成一句话（2026-06-12 用户定的格式）
   return `${cheng}\n\n小茉莉${mol}`;

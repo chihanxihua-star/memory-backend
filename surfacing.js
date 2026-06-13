@@ -8,7 +8,7 @@
 import fs from 'fs';
 import path from 'path';
 import { supabase } from './memory.js';
-import { buildNowInner, loadNarrationRules } from './world-narration.js';
+import { buildNowInner, loadNarrationRules, clearNarration } from './world-narration.js';
 import { pickWorldThought } from './world-thoughts.js';
 
 const FUXIAN_PATH = '/home/claude-user/.claude/CLAUDE.md';
@@ -201,7 +201,7 @@ async function gatherItems(userText) {
 async function buildNowStatusLine() {
   try {
     const [cs, us, env, rules] = await Promise.all([
-      supabase.from('character_status_cheng').select('world_time, location, activity, energy, satiety, cleanliness, health').eq('name', '澄').limit(1),
+      supabase.from('character_status_cheng').select('world_time, location, activity, energy, satiety, cleanliness, health, pending_narration').eq('name', '澄').limit(1),
       supabase.from('user_status_cheng').select('presence, location, activity').eq('name', 'user').limit(1),
       supabase.from('world_environment_cheng').select('date').eq('name', 'default').limit(1),
       loadNarrationRules(),
@@ -209,7 +209,10 @@ async function buildNowStatusLine() {
     const cheng = (cs.data && cs.data[0]) || {};
     const user = (us.data && us.data[0]) || {};
     const e = (env.data && env.data[0]) || {};
-    return buildNowInner(cheng, e, user, rules.phrases, rules.templates);
+    const result = buildNowInner(cheng, e, user, rules);
+    // 聊天 <此刻> 也消费动作补叙：用过即清，避免下条消息重复（每个动作只补一次）
+    if (Array.isArray(cheng.pending_narration) && cheng.pending_narration.length) await clearNarration();
+    return result;
   } catch (err) {
     console.warn('[surfacing] 生成 <此刻> 失败:', err.message);
     return '';

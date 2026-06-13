@@ -5,7 +5,7 @@
 import { supabase } from './memory.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 import { readWorldConfig } from './world-tick.js';
-import { realWorldTime } from './world-narration.js';
+import { realWorldTime, appendNarration } from './world-narration.js';
 
 const OVERTIME_HINT = [
   { stat: 'energy', direction: 'down', strength: 'small' },
@@ -45,7 +45,8 @@ async function readStatus() {
   return data && data[0];
 }
 // 更新状态 + 写一条 system 行程。返回更新后状态。
-async function setState(row, patch, action, detail) {
+// opts.narrate：是否入队补叙（作息切换=她不知道的动作，补；发工资不是动作，不补）。
+async function setState(row, patch, action, detail, opts = {}) {
   const { data: up, error } = await supabase
     .from('character_status_cheng').update({ ...patch, updated_at: new Date().toISOString() })
     .eq('id', row.id).select().single();
@@ -56,6 +57,7 @@ async function setState(row, patch, action, detail) {
       world_time: realWorldTime(), location: st.location, action, detail, source: 'system',
     });
   } catch (e) { console.warn('[WORK] 行程写入失败:', e.message); }
+  if (opts.narrate !== false) { try { await appendNarration(action); } catch { /* 不连累主流程 */ } }
   return st;
 }
 
@@ -162,7 +164,8 @@ export async function maybePaySalary({ force = false } = {}) {
   await supabase.from('work_profile_cheng').update({ last_salary_paid_month: yearMonth, updated_at: new Date().toISOString() }).eq('actor', 'cheng');
   console.log(`[WORK] 发工资 ${amount}（${yearMonth}）`);
   return setState(row, { wallet_balance: cur + amount }, '发工资',
-    { amount, type: 'intern_salary', department: prof.department, role: prof.role, effects_fixed: { wallet_balance: amount } });
+    { amount, type: 'intern_salary', department: prof.department, role: prof.role, effects_fixed: { wallet_balance: amount } },
+    { narrate: false }); // 发工资不是动作，不补叙
 }
 
 // tick：自动作息（工作日 + world_time 阈值，同一天每段一次）+ 工资。系统更新，不 engage。返回(可能更新的) status。

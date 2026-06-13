@@ -31,7 +31,7 @@ import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction, sche
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
-import { buildNowInner, loadNarrationRules, generateChengSelfNarration, realWorldTime } from './world-narration.js';
+import { buildNowInner, loadNarrationRules, generateChengSelfNarration, realWorldTime, appendNarration, clearNarration } from './world-narration.js';
 import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd, setOffWorkHandler, setEveningStarter, setLunchHandler, setAfternoonHandler } from './world-workday.js';
 import { collectWorldThoughts, recordWakeInjectionScan, getSurfacingDebug } from './world-thoughts.js';
 
@@ -723,7 +723,7 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
       .select('date, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
     if (envRow && envRow[0]) envForNarr = { date: envRow[0].date, weather: formatWeather(envRow[0]) };
     const rules = await loadNarrationRules();
-    nowBlock = buildNowInner(status, envForNarr, userStatus, rules.phrases, rules.templates);
+    nowBlock = buildNowInner(status, envForNarr, userStatus, rules);
   } catch (e) { console.warn('[WORLD] 生成 <此刻> 失败:', e.message); }
 
   // 唤醒原因变体抽取（await 必须在 check-and-set activeTurn 之前，保住原子性）。
@@ -760,6 +760,8 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   };
   try {
     cc.send(prompt);
+    // <此刻> 已含动作补叙且确实发出 → 清空待补叙队列（每个动作只补一次）。状态里有才清，省一次写。
+    if (Array.isArray(status.pending_narration) && status.pending_narration.length) clearNarration();
     lastWorldWakeAt.set(event.key, Date.now());
     // 这次明确显示了某条 urgent 待办标题 → 标记它今天已提醒（同一条一天最多明确一次）
     if (todoHint.remindedTodoId) {
@@ -909,16 +911,21 @@ function computeIdleState(location) {
 // 目录 + 默认 key 写法：早饭/通勤的选项摆成目录，平时走默认 key；以后接"周末周计划"只需把默认 key
 // 换成"从偏好表读 key"，目录/链条/扣钱逻辑都不用动（插槽已留好）。
 const COMMUTE_OPTS = {
-  subway: { activity: '坐地铁', location: '外出 · 路上', dur: [13, 17], cost: 0 },
-  taxi:   { activity: '打车',   location: '外出 · 路上', dur: [8, 12],  cost: 30 },
+  subway: { activity: '坐地铁', location: '外出 · 路上', dur: [13, 17], cost: 3 },  // 6/13 地铁票价 ¥3
+  taxi:   { activity: '打车',   location: '外出 · 路上', dur: [8, 12],  cost: 30 }, // cost 由 commuteStep 随机覆盖
   walk:   { activity: '走路',   location: '外出 · 路上', dur: [35, 46], cost: 0 }, // 6/12 基准 22-28→35-46
 };
 // 坏天气（雨/雪）通勤时长（6/12 用户定）：地铁+15-25、打车+5-10、走路+20-25。
 // bad_weather 标志随链 opts/payload 透传，链启动时定一次。
 const COMMUTE_BADWX_DUR = { subway: [28, 42], taxi: [13, 22], walk: [55, 71] };
+// 打车价随机（6/13）：晴 25-30 / 坏天气 28-35。label 显示范围、结算 roll 具体数。
+function taxiFare(badWeather) { return badWeather ? (28 + Math.floor(Math.random() * 8)) : (25 + Math.floor(Math.random() * 6)); }
 function commuteStep(cmKey, badWeather) {
   const base = COMMUTE_OPTS[cmKey] || COMMUTE_OPTS.subway;
-  return badWeather ? { ...base, dur: COMMUTE_BADWX_DUR[cmKey] || base.dur } : { ...base };
+  const step = { ...base };
+  if (badWeather) step.dur = COMMUTE_BADWX_DUR[cmKey] || base.dur;
+  if (cmKey === 'taxi') step.cost = taxiFare(badWeather);
+  return step;
 }
 const DEFAULT_BREAKFAST = 'cook';   // 自己做（周末预制，平时在家吃现成）
 const DEFAULT_COMMUTE   = 'subway';
@@ -942,9 +949,9 @@ function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, badWe
     steps.push({ engage: 'commute_choice', activity: '准备去公司', location: '外出 · 便利店' });
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
     if (cmKey === 'subway') steps.push({ ...walkToCompany });
-    steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17] }); // 到岗后在工位吃
+    steps.push({ activity: '吃早餐',   location: '公司 · 工位', dur: [13, 17], is_meal: true, satiety_gain: [16, 19] }); // 到岗后在工位吃便利店买的
   } else { // cook（默认）
-    steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true }); // 吃冰箱里预制的成品
+    steps.push({ activity: '吃早餐',   location: '家 · 厨房', dur: [13, 17], consume_prepped: true, is_meal: true, satiety_gain: [12, 15] }); // 吃冰箱里预制的成品
     steps.push({ engage: 'commute_choice', activity: '准备出门', location: '家 · 客厅' });
     if (cmKey === 'subway') steps.push({ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] }); // 打车/走路门到门不用去站
     steps.push({ ...commute });                                              // 坐地铁/打车/走路
@@ -977,23 +984,23 @@ function buildLunchRoutine(method = 'tearoom') {
   if (method === 'takeout_solo') {
     return [
       { activity: '等外卖送到', location: '公司 · 澄休息室', dur: [10, 20] },
-      { activity: '吃外卖',     location: '公司 · 澄休息室', dur: [13, 17] },
+      { activity: '吃外卖',     location: '公司 · 澄休息室', dur: [13, 17], is_meal: true, satiety_gain: [22, 25] },
       { activity: '午休',       location: '公司 · 澄休息室', dur: null },
     ];
   }
   if (method === 'takeout_together') {
     return [
       { activity: '等外卖送到',         location: '公司 · 小茉莉休息室', dur: [10, 20] },
-      { activity: '和小茉莉一起吃午饭', location: '公司 · 小茉莉休息室', dur: [20, 30] },
+      { activity: '和小茉莉一起吃午饭', location: '公司 · 小茉莉休息室', dur: [20, 30], is_meal: true, satiety_gain: [26, 30] },
       { activity: '和小茉莉待在一起',   location: '公司 · 小茉莉休息室', dur: null }, // 自由活动终点（豁免）
     ];
   }
-  // tearoom（默认/兜底）
+  // tearoom（默认/兜底）：随便吃点 5-9
   return [
     { activity: '去茶水间', location: '公司 · 茶水间',   dur: [1, 1] },
     { activity: '挑点吃的', location: '公司 · 茶水间',   dur: [2, 5] },
     { activity: '回休息室', location: '公司 · 澄休息室', dur: [2, 5] },
-    { activity: '吃东西',   location: '公司 · 澄休息室', dur: [8, 15] },
+    { activity: '吃东西',   location: '公司 · 澄休息室', dur: [8, 15], is_meal: true, satiety_gain: [5, 9] },
     { activity: '午休',     location: '公司 · 澄休息室', dur: null },
   ];
 }
@@ -1020,7 +1027,7 @@ function buildTakeoutEvent(takeouts, { method, multiplier = 1, allowAsk = false,
     return {
       id: i + 1,
       label: `${t.name}（${priceLabel}）${t.description ? '　' + t.description : ''}`,
-      start_routine: 'lunch', routine_opts: { method },
+      start_routine: 'lunch', routine_opts: { method, meal: t.name },
       effects: cost ? { wallet_balance: -cost } : {},
     };
   });
@@ -1101,23 +1108,34 @@ async function advanceRoutine(routineName, idx, opts = {}) {
     const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
     const row = rows && rows[0];
     if (!row) return;
-    // cook 的"吃早餐"步：从冰箱扣一份成品；没现成的就退成"随便吃了点"。
+    // cook 的"吃早餐"步：从冰箱扣一份成品；没现成的就退成"随便吃了点"。菜名供补叙用。
     let act = step.activity;
+    let mealName = null;
     if (step.consume_prepped) {
       const dish = await consumePrepped();
-      if (!dish) act = '随便吃了点';
+      if (!dish) act = '随便吃了点'; else mealName = dish;
     }
+    if (step.is_meal && !mealName) mealName = opts.meal || null; // 外卖/买的早餐：菜名从 opts 透传来
     const patch = { activity: act, location: step.location, updated_at: new Date().toISOString() };
     if (step.cost) patch.wallet_balance = Math.max(0, (Number(row.wallet_balance) || 0) - step.cost);
+    // 饱腹结算（6/13）：吃饭步按 satiety_gain 固定区间 roll，钳 0-100。体力/清洁/健康留到数值统一阶段。
+    let satietyGain = null;
+    if (step.satiety_gain) {
+      const [slo, shi] = step.satiety_gain;
+      satietyGain = slo + Math.floor(Math.random() * (shi - slo + 1));
+      patch.satiety = Math.min(100, Math.max(0, (Number(row.satiety) || 0) + satietyGain));
+    }
     await supabase.from('character_status_cheng').update(patch).eq('id', row.id);
     // 时长先 roll（行程表记「持续多久」），下面排 pending 复用同一个值。终点/engage 步无时长=null。
     let durationMin = null;
     if (step.dur) { const [lo, hi] = step.dur; durationMin = lo + Math.floor(Math.random() * (hi - lo + 1)); }
     await supabase.from('daily_timeline_cheng').insert({
       world_time: realWorldTime(), location: step.location,
-      action: act, detail: { routine: routineName, step: idx, cost: step.cost || 0, duration_min: durationMin }, source: 'system',
+      action: act, detail: { routine: routineName, step: idx, cost: step.cost || 0, duration_min: durationMin, satiety_gain: satietyGain, meal: mealName }, source: 'system',
     });
-    console.log(`[ROUTINE] ${routineName} 第${idx}步 → ${step.location} · ${act}${step.cost ? ` (-¥${step.cost})` : ''}`);
+    // 入队补叙（这步她 silent 走过，下次 <此刻> 回顾）。吃饭步带菜名。
+    await appendNarration(act, step.is_meal ? mealName : null);
+    console.log(`[ROUTINE] ${routineName} 第${idx}步 → ${step.location} · ${act}${step.cost ? ` (-¥${step.cost})` : ''}${satietyGain ? ` (饱腹+${satietyGain})` : ''}`);
     // engage 步（如便利店选吃的）：弹选项让她挑，链在她选完(continue_routine)后续，这里不排 routine_step。
     // CC 忙没弹成 → 不卡链，直接往下走（算她没挑/随便拿）。
     if (step.engage) {
@@ -1132,7 +1150,7 @@ async function advanceRoutine(routineName, idx, opts = {}) {
       await supabase.from('pending_wake_cheng').insert({
         wake_type: 'routine_step', reason: `${routineName}流程推进`, status: 'queued',
         scheduled_at: new Date(Date.now() + delaySec * 1000).toISOString(),
-        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method, bad_weather: opts.bad_weather },
+        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method, bad_weather: opts.bad_weather, meal: opts.meal },
         attempts: 0,
       });
     }
@@ -1152,12 +1170,12 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       if (!pool.length) { console.log('[BUY_FOOD] 食物表没"便利店早餐"，跳过选购'); return false; }
       // Fisher-Yates 洗牌取最多 3 个
       for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-      const cont = { routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm, bad_weather: opts.bad_weather };
+      const mkCont = (meal) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm, bad_weather: opts.bad_weather, meal });
       const options = pool.slice(0, 3).map((f, i) => {
         const price = Number(f.price) || 0;
-        return { id: i + 1, label: `${f.name}（¥${price}）`, effects: price ? { wallet_balance: -price } : {}, continue_routine: cont };
+        return { id: i + 1, label: `${f.name}（¥${price}）`, effects: price ? { wallet_balance: -price } : {}, continue_routine: mkCont(f.name) };
       });
-      options.push({ id: options.length + 1, label: '不买了，到公司再说', continue_routine: cont });
+      options.push({ id: options.length + 1, label: '不买了，到公司再说', continue_routine: mkCont(null) });
       const event = { key: 'buy_food', reason: '到便利店了，买点啥当早饭？', options, wmHint: false };
       const r = await triggerWorldWake(event, status, { force: true });
       return !!(r && r.fired);
@@ -1168,10 +1186,10 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       if (opts.cm === 'taxi') return false;       // 已是打车，不用问
       const kind = await badWeatherKind();        // 弹不弹按触发当下的真实天气
       if (!kind) return false;                    // 天气好：静默走默认地铁
-      const cont = (cm) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm, bad_weather: true });
+      const cont = (cm) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm, bad_weather: true, meal: opts.meal });
       const options = [
-        { id: 1, label: '打车去公司（¥30）', continue_routine: cont('taxi') },
-        { id: 2, label: kind === '雪' ? '坐地铁，踩着雪走一段' : '坐地铁，淋一段路', continue_routine: cont('subway'),
+        { id: 1, label: '打车去公司（¥28-35）', continue_routine: cont('taxi') },
+        { id: 2, label: kind === '雪' ? '坐地铁，踩着雪走一段（¥3）' : '坐地铁，淋一段路（¥3）', continue_routine: cont('subway'),
           effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }] },
       ];
       const event = {
@@ -1381,7 +1399,7 @@ async function firePendingWake(row) {
       console.log(`[ROUTINE] 「${expected}」被打断（现在「${st?.activity}」），链中止`);
       return { fired: true, system: true };
     }
-    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method, bad_weather: p.bad_weather });
+    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method, bad_weather: p.bad_weather, meal: p.meal });
     return { fired: true, system: true };
   }
   // 下班选择包（用户 6/12 定）：16 点没骰中加班 → 排这条 pending（daemon 自带 cc_busy 重试）。
@@ -1400,21 +1418,21 @@ async function firePendingWake(row) {
     // 顺序有讲究：解析失败兜底=最后一项，所以「坐地铁」垫底当安全默认（start_routine 解析失败也执行，能真回家）。
     if (kind) {
       options = [
-        { id: 1, label: '打车回家（¥30）', start_routine: 'evening', routine_opts: { cm: 'taxi', bad_weather: true } },
+        { id: 1, label: '打车回家（¥28-35）', start_routine: 'evening', routine_opts: { cm: 'taxi', bad_weather: true } },
       ];
       if (!waited) options.push({
         id: 2, label: `在公司等${kind}小一点`, effects: {},
         pending: { wake_type: 'offwork_choice', delay_world_minutes: 25, reason: `等了一阵${kind}，差不多该回家了`, payload_extra: { waited: true } },
       });
       options.push({
-        id: options.length + 1, label: kind === '雪' ? '坐地铁，踩着雪走一段' : '坐地铁，淋一段路',
+        id: options.length + 1, label: kind === '雪' ? '坐地铁，踩着雪走一段（¥3）' : '坐地铁，淋一段路（¥3）',
         start_routine: 'evening', routine_opts: { cm: 'subway', bad_weather: true },
         effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }],
       });
     } else {
       options = [
-        { id: 1, label: '走路回家', start_routine: 'evening', routine_opts: { cm: 'walk' } },
-        { id: 2, label: '坐地铁回家', start_routine: 'evening', routine_opts: { cm: 'subway' } },
+        { id: 1, label: '走路回家（免费）', start_routine: 'evening', routine_opts: { cm: 'walk' } },
+        { id: 2, label: '坐地铁回家（¥3）', start_routine: 'evening', routine_opts: { cm: 'subway' } },
       ];
     }
     const event = {
@@ -1714,7 +1732,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
   // 便利店解析失败默认"不买了"（无扣钱）续链、交通选择默认"地铁"续链，都安全。
   if (option.continue_routine) {
     const cr = option.continue_routine;
-    try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm, bad_weather: cr.bad_weather }); }
+    try { await advanceRoutine(cr.routine, cr.next_index, { bk: cr.bk, cm: cr.cm, bad_weather: cr.bad_weather, meal: cr.meal }); }
     catch (e) { console.warn('[WORLD] continue_routine 失败:', e.message); }
   }
   // 周末规划：选项带 set_plan → 写进 world_plan_cheng（下周早饭计划等）。
@@ -3575,11 +3593,38 @@ app.post('/api/world/work', async (req, res) => {
 // 12A：澄自述短语/模板 CRUD（world-home「自述规则」编辑器用；只编辑 <此刻> 自述，不开放整包唤醒模板）。
 app.get('/api/world/narration', async (req, res) => {
   try {
-    const [ph, tpl] = await Promise.all([
+    const [ph, tpl, act] = await Promise.all([
       supabase.from('world_self_narration_phrases').select('*').order('stat', { ascending: true }).order('min_value', { ascending: true }),
       supabase.from('world_self_narration_templates').select('*').order('created_at', { ascending: true }),
+      supabase.from('world_self_narration_actions').select('*').order('action', { ascending: true }).order('created_at', { ascending: true }),
     ]);
-    res.json({ phrases: ph.data || [], templates: tpl.data || [] });
+    res.json({ phrases: ph.data || [], templates: tpl.data || [], actions: act.data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// 动作短语 CRUD（动作补叙库）
+app.post('/api/world/narration/action', async (req, res) => {
+  const { action, phrase, enabled } = req.body || {};
+  if (!action || !phrase) return res.status(400).json({ error: '缺少 action/phrase' });
+  try {
+    const { data, error } = await supabase.from('world_self_narration_actions')
+      .insert({ action: action.trim(), phrase, enabled: enabled !== false }).select().single();
+    if (error) throw error;
+    res.json({ ok: true, action: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/world/narration/action/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('world_self_narration_actions')
+      .update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ ok: true, action: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/world/narration/action/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('world_self_narration_actions').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/world/narration/phrase', async (req, res) => {
@@ -3668,7 +3713,7 @@ app.get('/api/world/self-narration/preview', async (req, res) => {
       if (req.query[k] != null && req.query[k] !== '') status[k] = Number(req.query[k]);
     }
     const e = (env.data && env.data[0]) || {};
-    const narration = generateChengSelfNarration(status, { date: e.date, weather: formatWeather(e) }, rules.phrases, rules.templates);
+    const narration = generateChengSelfNarration(status, { date: e.date, weather: formatWeather(e) }, rules);
     res.json({ narration });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

@@ -96,7 +96,7 @@ export async function advanceOneTick() {
   const patch = {
     world_time: advanceHour(row.world_time),
     energy: clamp(row.energy - 2, 0, 100),      // 体力 下限 0
-    satiety: clamp(row.satiety - 3, 0, 100),    // 饱腹 下限 0
+    satiety: clamp(row.satiety - 2, 0, 100),    // 饱腹 下限 0（6/13 -3→-2）
     cleanliness: clamp(row.cleanliness - 1, 0, 100), // 清洁 下限 0
     updated_at: new Date().toISOString(),
   };
