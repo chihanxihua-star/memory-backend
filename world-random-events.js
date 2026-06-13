@@ -15,13 +15,13 @@ export const RANDOM_EVENTS = {
     probability: 0.25, cooldown_world_minutes: 180, once_per_day: true,
     options: [
       { id: 1, label: '去茶水间倒杯咖啡', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'small' }, { stat: 'focus', direction: 'up', strength: 'small' }, { stat: 'stress', direction: 'up', strength: 'tiny' }], target_location: '公司 · 茶水间', target_activity: '倒咖啡' },
-      { id: 2, label: '去休息室眯一会儿', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'focus', direction: 'up', strength: 'tiny' }], target_location: '公司 · 休息室', target_activity: '休息' },
+      { id: 2, label: '去休息室眯一会儿', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'focus', direction: 'up', strength: 'tiny' }], target_location: '公司 · 澄休息室', target_activity: '休息' },
       { id: 3, label: '硬撑继续工作', effects_hint: [{ stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'focus', direction: 'down', strength: 'medium' }, { stat: 'stress', direction: 'up', strength: 'small' }], target_activity: '工作' },
     ],
   },
   tea_restock: {
     id: 'tea_restock', label: '茶水间补货', reason: '茶水间刚补了货，零食饮料满满当当',
-    locations: ['公司 · 工位', '公司 · 休息室'], time_range: ['09:00', '18:00'],
+    locations: ['公司 · 工位', '公司 · 澄休息室'], time_range: ['09:00', '18:00'],
     probability: 0.2, cooldown_world_minutes: 240, once_per_day: true,
     options: [
       { id: 1, label: '去拿杯热饮', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }, { stat: 'comfort', direction: 'up', strength: 'tiny' }], target_location: '公司 · 茶水间', target_activity: '倒水' },
@@ -44,7 +44,7 @@ export const RANDOM_EVENTS = {
   },
   boss_perk: {
     id: 'boss_perk', label: '老板发福利', reason: '老板今天发了点福利',
-    locations: ['公司 · 工位', '公司 · 休息室'], time_range: ['09:00', '18:00'],
+    locations: ['公司 · 工位', '公司 · 澄休息室'], time_range: ['09:00', '18:00'],
     probability: 0.12, cooldown_world_minutes: 1440, once_per_day: true,
     options: [
       { id: 1, label: '开心收下', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }] },
