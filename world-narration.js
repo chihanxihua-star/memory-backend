@@ -41,7 +41,7 @@ export async function loadNarrationRules() {
 
 // 待补叙队列：silent 动作（链步骤/作息切换）执行时入队，<此刻> 生成消费后清空。
 // item = { action: activity名, meal?: 菜名 }。最多留最近 15 个防爆。
-export async function appendNarration(actionName, meal = null, statInfo = null) {
+export async function appendNarration(actionName, meal = null, statInfo = null, extra = null) {
   if (!actionName) return;
   try {
     const { data } = await supabase.from('character_status_cheng').select('pending_narration').eq('name', '澄').limit(1);
@@ -49,6 +49,7 @@ export async function appendNarration(actionName, meal = null, statInfo = null) 
     const item = { action: actionName };
     if (meal) item.meal = meal;
     if (statInfo && statInfo.stat) { item.stat = statInfo.stat; item.after = statInfo.after; } // 改数值的动作带现状感受
+    if (extra && typeof extra === 'object') Object.assign(item, extra); // 通勤步带 wx(天气) 等
     cur.push(item);
     await supabase.from('character_status_cheng').update({ pending_narration: cur.slice(-15) }).eq('name', '澄');
   } catch (e) { console.warn('[NAR] appendNarration 失败:', e.message); }
@@ -62,15 +63,56 @@ export async function clearNarration() {
 // 把队列动作串成「我A，B，C」回顾句。每个动作从 actions 库随机抽一句（含 {meal} 替换）。
 // 改数值的动作（item 带 stat+after）后面接一句该数值现状短语（吃了麻辣香锅，肚子圆滚滚的）。
 // 返回 { text, usedStats }：usedStats 给结尾 pickPhrases 排除，避免重复念叨同一个数值。
+// 固定搭配（6/13 用户定）：连续动作"整串缺一不可"才合并。贪婪匹配最长（按 seq 长度降序）。
+// 通勤=公式拼接：[天气][跟小茉莉一起]乘[地铁/车][到公司/回家]，天气从序列 item.wx 拿、菜名从 item.meal 拿。
+// 约见=固定短语。打车需先拆成"出门/走到公司楼下 + 打车 + 乘车"多步才匹配得到。
+const COMBO_RULES = [
+  { seq: ['去便利店', '去地铁站', '坐地铁', '从地铁站走到公司'], mode: 'subway', dir: 'to', store: true },
+  { seq: ['去便利店', '坐地铁', '从地铁站走到公司'], mode: 'subway', dir: 'to', store: true },
+  { seq: ['去地铁站', '坐地铁', '从地铁站走到公司'], mode: 'subway', dir: 'to' },
+  { seq: ['坐地铁', '从地铁站走到公司'], mode: 'subway', dir: 'to' },
+  { seq: ['从公司走到地铁站', '坐地铁', '从地铁站走回家'], mode: 'subway', dir: 'home' },
+  { seq: ['出门', '打车', '乘车'], mode: 'taxi', dir: 'to' },
+  { seq: ['走到公司楼下', '打车', '乘车'], mode: 'taxi', dir: 'home' },
+  { seq: ['去找小茉莉', '到小茉莉休息室'], fixed: '去小茉莉休息室找她' },
+].sort((a, b) => b.seq.length - a.seq.length);
+function matchCombo(actNames, i) {
+  for (const r of COMBO_RULES) {
+    if (i + r.seq.length > actNames.length) continue;
+    let ok = true;
+    for (let k = 0; k < r.seq.length; k++) if (actNames[i + k] !== r.seq[k]) { ok = false; break; }
+    if (ok) return r;
+  }
+  return null;
+}
+function comboPhrase(rule, items, i) {
+  if (rule.fixed) return rule.fixed;
+  let wx = '', meal = '', together = false;
+  for (let k = 0; k < rule.seq.length; k++) {
+    const it = items[i + k];
+    if (it && typeof it === 'object') { if (it.wx && !wx) wx = it.wx; if (it.meal && !meal) meal = it.meal; if (it.together) together = true; }
+  }
+  const wxPre = wx === '雪' ? '下雪天' : wx === '雨' ? '下雨天' : '';
+  const tPre = together ? '跟小茉莉一起' : '';
+  const core = (rule.mode === 'taxi' ? '打车' : '坐地铁') + (rule.dir === 'home' ? '回家' : '到公司');
+  if (rule.store) return wxPre + tPre + '在便利店买了' + (meal || '早饭') + '，' + core;
+  return wxPre + tPre + core;
+}
+
 const recentActionPhraseIds = new Set();
 function buildRecentActions(pending, actions, phrases) {
   const items = Array.isArray(pending) ? pending : [];
   if (!items.length) return { text: '', usedStats: [] };
   recentActionPhraseIds.clear();
+  const actNames = items.map(it => (typeof it === 'string' ? it : it?.action));
   const parts = [], usedStats = [];
-  for (const it of items) {
-    const actName = typeof it === 'string' ? it : it?.action;
-    if (!actName) continue;
+  let i = 0;
+  while (i < items.length) {
+    const combo = matchCombo(actNames, i);
+    if (combo) { parts.push(comboPhrase(combo, items, i)); i += combo.seq.length; continue; }
+    const it = items[i];
+    const actName = actNames[i];
+    if (!actName) { i++; continue; }
     const meal = (it && typeof it === 'object' && it.meal) ? it.meal : '';
     const matches = (actions || []).filter(a => a.action === actName);
     let phrase;
@@ -80,15 +122,13 @@ function buildRecentActions(pending, actions, phrases) {
       const pick = pool[Math.floor(Math.random() * pool.length)];
       recentActionPhraseIds.add(pick.id);
       phrase = pick.phrase;
-    } else {
-      phrase = actName; // 没配短语兜底用动作名
-    }
+    } else { phrase = actName; }
     parts.push(phrase.replace(/\{meal\}/g, meal || '点东西'));
-    // 改数值的动作：接一句该数值现状（"吃了X，肚子圆滚滚的"）
     if (it && typeof it === 'object' && it.stat && Number.isFinite(Number(it.after))) {
       const feel = pickOnePhrase(it.stat, Number(it.after), phrases);
       if (feel) { parts.push(feel.phrase); usedStats.push(it.stat); }
     }
+    i++;
   }
   recentActionPhraseIds.clear();
   return { text: parts.length ? '我' + parts.join('，') : '', usedStats };

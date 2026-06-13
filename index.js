@@ -1133,9 +1133,10 @@ async function advanceRoutine(routineName, idx, opts = {}) {
       world_time: realWorldTime(), location: step.location,
       action: act, detail: { routine: routineName, step: idx, cost: step.cost || 0, duration_min: durationMin, satiety_gain: satietyGain, meal: mealName }, source: 'system',
     });
-    // 入队补叙（这步她 silent 走过，下次 <此刻> 回顾）。吃饭步带菜名 + 饱腹现状感受。
-    await appendNarration(act, step.is_meal ? mealName : null,
-      satietyGain != null ? { stat: 'satiety', after: patch.satiety } : null);
+    // 入队补叙（这步她 silent 走过，下次 <此刻> 回顾）。吃饭步带菜名+饱腹感受；通勤步带菜名(便利店前缀用)+天气(wx)。
+    await appendNarration(act, step.is_meal ? mealName : (opts.meal || null),
+      satietyGain != null ? { stat: 'satiety', after: patch.satiety } : null,
+      opts.bad_weather ? { wx: opts.bad_weather } : null);
     console.log(`[ROUTINE] ${routineName} 第${idx}步 → ${step.location} · ${act}${step.cost ? ` (-¥${step.cost})` : ''}${satietyGain ? ` (饱腹+${satietyGain})` : ''}`);
     // engage 步（如便利店选吃的）：弹选项让她挑，链在她选完(continue_routine)后续，这里不排 routine_step。
     // CC 忙没弹成 → 不卡链，直接往下走（算她没挑/随便拿）。
@@ -1187,7 +1188,7 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       if (opts.cm === 'taxi') return false;       // 已是打车，不用问
       const kind = await badWeatherKind();        // 弹不弹按触发当下的真实天气
       if (!kind) return false;                    // 天气好：静默走默认地铁
-      const cont = (cm) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm, bad_weather: true, meal: opts.meal });
+      const cont = (cm) => ({ routine: routineName, next_index: idx + 1, bk: opts.bk, cm, bad_weather: kind, meal: opts.meal });
       const options = [
         { id: 1, label: '打车去公司（¥28-35）', continue_routine: cont('taxi') },
         { id: 2, label: kind === '雪' ? '坐地铁，踩着雪走一段（¥3）' : '坐地铁，淋一段路（¥3）', continue_routine: cont('subway'),
@@ -1260,6 +1261,7 @@ async function firePendingWake(row) {
       action: '到小茉莉休息室，和她一起午休', detail: { reason: '两人午休碰上' }, source: 'system',
     });
     await autoSetUserLunchLocation();
+    await appendNarration('到小茉莉休息室'); // 跟"去找小茉莉"搭配合并成"去小茉莉休息室找她"
     const takeouts = await pickTakeoutOptions();
     if (!takeouts.length) return { fired: true, system: true }; // 没外卖配置=就一起待着，不弹
     const status2 = { ...status, location: '公司 · 小茉莉休息室', activity: '和小茉莉一起午休' };
@@ -1310,6 +1312,7 @@ async function firePendingWake(row) {
       world_time: realWorldTime(), location: '公司 · 工位',
       action: '回到工位，下午上班', detail: { reason: '午休结束' }, source: 'system',
     });
+    await appendNarration('回工位'); // 补叙"晃回工位坐下"
     console.log('[LUNCH] 回工位，下午上班');
     return { fired: true, system: true };
   }
@@ -1331,6 +1334,7 @@ async function firePendingWake(row) {
           world_time: realWorldTime(), location: '公司 · 去小茉莉休息室的路上',
           action: '小茉莉回了，去找她', detail: { reason: '小茉莉回应了，去她休息室一起午休', duration_min: 2 }, source: 'system',
         });
+        await appendNarration('去找小茉莉'); // 跟"到小茉莉休息室"搭配合并
         const cfg = readWorldConfig();
         await supabase.from('pending_wake_cheng').insert({
           wake_type: 'meet_arrive', reason: '到小茉莉休息室', status: 'queued',
@@ -1419,7 +1423,7 @@ async function firePendingWake(row) {
     // 顺序有讲究：解析失败兜底=最后一项，所以「坐地铁」垫底当安全默认（start_routine 解析失败也执行，能真回家）。
     if (kind) {
       options = [
-        { id: 1, label: '打车回家（¥28-35）', start_routine: 'evening', routine_opts: { cm: 'taxi', bad_weather: true } },
+        { id: 1, label: '打车回家（¥28-35）', start_routine: 'evening', routine_opts: { cm: 'taxi', bad_weather: kind } },
       ];
       if (!waited) options.push({
         id: 2, label: `在公司等${kind}小一点`, effects: {},
@@ -1427,7 +1431,7 @@ async function firePendingWake(row) {
       });
       options.push({
         id: options.length + 1, label: kind === '雪' ? '坐地铁，踩着雪走一段（¥3）' : '坐地铁，淋一段路（¥3）',
-        start_routine: 'evening', routine_opts: { cm: 'subway', bad_weather: true },
+        start_routine: 'evening', routine_opts: { cm: 'subway', bad_weather: kind },
         effects_hint: [{ stat: 'cleanliness', direction: 'down', strength: 'small' }, { stat: 'energy', direction: 'down', strength: 'tiny' }],
       });
     } else {
@@ -1578,7 +1582,7 @@ setOffWorkHandler(async (row, { overtime }) => {
 });
 // 加班结束：静默走 evening 链回家，坏天气(雨/雪)自动偏成打车（不再问），时长也按坏天气加成。
 setEveningStarter(async () => {
-  const bad = !!(await badWeatherKind());
+  const bad = await badWeatherKind(); // ''|雨|雪
   await advanceRoutine('evening', 0, { cm: bad ? 'taxi' : 'subway', bad_weather: bad });
 });
 // 中午钩子（6/13）：11:00 切午休后排必弹包；13:00 排"该上班了"包。daemon 自带 CC 忙重试。
@@ -1724,7 +1728,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     try {
       const opts = option.routine_opts || await readWorldPlan(); // 午休带 method；早晨读周计划
       // 天气好坏在链启动时定一次，随 opts/payload 透传整条链（坏天气通勤时长加成；午休链无通勤步不受影响）
-      if (opts.bad_weather === undefined) opts.bad_weather = !!(await badWeatherKind());
+      if (opts.bad_weather === undefined) opts.bad_weather = await badWeatherKind(); // ''|雨|雪
       await advanceRoutine(option.start_routine, 0, opts);
     } catch (e) { console.warn('[WORLD] start_routine 失败:', e.message); }
   }

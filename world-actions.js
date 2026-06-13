@@ -4,7 +4,7 @@
 // 行为瞬间完成，不消耗世界时间（行为耗时系统以后再做）。
 import { supabase } from './memory.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
-import { realWorldTime } from './world-narration.js';
+import { realWorldTime, appendNarration } from './world-narration.js';
 import { readWorldConfig } from './world-tick.js';
 
 // ── 行为自动结束（第二步·地基）────────────────────────────
@@ -55,15 +55,15 @@ export const ACTIONS = {
   go_breakroom:     { label: '去休息室',   allowed: ['公司 · 工位', '公司 · 茶水间'],                                           target_location: '公司 · 澄休息室', target_activity: '休息',  effects: {} },
   go_workstation:   { label: '回工位',     allowed: ['公司 · 澄休息室', '公司 · 茶水间'],                                         target_location: '公司 · 工位', target_activity: '工作',   effects: {} },
   go_tea_room:      { label: '去茶水间',   allowed: ['公司 · 工位', '公司 · 澄休息室'],                                           target_location: '公司 · 茶水间', target_activity: '倒水',  effects: {} },
-  eat_snack:        { label: '吃零食',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 澄休息室', '公司 · 茶水间'], target_activity: '吃零食',
+  eat_snack:        { label: '吃零食',     narrate_stat: 'satiety', allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 澄休息室', '公司 · 茶水间'], target_activity: '吃零食',
     effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }] },
-  order_takeout:    { label: '点外卖',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 澄休息室', '公司 · 茶水间'], target_activity: '点外卖',
+  order_takeout:    { label: '点外卖',     narrate_stat: 'satiety', allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 澄休息室', '公司 · 茶水间'], target_activity: '点外卖',
     effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'medium' }, { stat: 'mood', direction: 'up', strength: 'tiny' }], effects: { wallet_balance: -30 } },
-  cook_simple_meal: { label: '自己做饭',   allowed: ['家 · 厨房'],                                                             target_activity: '做饭',
+  cook_simple_meal: { label: '自己做饭',   narrate_stat: 'satiety', allowed: ['家 · 厨房'],                                                             target_activity: '做饭',
     effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'large' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'cleanliness', direction: 'down', strength: 'tiny' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
-  shower:           { label: '洗澡',       allowed: ['家 · 浴室'],                                                             target_activity: '洗澡',
+  shower:           { label: '洗澡',       narrate_stat: 'cleanliness', allowed: ['家 · 浴室'],                                                             target_activity: '洗澡',
     effects_hint: [{ stat: 'cleanliness', direction: 'up', strength: 'large' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
-  rest:             { label: '休息一会儿', allowed: ['家 · 卧室', '家 · 客厅', '公司 · 澄休息室'],                                target_activity: '休息',
+  rest:             { label: '休息一会儿', narrate_stat: 'energy', allowed: ['家 · 卧室', '家 · 客厅', '公司 · 澄休息室'],                                target_activity: '休息',
     effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
 };
 
@@ -129,6 +129,12 @@ export async function executeWorldAction(actionId, { actor = 'cheng', source = '
       source: 'action',
     });
   } catch (e) { console.error('[ACTION] 行程写入失败（不连累主流程）:', e.message); }
+
+  // 入队补叙：她选了这个行为、系统立即执行，下次 <此刻> 回顾。改数值的行为(narrate_stat)带现状感受。
+  if (actor === 'cheng') {
+    await appendNarration(action.label, null,
+      action.narrate_stat ? { stat: action.narrate_stat, after: up[action.narrate_stat] } : null);
+  }
 
   console.log(`[ACTION] ${actor} 执行「${action.label}」(${source}): ${fromLoc} → ${up.location}`);
   return up;
