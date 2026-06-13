@@ -41,12 +41,15 @@ export async function loadNarrationRules() {
 
 // 待补叙队列：silent 动作（链步骤/作息切换）执行时入队，<此刻> 生成消费后清空。
 // item = { action: activity名, meal?: 菜名 }。最多留最近 15 个防爆。
-export async function appendNarration(actionName, meal = null) {
+export async function appendNarration(actionName, meal = null, statInfo = null) {
   if (!actionName) return;
   try {
     const { data } = await supabase.from('character_status_cheng').select('pending_narration').eq('name', '澄').limit(1);
     const cur = Array.isArray(data?.[0]?.pending_narration) ? data[0].pending_narration : [];
-    cur.push(meal ? { action: actionName, meal } : { action: actionName });
+    const item = { action: actionName };
+    if (meal) item.meal = meal;
+    if (statInfo && statInfo.stat) { item.stat = statInfo.stat; item.after = statInfo.after; } // 改数值的动作带现状感受
+    cur.push(item);
     await supabase.from('character_status_cheng').update({ pending_narration: cur.slice(-15) }).eq('name', '澄');
   } catch (e) { console.warn('[NAR] appendNarration 失败:', e.message); }
 }
@@ -56,12 +59,15 @@ export async function clearNarration() {
   catch (e) { console.warn('[NAR] clearNarration 失败:', e.message); }
 }
 
-// 把队列动作串成「我A，B，C」回顾句。每个动作从 actions 库随机抽一句（含 {meal} 替换），避连抽同句。
+// 把队列动作串成「我A，B，C」回顾句。每个动作从 actions 库随机抽一句（含 {meal} 替换）。
+// 改数值的动作（item 带 stat+after）后面接一句该数值现状短语（吃了麻辣香锅，肚子圆滚滚的）。
+// 返回 { text, usedStats }：usedStats 给结尾 pickPhrases 排除，避免重复念叨同一个数值。
 const recentActionPhraseIds = new Set();
-function buildRecentActions(pending, actions) {
+function buildRecentActions(pending, actions, phrases) {
   const items = Array.isArray(pending) ? pending : [];
-  if (!items.length) return '';
-  const parts = [];
+  if (!items.length) return { text: '', usedStats: [] };
+  recentActionPhraseIds.clear();
+  const parts = [], usedStats = [];
   for (const it of items) {
     const actName = typeof it === 'string' ? it : it?.action;
     if (!actName) continue;
@@ -78,31 +84,47 @@ function buildRecentActions(pending, actions) {
       phrase = actName; // 没配短语兜底用动作名
     }
     parts.push(phrase.replace(/\{meal\}/g, meal || '点东西'));
+    // 改数值的动作：接一句该数值现状（"吃了X，肚子圆滚滚的"）
+    if (it && typeof it === 'object' && it.stat && Number.isFinite(Number(it.after))) {
+      const feel = pickOnePhrase(it.stat, Number(it.after), phrases);
+      if (feel) { parts.push(feel.phrase); usedStats.push(it.stat); }
+    }
   }
   recentActionPhraseIds.clear();
-  if (!parts.length) return '';
-  return '我' + parts.join('，');
+  return { text: parts.length ? '我' + parts.join('，') : '', usedStats };
 }
 
 // 避免连续两次抽到同一句。
 const recentPhraseIds = new Set();
-// 只看 4 个身体状态，命中启用 phrase 就可出现；每状态命中多条随机抽一条；最多 3 条。
-// 返回拼好的字符串（非空时自带句号结尾），全平静则返回 ''。
-function pickPhrases(status, phrases) {
-  const picked = [];
-  for (const stat of BODY_STATS) {
-    if (picked.length >= 3) break;
+// 抽某 stat 在当前值档位的一句短语（避连抽同句）。无命中返回 null。
+function pickOnePhrase(stat, v, phrases) {
+  const matches = (phrases || []).filter(p => p.stat === stat && v >= Number(p.min_value) && v <= Number(p.max_value));
+  if (!matches.length) return null;
+  const fresh = matches.filter(p => !recentPhraseIds.has(p.id));
+  const pool = fresh.length ? fresh : matches;
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  recentPhraseIds.add(pick.id);
+  return pick;
+}
+// 身体短语（6/13 用户定规则）：4 状态 ≤50 才出现（差状态优先）；都 >50 随机挑 2-3 个组句（不然全空）。
+// excludeStats = 已在动作补叙里带过感受的 stat（如吃完已说"肚子圆滚滚"），结尾不重复。
+function pickPhrases(status, phrases, excludeStats = []) {
+  recentPhraseIds.clear();
+  const stats = BODY_STATS.filter(s => !excludeStats.includes(s));
+  const low = [], high = [];
+  for (const stat of stats) {
     const v = Number(status?.[stat]);
     if (!Number.isFinite(v)) continue;
-    const matches = (phrases || []).filter(p => p.stat === stat && v >= Number(p.min_value) && v <= Number(p.max_value));
-    if (!matches.length) continue;
-    const fresh = matches.filter(p => !recentPhraseIds.has(p.id));
-    const pool = fresh.length ? fresh : matches; // 全是刚用过的也还是出，别空着
-    picked.push(pool[Math.floor(Math.random() * pool.length)]);
+    (v <= 50 ? low : high).push(stat);
   }
-  recentPhraseIds.clear();
-  picked.forEach(p => recentPhraseIds.add(p.id));
-  const strs = picked.map(p => p.phrase).filter(Boolean);
+  let chosen;
+  if (low.length) chosen = low.slice(0, 3);            // 有差状态：优先显示（最多3）
+  else {                                                // 都 >50：随机挑 2-3 个
+    const sh = high.slice();
+    for (let i = sh.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [sh[i], sh[j]] = [sh[j], sh[i]]; }
+    chosen = sh.slice(0, Math.min(sh.length, 2 + Math.floor(Math.random() * 2)));
+  }
+  const strs = chosen.map(stat => pickOnePhrase(stat, Number(status[stat]), phrases)).filter(Boolean).map(p => p.phrase);
   return strs.length ? strs.join('，') + '。' : '';
 }
 
@@ -126,8 +148,9 @@ export function generateChengSelfNarration(status, env, rules) {
   const time = realWorldTime();
   const locN = formatNaturalLocation(status?.location);
   const act = mapActivity(status?.activity);
-  const ph = pickPhrases(status, phrases);
-  const recentActions = useAction ? buildRecentActions(pending, actions) : '';
+  const ra = useAction ? buildRecentActions(pending, actions, phrases) : { text: '', usedStats: [] };
+  const recentActions = ra.text;
+  const ph = pickPhrases(status, phrases, ra.usedStats); // 排除动作里已带感受的数值，不重复
   let s = tpl
     .replace(/\{date\}/g, date)
     .replace(/\{time\}/g, time)

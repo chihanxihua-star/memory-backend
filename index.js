@@ -1133,8 +1133,9 @@ async function advanceRoutine(routineName, idx, opts = {}) {
       world_time: realWorldTime(), location: step.location,
       action: act, detail: { routine: routineName, step: idx, cost: step.cost || 0, duration_min: durationMin, satiety_gain: satietyGain, meal: mealName }, source: 'system',
     });
-    // 入队补叙（这步她 silent 走过，下次 <此刻> 回顾）。吃饭步带菜名。
-    await appendNarration(act, step.is_meal ? mealName : null);
+    // 入队补叙（这步她 silent 走过，下次 <此刻> 回顾）。吃饭步带菜名 + 饱腹现状感受。
+    await appendNarration(act, step.is_meal ? mealName : null,
+      satietyGain != null ? { stat: 'satiety', after: patch.satiety } : null);
     console.log(`[ROUTINE] ${routineName} 第${idx}步 → ${step.location} · ${act}${step.cost ? ` (-¥${step.cost})` : ''}${satietyGain ? ` (饱腹+${satietyGain})` : ''}`);
     // engage 步（如便利店选吃的）：弹选项让她挑，链在她选完(continue_routine)后续，这里不排 routine_step。
     // CC 忙没弹成 → 不卡链，直接往下走（算她没挑/随便拿）。
