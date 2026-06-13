@@ -143,7 +143,8 @@ export function generateChengSelfNarration(status, env, rules) {
 export function formatUserStatus(user) {
   const u = user || {};
   const locN = formatNaturalLocation(u.location || '家 · 客厅');
-  const act = u.activity || '休息';
+  // <此刻> 是给澄看的：小茉莉状态里的"澄"=在对澄说，转成"我"（如"和澄一起午休"→"和我一起午休"）
+  const act = (u.activity || '休息').replace(/澄/g, '我');
   return `在${locN}，正在${act}`;
 }
 
