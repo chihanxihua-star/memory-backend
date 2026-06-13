@@ -10,7 +10,7 @@ import { readWorldConfig } from './world-tick.js';
 // ── 行为自动结束（第二步·地基）────────────────────────────
 // 她进入的「行为」（activity）会有时长，到点静默收尾（清成闲着/工作），治"卡死在一个行为上"。
 // 时长分长/中/短三桶（世界分钟≈现实分钟），随机抽；豁免=作息/加班自管的状态，不自动结束。
-const ACTIVITY_EXEMPT = new Set(['工作', '午休', '加班', '加班处理任务', '等小茉莉', '预制早餐']);
+const ACTIVITY_EXEMPT = new Set(['工作', '午休', '加班', '加班处理任务', '等小茉莉', '预制早餐', '和小茉莉一起午休', '和小茉莉待在一起', '去找小茉莉', '往工位走']);
 const ACTIVITY_LONG  = new Set(['休息', '做饭', '点外卖', '开会', '走神开会', '下班回家后休息', '加班后回家休息']);
 const ACTIVITY_SHORT = new Set(['吃零食', '倒水', '倒咖啡', '泡茶', '拿饼干', '吃小蛋糕', '看小手机', '挑选公司福利', '记录福利信息', '记录新品想法', '和老板确认任务', '在厨房']);
 // 其余 → 默认「中」。
@@ -52,18 +52,18 @@ export const ACTIONS = {
   go_kitchen:       { label: '去厨房',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 浴室'],                                    target_location: '家 · 厨房',   target_activity: '在厨房', effects: {} },
   go_bathroom:      { label: '去浴室',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房'],                                    target_location: '家 · 浴室',   target_activity: '洗漱',   effects: {} },
   go_living_room:   { label: '去客厅',     allowed: ['家 · 卧室', '家 · 厨房', '家 · 浴室'],                                    target_location: '家 · 客厅',   target_activity: '休息',   effects: {} },
-  go_breakroom:     { label: '去休息室',   allowed: ['公司 · 工位', '公司 · 茶水间'],                                           target_location: '公司 · 休息室', target_activity: '休息',  effects: {} },
-  go_workstation:   { label: '回工位',     allowed: ['公司 · 休息室', '公司 · 茶水间'],                                         target_location: '公司 · 工位', target_activity: '工作',   effects: {} },
-  go_tea_room:      { label: '去茶水间',   allowed: ['公司 · 工位', '公司 · 休息室'],                                           target_location: '公司 · 茶水间', target_activity: '倒水',  effects: {} },
-  eat_snack:        { label: '吃零食',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'], target_activity: '吃零食',
+  go_breakroom:     { label: '去休息室',   allowed: ['公司 · 工位', '公司 · 茶水间'],                                           target_location: '公司 · 澄休息室', target_activity: '休息',  effects: {} },
+  go_workstation:   { label: '回工位',     allowed: ['公司 · 澄休息室', '公司 · 茶水间'],                                         target_location: '公司 · 工位', target_activity: '工作',   effects: {} },
+  go_tea_room:      { label: '去茶水间',   allowed: ['公司 · 工位', '公司 · 澄休息室'],                                           target_location: '公司 · 茶水间', target_activity: '倒水',  effects: {} },
+  eat_snack:        { label: '吃零食',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 澄休息室', '公司 · 茶水间'], target_activity: '吃零食',
     effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }] },
-  order_takeout:    { label: '点外卖',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'], target_activity: '点外卖',
+  order_takeout:    { label: '点外卖',     allowed: ['家 · 卧室', '家 · 客厅', '家 · 厨房', '公司 · 工位', '公司 · 澄休息室', '公司 · 茶水间'], target_activity: '点外卖',
     effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'medium' }, { stat: 'mood', direction: 'up', strength: 'tiny' }], effects: { wallet_balance: -30 } },
   cook_simple_meal: { label: '自己做饭',   allowed: ['家 · 厨房'],                                                             target_activity: '做饭',
     effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'large' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'cleanliness', direction: 'down', strength: 'tiny' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
   shower:           { label: '洗澡',       allowed: ['家 · 浴室'],                                                             target_activity: '洗澡',
     effects_hint: [{ stat: 'cleanliness', direction: 'up', strength: 'large' }, { stat: 'energy', direction: 'down', strength: 'small' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
-  rest:             { label: '休息一会儿', allowed: ['家 · 卧室', '家 · 客厅', '公司 · 休息室'],                                target_activity: '休息',
+  rest:             { label: '休息一会儿', allowed: ['家 · 卧室', '家 · 客厅', '公司 · 澄休息室'],                                target_activity: '休息',
     effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'small' }] },
 };
 

@@ -59,9 +59,25 @@ async function setState(row, patch, action, detail) {
   return st;
 }
 
+// 中午钩子（6/13，index.js 注入，避免循环依赖）：goLunch 切午休后排 lunch_choice 必弹包；
+// goAfternoon 不再静默切工位，改排 afternoon_choice「该上班了」包。钩子没注入则退回旧行为保底。
+let lunchHandler = null;
+let afternoonHandler = null;
+export function setLunchHandler(fn) { lunchHandler = fn; }
+export function setAfternoonHandler(fn) { afternoonHandler = fn; }
+
 const goToWork    = (row) => setState(row, { location: '公司 · 工位', activity: '工作' }, '上班', { reason: '工作日到点上班' });
-const goLunch     = (row) => setState(row, { location: '公司 · 休息室', activity: '午休' }, '午休', { reason: '午休时间' });
-const goAfternoon = (row) => setState(row, { location: '公司 · 工位', activity: '工作' }, '下午上班', { reason: '午休结束，下午上班' });
+const goLunch     = async (row) => {
+  const st = await setState(row, { location: '公司 · 澄休息室', activity: '午休' }, '午休', { reason: '午休时间' });
+  if (lunchHandler) { try { await lunchHandler(); } catch (e) { console.warn('[WORK] 午休选择排队失败:', e.message); } }
+  return st;
+};
+const goAfternoon = async (row) => {
+  if (afternoonHandler) {
+    try { await afternoonHandler(); return row; } catch (e) { console.warn('[WORK] 下午上班提醒排队失败:', e.message); }
+  }
+  return setState(row, { location: '公司 · 工位', activity: '工作' }, '下午上班', { reason: '午休结束，下午上班' });
+};
 const goHomeNormal= (row) => setState(row, { location: '家 · 客厅', activity: '下班回家后休息' }, '下班回家', { overtime: false });
 
 // 挂一条 0.5-2h（30-120 世界分钟）的加班结束 pending。导出给 11B「下班前加任务→加班」复用
@@ -178,8 +194,8 @@ export async function workdayTick(status, env) {
     if (await hasMorningFlow()) return cur;  // 早晨链在途：不瞬移不耗 mark，她自己会到岗（链断档时下个tick自然兜底）
     marks.on_work = true; return await goToWork(cur);
   }
-  if (t >= 660 && t < 780 && !marks.lunch) { marks.lunch = true; return await goLunch(cur); }                          // 11:00-13:00 午休
-  if (t >= 780 && t < 960 && !marks.afternoon && cur.location === '公司 · 休息室') { marks.afternoon = true; return await goAfternoon(cur); } // 13:00-16:00 下午上班
+  if (t >= 660 && t < 780 && !marks.lunch && atCompany) { marks.lunch = true; return await goLunch(cur); }              // 11:00-13:00 午休（仅在公司，翘班/外出跳过整段）
+  if (t >= 780 && t < 960 && !marks.afternoon && atCompany) { marks.afternoon = true; return await goAfternoon(cur); }  // 13:00-16:00 下午上班（弹"该上班了"包，不再要求必须在休息室）
   if (t >= 960 && !marks.off_decision) { marks.off_decision = true; return await offWorkDecision(cur); }               // 16:00+ 下班判断
   return cur;
 }

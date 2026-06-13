@@ -9,7 +9,12 @@ import { BODY_STATS } from './world-effects.js';
 export function formatNaturalLocation(location) {
   const loc = String(location || '').trim();
   if (loc.startsWith('家 · ')) return '家的' + loc.slice(4);
-  if (loc.startsWith('公司 · ')) return '公司的' + loc.slice(5);
+  if (loc.startsWith('公司 · ')) {
+    const rest = loc.slice(5);
+    // 过场地点（"去小茉莉休息室的路上"等）本身就是完整短语，别拼成"公司的去…路上"
+    if (rest.includes('路上')) return rest;
+    return '公司的' + rest;
+  }
   if (loc.startsWith('外出 · ')) return loc.slice(5);
   return loc || '家的客厅';
 }

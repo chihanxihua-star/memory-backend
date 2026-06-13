@@ -32,7 +32,7 @@ import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
 import { buildNowInner, loadNarrationRules, generateChengSelfNarration, realWorldTime } from './world-narration.js';
-import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd, setOffWorkHandler, setEveningStarter } from './world-workday.js';
+import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd, setOffWorkHandler, setEveningStarter, setLunchHandler, setAfternoonHandler } from './world-workday.js';
 import { collectWorldThoughts, recordWakeInjectionScan, getSurfacingDebug } from './world-thoughts.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
@@ -822,7 +822,7 @@ async function processTodoDoneTags(clean) {
 // 只改 location/activity 两个描述字段，不结算任何数值——带后果的事（吃饭/花钱）仍走世界系统。
 // 规则：地点白名单 + 只许同栋楼内移动（跨楼忽略）；一条回复里出现多个 MOVE 只认最后一个；
 // 地点可省「家/公司」前缀（房间名在两栋楼里不重名）。行为复用 scheduleActivityEnd 自动收尾。
-const CHAT_MOVE_LOCATIONS = ['家 · 卧室', '家 · 客厅', '家 · 厨房', '家 · 浴室', '公司 · 工位', '公司 · 休息室', '公司 · 茶水间'];
+const CHAT_MOVE_LOCATIONS = ['家 · 卧室', '家 · 客厅', '家 · 厨房', '家 · 浴室', '公司 · 工位', '公司 · 澄休息室', '公司 · 小茉莉休息室', '公司 · 茶水间'];
 async function processChatMoveTag(text) {
   try {
     const re = /\[MOVE:([^\]]+)\]/gi;
@@ -969,19 +969,80 @@ function buildEveningRoutine(cm = 'subway', badWeather = false) {
   return steps;
 }
 
-// 午休"吃→休息"小链（等小茉莉没等到→自己吃→吃完歇会儿→回午休基线）。method 决定怎么吃。
-const LUNCH_EAT = {
-  snack:   { activity: '吃零食', location: '公司 · 休息室', dur: [8, 15],  cost: 0 },
-  takeout: { activity: '吃外卖', location: '公司 · 休息室', dur: [13, 17], cost: 25 },
-  tearoom: { activity: '吃东西', location: '公司 · 茶水间', dur: [10, 15], cost: 0 },
-};
-function buildLunchRoutine(method = 'snack') {
-  const eat = LUNCH_EAT[method] || LUNCH_EAT.snack;
+// 午休吃饭链（6/13 重构）。method 决定吃法+地点；外卖扣钱在选择结算时按份数做，不走 step.cost。
+//   tearoom         = 茶水间随便吃点（细化链：去茶水间1 → 挑2-5 → 回澄休息室2-5 → 吃8-15 → 午休）
+//   takeout_solo    = 自己点外卖（等送达10-20 → 吃13-17 → 午休）
+//   takeout_together= 跟小茉莉一起吃（等送达10-20 → 一起吃20-30 → 和小茉莉待一起·终点）
+function buildLunchRoutine(method = 'tearoom') {
+  if (method === 'takeout_solo') {
+    return [
+      { activity: '等外卖送到', location: '公司 · 澄休息室', dur: [10, 20] },
+      { activity: '吃外卖',     location: '公司 · 澄休息室', dur: [13, 17] },
+      { activity: '午休',       location: '公司 · 澄休息室', dur: null },
+    ];
+  }
+  if (method === 'takeout_together') {
+    return [
+      { activity: '等外卖送到',         location: '公司 · 小茉莉休息室', dur: [10, 20] },
+      { activity: '和小茉莉一起吃午饭', location: '公司 · 小茉莉休息室', dur: [20, 30] },
+      { activity: '和小茉莉待在一起',   location: '公司 · 小茉莉休息室', dur: null }, // 自由活动终点（豁免）
+    ];
+  }
+  // tearoom（默认/兜底）
   return [
-    { ...eat },                                                      // 吃
-    { activity: '休息', location: eat.location, dur: [20, 40] },     // 吃完接休息
-    { activity: '午休', location: '公司 · 休息室', dur: null },        // 终点（回午休基线，豁免不再推）
+    { activity: '去茶水间', location: '公司 · 茶水间',   dur: [1, 1] },
+    { activity: '挑点吃的', location: '公司 · 茶水间',   dur: [2, 5] },
+    { activity: '回休息室', location: '公司 · 澄休息室', dur: [2, 5] },
+    { activity: '吃东西',   location: '公司 · 澄休息室', dur: [8, 15] },
+    { activity: '午休',     location: '公司 · 澄休息室', dur: null },
   ];
+}
+
+// 从食物表"外卖"类随机取最多 3 个 → [{name, price, description}]。空表返回 []。
+async function pickTakeoutOptions() {
+  try {
+    const { data } = await supabase.from('world_items_cheng')
+      .select('name, price, description').eq('enabled', true).eq('category', '外卖');
+    const pool = (data || []).slice();
+    for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+    return pool.slice(0, 3);
+  } catch (e) { console.warn('[LUNCH] 读外卖表失败:', e.message); return []; }
+}
+
+// 用一组外卖拼"点外卖"事件。multiplier=份数(一起吃=2)；method=吃完走哪条午休链；
+// allowAsk=是否给"先问问小茉莉"（仅一起吃首弹给，给了 wmHint 让她发消息问你）。
+// 解析失败默认=最后一项：allowAsk 时是"先问问"(无副作用安全)，否则是最后一个外卖（会扣钱，但总得吃）。
+function buildTakeoutEvent(takeouts, { method, multiplier = 1, allowAsk = false, reason, key }) {
+  const options = takeouts.map((t, i) => {
+    const price = Number(t.price) || 0;
+    const cost = price * multiplier;
+    const priceLabel = multiplier > 1 ? `¥${price}×2=¥${cost}` : `¥${price}`;
+    return {
+      id: i + 1,
+      label: `${t.name}（${priceLabel}）${t.description ? '　' + t.description : ''}`,
+      start_routine: 'lunch', routine_opts: { method },
+      effects: cost ? { wallet_balance: -cost } : {},
+    };
+  });
+  if (allowAsk) {
+    const askDelay = 5 + Math.floor(Math.random() * 6); // 5-10 世界分钟
+    options.push({
+      id: options.length + 1, label: '先问问小茉莉想吃什么', effects: {},
+      pending: { wake_type: 'lunch_ask', delay_world_minutes: askDelay, reason: '问了小茉莉想吃啥，等她回话', payload_extra: { takeouts } },
+    });
+  }
+  return { key: key || 'lunch_order', reason, options, wmHint: allowAsk };
+}
+
+// 约见落地时自动把你的位置设成小茉莉休息室 + Bark 提醒你（只给你，不 engage 澄）。
+// 你手动改过也会被覆盖一次——配合 Bark 提示，不对自己再改回去。
+async function autoSetUserLunchLocation() {
+  try {
+    await supabase.from('user_status_cheng')
+      .update({ location: '公司 · 小茉莉休息室', activity: '和澄一起午休', updated_at: new Date().toISOString() })
+      .eq('name', 'user');
+    await pushBark({ title: '小茉莉', body: '你和澄在小茉莉休息室一起午休啦，位置已自动更新（不对的话去小世界改一下）' });
+  } catch (e) { console.warn('[LUNCH] 自动设置 user 位置/Bark 失败:', e.message); }
 }
 
 function getRoutineSteps(routineName, opts = {}) {
@@ -1086,9 +1147,9 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
     if (!status) return false;
     if (engageType === 'buy_food') {
       const { data: foods } = await supabase.from('world_items_cheng')
-        .select('name, price').eq('enabled', true).eq('category', '便利店成品');
+        .select('name, price').eq('enabled', true).eq('category', '便利店早餐');
       const pool = (foods || []).slice();
-      if (!pool.length) { console.log('[BUY_FOOD] 食物表没"便利店成品"，跳过选购'); return false; }
+      if (!pool.length) { console.log('[BUY_FOOD] 食物表没"便利店早餐"，跳过选购'); return false; }
       // Fisher-Yates 洗牌取最多 3 个
       for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
       const cont = { routine: routineName, next_index: idx + 1, bk: opts.bk, cm: opts.cm, bad_weather: opts.bad_weather };
@@ -1132,6 +1193,107 @@ async function firePendingWake(row) {
     catch (e) { console.warn('[WORK] 加班结束结算失败:', e.message); }
     return { fired: true, system: true };
   }
+  // 中午必弹（6/13）：11:00 切午休后由 workdayTick 排这条。她不在公司=作废（翘班/异常）。
+  // 四选：躺会儿 / 点外卖(二级包) / 约小茉莉(仅你在公司) / 去茶水间随便吃点(默认垫底)。
+  if (row.wake_type === 'lunch_choice') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    if (!String(status.location || '').startsWith('公司')) {
+      console.log('[LUNCH] 人不在公司，午休选择作废'); return { fired: true, system: true };
+    }
+    let userAtCompany = false;
+    try {
+      const { data: us } = await supabase.from('user_status_cheng').select('location').eq('name', 'user').limit(1);
+      userAtCompany = String(us?.[0]?.location || '').startsWith('公司');
+    } catch { /* 读不到按不在公司 */ }
+    const options = [
+      { id: 1, label: '就在休息室躺一会儿', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }], target_location: '公司 · 澄休息室', target_activity: '午休' },
+      { id: 2, label: '点份外卖', effects: {}, pending: { wake_type: 'lunch_order_solo', delay_world_minutes: 0, reason: '打开外卖软件挑吃的' } },
+    ];
+    if (userAtCompany) options.push({ id: options.length + 1, label: '约小茉莉一起午休', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'tiny' }], target_activity: '等小茉莉', meet_request: true });
+    options.push({ id: options.length + 1, label: '去茶水间随便吃点', start_routine: 'lunch', routine_opts: { method: 'tearoom' } });
+    const event = { key: 'lunch_choice', reason: '到午休时间了，午饭怎么解决？', options, wmHint: false };
+    return await triggerWorldWake(event, status, { force: true });
+  }
+  // 自己点外卖二级包：从外卖表随机 3 个 → 选了走 takeout_solo 链（下单扣 1 份钱→等送达→吃）。
+  if (row.wake_type === 'lunch_order_solo') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    const takeouts = await pickTakeoutOptions();
+    if (!takeouts.length) { // 外卖表空：退回茶水间
+      const ev = { key: 'lunch_order_solo', reason: '外卖今天点不了，去茶水间将就一下吧', options: [{ id: 1, label: '去茶水间随便吃点', start_routine: 'lunch', routine_opts: { method: 'tearoom' } }], wmHint: false };
+      return await triggerWorldWake(ev, status, { force: true });
+    }
+    const event = buildTakeoutEvent(takeouts, { method: 'takeout_solo', multiplier: 1, allowAsk: false, reason: '点份外卖，今天吃什么？', key: 'lunch_order_solo' });
+    return await triggerWorldWake(event, status, { force: true });
+  }
+  // 约见落地（6/13）：meet_request 判定你回了 → 排这条 2 分钟过场 → 到点落地小茉莉休息室 + 自动设你位置/Bark + 弹商量外卖包。
+  if (row.wake_type === 'meet_arrive') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: true, system: true };
+    await supabase.from('character_status_cheng')
+      .update({ location: '公司 · 小茉莉休息室', activity: '和小茉莉一起午休', updated_at: new Date().toISOString() }).eq('name', '澄');
+    await supabase.from('daily_timeline_cheng').insert({
+      world_time: realWorldTime(), location: '公司 · 小茉莉休息室',
+      action: '到小茉莉休息室，和她一起午休', detail: { reason: '两人午休碰上' }, source: 'system',
+    });
+    await autoSetUserLunchLocation();
+    const takeouts = await pickTakeoutOptions();
+    if (!takeouts.length) return { fired: true, system: true }; // 没外卖配置=就一起待着，不弹
+    const status2 = { ...status, location: '公司 · 小茉莉休息室', activity: '和小茉莉一起午休' };
+    const event = buildTakeoutEvent(takeouts, { method: 'takeout_together', multiplier: 2, allowAsk: true, reason: '跟小茉莉碰头了，一起点个外卖，吃什么好？', key: 'lunch_order' });
+    return await triggerWorldWake(event, status2, { force: true });
+  }
+  // "先问问小茉莉"后的再弹（6/13）：用存下来的同 3 个外卖，这次不带"先问问"。
+  if (row.wake_type === 'lunch_ask') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: true, system: true };
+    const takeouts = (row.payload && row.payload.takeouts) || await pickTakeoutOptions();
+    if (!takeouts.length) return { fired: true, system: true };
+    const event = buildTakeoutEvent(takeouts, { method: 'takeout_together', multiplier: 2, allowAsk: false, reason: '问过小茉莉了，定个外卖吧', key: 'lunch_order' });
+    return await triggerWorldWake(event, status, { force: true });
+  }
+  // 13:00 该上班了（6/13）：workdayTick 排这条，取代旧的静默 goAfternoon。①再赖10分钟(仅一次) ②回工位(默认垫底)。
+  // 第二次(snoozed)只给"回工位"。选回工位 → 2 分钟过场"回工位的路上" → back_to_work 落地工位。
+  if (row.wake_type === 'afternoon_choice') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: false, reason: 'no_status_row' };
+    if (!String(status.location || '').startsWith('公司')) {
+      console.log('[LUNCH] 人不在公司，下午上班提醒作废'); return { fired: true, system: true };
+    }
+    const snoozed = !!(row.payload && row.payload.snoozed);
+    const backToWork = { id: 99, label: '回工位上班', target_location: '公司 · 回工位的路上', target_activity: '往工位走',
+      pending: { wake_type: 'back_to_work', delay_world_minutes: 2, reason: '走回工位，下午上班' } };
+    const options = snoozed ? [{ ...backToWork, id: 1 }] : [
+      { id: 1, label: '再赖 10 分钟', effects: {}, pending: { wake_type: 'afternoon_choice', delay_world_minutes: 10, reason: '又赖了十分钟，真得上班了', payload_extra: { snoozed: true } } },
+      { ...backToWork, id: 2 },
+    ];
+    const event = {
+      key: 'afternoon_choice',
+      reason: snoozed ? '午休已经延长十分钟了，该去上班了' : '午休快结束了，准备上班吗？',
+      options, wmHint: false,
+    };
+    return await triggerWorldWake(event, status, { force: true });
+  }
+  // 回工位落地（6/13）：2 分钟过场到点 → 工位工作。
+  if (row.wake_type === 'back_to_work') {
+    const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    const status = rows && rows[0];
+    if (!status) return { fired: true, system: true };
+    await supabase.from('character_status_cheng')
+      .update({ location: '公司 · 工位', activity: '工作', updated_at: new Date().toISOString() }).eq('name', '澄');
+    await supabase.from('daily_timeline_cheng').insert({
+      world_time: realWorldTime(), location: '公司 · 工位',
+      action: '回到工位，下午上班', detail: { reason: '午休结束' }, source: 'system',
+    });
+    console.log('[LUNCH] 回工位，下午上班');
+    return { fired: true, system: true };
+  }
   // 11B：午休约见超时 — 小茉莉没回应 → 写一条 timeline，澄自己继续。不 engage、不移动 user、不改 user_status。
   // 午休约见到点：看这段时间小茉莉回没回。回了=见上(不弹吃啥)；没回=她在忙→弹"中午吃啥"→选了走午休链(吃→休息)。
   if (row.wake_type === 'meet_request') {
@@ -1143,11 +1305,19 @@ async function firePendingWake(row) {
       const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
       const status = rows && rows[0];
       if (userReplied) {
+        // 回了：去小茉莉休息室的路上（2 分钟过场）→ 排 meet_arrive 落地。
+        await supabase.from('character_status_cheng')
+          .update({ location: '公司 · 去小茉莉休息室的路上', activity: '去找小茉莉', updated_at: new Date().toISOString() }).eq('name', '澄');
         await supabase.from('daily_timeline_cheng').insert({
-          world_time: realWorldTime(), location: status?.location || null,
-          action: '午休见到小茉莉', detail: { reason: '小茉莉回应了，两人午休碰上' }, source: 'system',
+          world_time: realWorldTime(), location: '公司 · 去小茉莉休息室的路上',
+          action: '小茉莉回了，去找她', detail: { reason: '小茉莉回应了，去她休息室一起午休', duration_min: 2 }, source: 'system',
         });
-        console.log('[WORK] meet_request：小茉莉回了，算见上');
+        const cfg = readWorldConfig();
+        await supabase.from('pending_wake_cheng').insert({
+          wake_type: 'meet_arrive', reason: '到小茉莉休息室', status: 'queued',
+          scheduled_at: new Date(Date.now() + (cfg.fast_test ? 2 : 120) * 1000).toISOString(), payload: {}, attempts: 0,
+        });
+        console.log('[WORK] meet_request：小茉莉回了，去她休息室（2 分钟过场）');
         return { fired: true, system: true };
       }
       if (!status) return { fired: true, system: true };
@@ -1155,9 +1325,8 @@ async function firePendingWake(row) {
         key: 'lunch_solo',
         reason: '等了一会儿，小茉莉好像在忙，没回你。午休还是得吃点，你想吃啥？',
         options: [
-          { id: 1, label: '吃点零食垫垫', start_routine: 'lunch', routine_opts: { method: 'snack' } },
-          { id: 2, label: '点个外卖（¥25）', start_routine: 'lunch', routine_opts: { method: 'takeout' } },
-          { id: 3, label: '去茶水间找点吃的', start_routine: 'lunch', routine_opts: { method: 'tearoom' } },
+          { id: 1, label: '点份外卖', effects: {}, pending: { wake_type: 'lunch_order_solo', delay_world_minutes: 0, reason: '打开外卖软件挑吃的' } },
+          { id: 2, label: '去茶水间随便吃点', start_routine: 'lunch', routine_opts: { method: 'tearoom' } },
         ],
         wmHint: false,
       };
@@ -1311,9 +1480,9 @@ async function firePendingWake(row) {
     const status = rows && rows[0];
     if (!status) return { fired: false, reason: 'no_status_row' };
     const { data: dishes } = await supabase.from('world_items_cheng')
-      .select('name, price, shelf_life_days').eq('enabled', true).eq('category', '早餐').limit(4);
+      .select('name, price, shelf_life_days').eq('enabled', true).eq('category', '手作早餐').limit(4);
     const list = dishes || [];
-    if (!list.length) { console.log('[PREP] 食物表没"早餐"类菜，cook_prep 跳过'); return { fired: true, system: true }; }
+    if (!list.length) { console.log('[PREP] 食物表没"手作早餐"类菜，cook_prep 跳过'); return { fired: true, system: true }; }
     const QTY = 5; // v1：预制一周 5 份
     const options = list.map((dsh, i) => {
       const cost = Number(dsh.price) || 0;
@@ -1392,6 +1561,21 @@ setOffWorkHandler(async (row, { overtime }) => {
 setEveningStarter(async () => {
   const bad = !!(await badWeatherKind());
   await advanceRoutine('evening', 0, { cm: bad ? 'taxi' : 'subway', bad_weather: bad });
+});
+// 中午钩子（6/13）：11:00 切午休后排必弹包；13:00 排"该上班了"包。daemon 自带 CC 忙重试。
+setLunchHandler(async () => {
+  await supabase.from('pending_wake_cheng').insert({
+    wake_type: 'lunch_choice', reason: '午休，午饭怎么解决', status: 'queued',
+    scheduled_at: new Date().toISOString(), payload: {}, attempts: 0,
+  });
+  console.log('[LUNCH] 已排午休选择包');
+});
+setAfternoonHandler(async () => {
+  await supabase.from('pending_wake_cheng').insert({
+    wake_type: 'afternoon_choice', reason: '午休快结束，问上不上班', status: 'queued',
+    scheduled_at: new Date().toISOString(), payload: {}, attempts: 0,
+  });
+  console.log('[LUNCH] 已排下午上班提醒');
 });
 
 // 世界唤醒轮收尾：解析澄的选择 → 读-改-写状态结算 effects → 写行程表。
@@ -1730,9 +1914,9 @@ function canFaceToFace(chengLocation, userLocation) {
   if (chengLocation.startsWith('家 · ') && userLocation.startsWith('家 · ')) {
     return chengLocation === userLocation; // 家里：必须同一具体房间
   }
-  if (chengLocation === '公司 · 休息室' && userLocation === '公司 · 休息室') {
-    return true; // 公司：只有休息室能面对面
-  }
+  // 公司：只有休息室能面对面——俩人在同一间休息室（澄休息室或小茉莉休息室，字符串一致）即可
+  const LOUNGES = ['公司 · 澄休息室', '公司 · 小茉莉休息室'];
+  if (LOUNGES.includes(chengLocation) && chengLocation === userLocation) return true;
   return false; // 公司工位 / 不同地点 一律手机
 }
 

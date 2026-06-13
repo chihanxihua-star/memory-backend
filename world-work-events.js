@@ -36,7 +36,7 @@ export const WORK_EVENTS = {
   boss_perk_work: {
     id: 'boss_perk_work', label: '老板发福利', event_type: 'work_event', npc: '老板',
     reason: '老板今天发了一批员工福利，可能包括情趣内衣、小玩具、情绪玩具、香氛、新品试用装',
-    locations: ['公司 · 工位', '公司 · 休息室', '公司 · 茶水间', '公司 · 会议室'], activity_in: ['工作', '午休', '加班'], workday_only: true,
+    locations: ['公司 · 工位', '公司 · 澄休息室', '公司 · 茶水间', '公司 · 会议室'], activity_in: ['工作', '午休', '加班'], workday_only: true,
     time_ranges: [['09:00', '17:00']],
     probability: 0.1, cooldown_world_minutes: 1440, once_per_day: true, npc_boost: true, wmHint: true,
     options: [
@@ -60,7 +60,7 @@ export const WORK_EVENTS = {
   coworker_chat: {
     id: 'coworker_chat', label: '员工闲聊', event_type: 'work_event', npcPool: ['同事A', '同事B'],
     reason: '同事顺口聊起最近公司新品和实习期安排',
-    locations: ['公司 · 茶水间', '公司 · 休息室', '公司 · 工位'], activity_in: ['工作', '午休'], workday_only: true,
+    locations: ['公司 · 茶水间', '公司 · 澄休息室', '公司 · 工位'], activity_in: ['工作', '午休'], workday_only: true,
     time_ranges: [['09:00', '16:00']],
     probability: 0.18, cooldown_world_minutes: 360, once_per_day: false, npc_boost: true, wmHint: false,
     options: [
@@ -81,19 +81,8 @@ export const WORK_EVENTS = {
       { id: 3, label: '跟老板确认明天继续', effects_hint: [{ stat: 'social', direction: 'up', strength: 'tiny' }, { stat: 'stress', direction: 'down', strength: 'tiny' }], target_activity: '和老板确认任务' },
     ],
   },
-  lunch_break: {
-    id: 'lunch_break', label: '午休时间', event_type: 'work_event', npc: null,
-    reason: '午休时间到了，你可以在自己的休息室里短暂恢复，也可以看一眼小手机',
-    locations: ['公司 · 休息室', '公司 · 茶水间'], activity_in: ['午休'], workday_only: true,
-    time_ranges: [['11:00', '13:00']],
-    probability: 0.5, cooldown_world_minutes: 1440, once_per_day: true, npc_boost: false, wmHint: true,
-    options: [
-      { id: 1, label: '回休息室睡一会儿', effects_hint: [{ stat: 'energy', direction: 'up', strength: 'medium' }, { stat: 'stress', direction: 'down', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }], target_location: '公司 · 休息室', target_activity: '午休' },
-      { id: 2, label: '在休息室吃点东西', effects_hint: [{ stat: 'satiety', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }], target_location: '公司 · 休息室', target_activity: '吃东西' },
-      { id: 3, label: '看一眼小手机待办', effects_hint: [{ stat: 'focus', direction: 'up', strength: 'tiny' }, { stat: 'longing', direction: 'up', strength: 'tiny' }], target_activity: '看小手机' },
-      { id: 4, label: '约小茉莉午休见一面', effects_hint: [{ stat: 'longing', direction: 'up', strength: 'small' }, { stat: 'mood', direction: 'up', strength: 'tiny' }], target_activity: '等小茉莉', meet_request: true },
-    ],
-  },
+  // lunch_break（午休随机事件）已删除（2026-06-13）：中午改成 11:00 必弹 lunch_choice（躺会儿/点外卖/约小茉莉/茶水间），
+  // 由 workdayTick→goLunch→lunchHandler 排，不再走随机池，避免双弹。约见/外卖等逻辑都迁进 firePendingWake 的 lunch_* 分支。
   work_tea_restock: {
     id: 'work_tea_restock', label: '茶水间补货', event_type: 'work_event', npc: null,
     reason: '茶水间今天补了新的小面包、小蛋糕和饼干，咖啡机旁边也放了红茶和白茶',
