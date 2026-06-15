@@ -202,19 +202,38 @@ export function generateChengSelfNarration(status, env, rules) {
   return s.replace(/ {2,}/g, ' ').replace(/，。/g, '。').trim();
 }
 
-// 小茉莉第三人称客观描述。activity 是用户手填，允许长/换行/引号，原样拼，不清洗。
-export function formatUserStatus(user) {
+// 澄能否直接看见小茉莉 = 是否同一个房间（家同具体房间 / 同一间休息室）。口径同 index.js 的 canFaceToFace。
+// ⚠️ 这是独立拷贝，只给下面这句文字用，不碰气泡逻辑（气泡走 index.js 的 canFaceToFace）；改房间规则两边都要改。
+function sameRoomAsCheng(chengStatus, user) {
+  const c = chengStatus && chengStatus.location, m = user && user.location;
+  if (!c || !m) return false;
+  if (c.startsWith('家 · ') && m.startsWith('家 · ')) return c === m;
+  const LOUNGES = ['公司 · 澄休息室', '公司 · 小茉莉休息室'];
+  if (LOUNGES.includes(c) && c === m) return true;
+  return false;
+}
+
+// 小茉莉第三人称。同房间=澄直接看见「在我旁边，正X」；不同房间（异地/不同工位/不同屋）=澄看不见，
+// 转述「说她在X地X事」——视角不穿帮（信息是小茉莉自己设状态告诉澄的，不是澄偷看到的）。
+// activity 用户手填，原样拼不清洗；其中"澄"=对澄说→转"我"（如"和澄一起午休"→"和我一起午休"）。
+export function formatUserStatus(user, chengStatus) {
   const u = user || {};
-  const locN = formatNaturalLocation(u.location || '家 · 客厅');
-  // <此刻> 是给澄看的：小茉莉状态里的"澄"=在对澄说，转成"我"（如"和澄一起午休"→"和我一起午休"）
   const act = (u.activity || '休息').replace(/澄/g, '我');
-  return `在${locN}，正在${act}`;
+  if (sameRoomAsCheng(chengStatus, u)) return `在我旁边，正${act}`;
+  // 转述：不同房间，澄看不见。同一栋楼（都在公司/都在家）省掉楼名只说房间（"工位"）；
+  // 不同栋楼保留全名（"公司的工位"），不然澄不知道她在哪栋。
+  const uLoc = u.location || '家 · 客厅';
+  const cBldg = ((chengStatus && chengStatus.location) || '').split(' · ')[0];
+  const uBldg = uLoc.split(' · ')[0];
+  const sameBldg = cBldg && uBldg && cBldg === uBldg;
+  const locN = sameBldg ? (uLoc.split(' · ')[1] || formatNaturalLocation(uLoc)) : formatNaturalLocation(uLoc);
+  return `说她在${locN}${act}`;
 }
 
 // <此刻> 内层内容（不含 <此刻> 标签壳）：澄自述 + 空行 + 小茉莉。两个入口共用。
 export function buildNowInner(chengStatus, env, user, rules) {
   const cheng = generateChengSelfNarration(chengStatus, env, rules);
-  const mol = formatUserStatus(user);
+  const mol = formatUserStatus(user, chengStatus);
   // 不带「澄：」前缀（自述本来就是第一人称「我」）；小茉莉行去冒号拼成一句话（2026-06-12 用户定的格式）
   return `${cheng}\n\n小茉莉${mol}`;
 }

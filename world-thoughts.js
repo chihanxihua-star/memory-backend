@@ -17,6 +17,8 @@ function nowISO() { return new Date().toISOString(); }
 function plus8Date(ts) { return ts ? new Date(new Date(ts).getTime() + 8 * 3600000).toISOString().slice(0, 10) : ''; }
 function shortAction(a) { const s = String(a || '').split(' → ')[0].trim(); return s.length > 26 ? s.slice(0, 26) + '…' : s; }
 function truncate(s, n) { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; }
+// 小心思/消息常用 ---bubble--- 分多个气泡，浮现只取第一段，避免标记和半截下一气泡漏进来。
+function firstBubble(s) { return String(s || '').split('---bubble---')[0]; }
 // 洗掉残留的世界标签([WORLD_MESSAGE]/[TODO]/[WORLD_CHOICE]/[MEMORY]，配对或单个)，保留里面的话。
 // 小心思本应是标签外散文，但偶有澄写漏闭合标签导致残留——念头 content 这里兜底洗一遍。
 function stripTags(s) {
@@ -80,7 +82,7 @@ async function gatherInnerThoughts() {
     .select('id, content, timeline_id, created_at').gt('created_at', wl).order('created_at', { ascending: true }).limit(60);
   return (data || []).map(it => ({
     source_type: 'inner_thought', source_id: String(it.id), category: String(it.content || '').includes('小茉莉') ? 'relationship' : 'life_event',
-    content: `之前留下一段小心思：${truncate(stripTags(it.content), 40)}`, salience: 0.55, status: 'active', created_at: it.created_at, _wl: 'inner_thought', metadata: { timeline_id: it.timeline_id },
+    content: `之前留下一段小心思：${truncate(stripTags(firstBubble(it.content)), 40)}`, salience: 0.55, status: 'active', created_at: it.created_at, _wl: 'inner_thought', metadata: { timeline_id: it.timeline_id, full: it.content },
   }));
 }
 async function gatherPending() {
@@ -102,7 +104,10 @@ async function gatherWorldMessage() {
 // 统一处理：采集 → 按 created_at 升序 → 最多新增 8 条 active；水位线只推进到「本轮实际处理过的 max(created_at)」，
 // 没被处理的候选不推进（不丢数据）。去重靠 source_type+source_id+category，重复也算已处理(推水位线)但不占 8 名额。
 async function scanNewSources(stats) {
-  const gathered = (await Promise.all([gatherTimeline(), gatherTodos(), gatherInnerThoughts(), gatherPending(), gatherWorldMessage()])).flat();
+  // 浮现源只留小手机待办 todo——小心思(演的戏/漏情绪)、pending_wake(系统自会唤醒)、
+  // world_message(上下文都在/回话即归档)、timeline(错标没收尾+漏 ignored 情绪) 都已砍。
+  // gatherInnerThoughts/gatherTimeline/gatherPending/gatherWorldMessage 保留定义但不再调用。
+  const gathered = await gatherTodos();
   if (!gathered.length) return;
   gathered.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
   // 现有键集合（判去重）
@@ -182,8 +187,14 @@ async function decayThoughts(stats) {
 // ── 12B-2：小世界浮现（只读挑 1 条 active 念头进聊天 surfacing；【不改状态/不落库】）──────────────
 // denylist 只是第二层保险(主防线是 collector 写 content 时就是事实句)；命中要打日志，作为回头修 collector 的信号。
 const SURFACE_DENYLIST = ['很想', '欲望', '依恋', '焦虑', '不安', '放不下', '惦记', 'attachment', 'desire', 'libido', 'longing', 'mood', 'stress', 'salience', 'priority', 'unresolved_weight'];
-const SURFACE_COOLDOWN_MS = 10 * 60 * 1000;
-const surfaceCooldown = new Map(); // thought_id -> last_shown_at(ms)，内存级防刷屏，重启清空可接受
+// 冷却随紧急度变：salience 0.5→36h、0.95→24h，线性插值（夹在 24~36h）。越急间隔越短=浮得越勤。
+const COOLDOWN_LOW_H = 36, COOLDOWN_HIGH_H = 24;
+function salienceCooldownMs(salience) {
+  const s = Math.min(0.95, Math.max(0.5, Number(salience) || 0.5));
+  const t = (s - 0.5) / (0.95 - 0.5); // 0..1
+  return (COOLDOWN_LOW_H + t * (COOLDOWN_HIGH_H - COOLDOWN_LOW_H)) * 3600 * 1000;
+}
+const surfaceCooldown = new Map(); // thought_id -> last_shown_at(ms)，内存级，重启清空（与澄失忆对齐，刻意不持久化）
 
 // ── 12B-2.1 观测（只内存、不落库、重启清空；不影响 pick 行为；不喂 Claude）──────────────
 const pickHistory = [];             // 最近 20 次聊天小世界浮现决策（不含 worldWakeInjection）
@@ -201,7 +212,8 @@ export async function pickWorldThought() {
     const now = Date.now();
     rec.activeThoughtsSnapshot = (data || []).map(t => ({ id: t.id, content: t.content, salience: t.salience, status: t.status, source_type: t.source_type, created_at: t.created_at }));
     for (const t of data || []) {
-      const c = String(t.content || '').trim();
+      // 已存旧念头的 content 可能含 ---bubble---（修复前收集的），展示时切到第一段洗干净。
+      const c = firstBubble(t.content).trim();
       if (!c) continue;
       const hit = SURFACE_DENYLIST.find(w => c.includes(w));
       if (hit) {
@@ -209,9 +221,10 @@ export async function pickWorldThought() {
         rec.filteredThoughts.push({ id: t.id, content: c, filtered_reason: 'unsafe_content', matched_word: hit, log_time: new Date().toISOString() });
         continue;
       }
+      const cdMs = salienceCooldownMs(t.salience);
       const last = surfaceCooldown.get(t.id) || 0;
-      if (now - last < SURFACE_COOLDOWN_MS) {
-        rec.cooldownSkipped.push({ id: t.id, content: c, last_shown_at: new Date(last).toISOString(), skipped_reason: 'cooldown_10min' });
+      if (now - last < cdMs) {
+        rec.cooldownSkipped.push({ id: t.id, content: c, last_shown_at: new Date(last).toISOString(), skipped_reason: `cooldown_${Math.round(cdMs / 3600000)}h` });
         continue;
       }
       surfaceCooldown.set(t.id, now);
@@ -253,10 +266,10 @@ export async function collectWorldThoughts() {
   isCollecting = true;
   const stats = { inserted: 0, archived: 0, decayed: 0 };
   try {
-    await scanNewSources(stats); // 采集所有源 → 按 created_at 排序 → 每轮最多新增 8 条 → 按源推水位线
-    await settleResolved(stats);
-    await decayThoughts(stats);
-    console.log(`[THOUGHTS] collect: +${stats.inserted} 新 / ${stats.archived} 收尾 / ${stats.decayed} 衰减`);
+    await scanNewSources(stats); // 只采 todo → 按 created_at 排序 → 每轮最多新增 8 条 → 推水位线
+    await settleResolved(stats); // 待办做完(status≠open) → 归档，停止浮现
+    // 衰减 + 砍最低已去掉：待办该一直提醒到做完，不因放久了淡出（decayThoughts 保留定义但不调用）。
+    console.log(`[THOUGHTS] collect: +${stats.inserted} 新 / ${stats.archived} 收尾`);
     return { ok: true, ...stats };
   } catch (e) {
     console.error('[THOUGHTS] collect 异常:', e.message);

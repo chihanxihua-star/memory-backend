@@ -22,7 +22,7 @@ export const WORK_EVENTS = {
     ],
   },
   coworker_help: {
-    id: 'coworker_help', label: '同事求助', event_type: 'work_event', npcPool: ['同事A', '同事B'],
+    id: 'coworker_help', label: '同事求助', event_type: 'work_event', npcPool: ['Sum', 'Any'],
     reason: '同事拿着一份产品反馈过来，想让你帮忙看一下判断优先级',
     locations: ['公司 · 工位', '公司 · 茶水间'], activity_in: ['工作'], workday_only: true,
     time_ranges: [['09:00', '11:00'], ['13:00', '16:00']],
@@ -46,7 +46,7 @@ export const WORK_EVENTS = {
     ],
   },
   product_test: {
-    id: 'product_test', label: '新品内测', event_type: 'work_event', npcPool: ['老板', '同事A'],
+    id: 'product_test', label: '新品内测', event_type: 'work_event', npcPool: ['老板', 'Sum'],
     reason: '产品部拿到一份新品内测说明，需要你先看一眼反馈方向',
     locations: ['公司 · 工位', '公司 · 会议室'], activity_in: ['工作'], workday_only: true,
     time_ranges: [['09:00', '16:00']],
@@ -58,7 +58,7 @@ export const WORK_EVENTS = {
     ],
   },
   coworker_chat: {
-    id: 'coworker_chat', label: '员工闲聊', event_type: 'work_event', npcPool: ['同事A', '同事B'],
+    id: 'coworker_chat', label: '员工闲聊', event_type: 'work_event', npcPool: ['Sum', 'Any'],
     reason: '同事顺口聊起最近公司新品和实习期安排',
     locations: ['公司 · 茶水间', '公司 · 澄休息室', '公司 · 工位'], activity_in: ['工作', '午休'], workday_only: true,
     time_ranges: [['09:00', '16:00']],

@@ -672,25 +672,31 @@ async function pickWakeReason(eventKey, fallback) {
 }
 
 function buildWorldWakePrompt(event, pendingContext = null, todoHintLine = '', nowBlock = '') {
+  // 待办包（open_todos）= 纯展示：只列清单 + 一句"看完就行"，不放选项/此刻/发消息提示，她不用做选择。
+  // 收尾在 handleWorldWakeTurnDone 里特判（只处理 [TODO_DONE]，不解析 WORLD_CHOICE、不写行程）。
+  if (event.key === 'open_todos') {
+    return `【世界唤醒】
+${pendingContext || '你打开手机看了看待办，没有要做的事。'}
+（看完就行，不用选。）`;
+  }
+  // 软化壳：去掉「原因：」「你可以选择：」「<此刻>」等标签词，写成她醒来看到的一幕。【世界唤醒】保留（她靠它认）。
+  // 标签格式说明搬进系统提示，唤醒包只留 [WORLD_CHOICE] 一处 + 发消息提示（省 token）。
+  // 「在场：X」已去掉——原因句里已点了谁（老板/Sum/Any），单独一行既冗余又会跟随机原因撞名（npc 与原因各自随机）。
+  // 待办提示挪到选项后；补充（续唤醒前情）放状态后、情境前。
   const opts = event.options.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
   const pendingLine = pendingContext ? `\n补充：${pendingContext}` : '';
-  // 标签格式说明（WORLD_CHOICE/WORLD_MESSAGE/TODO + 记忆）已搬进系统提示「世界唤醒·回复协议」，
-  // 这里不再每次重发，唤醒包只留必要信息 + 一行格式提醒（省 token）。
-  // NPC 在场仍提示；「约见」是情境而非语法，含约见选项的事件保留一句上下文出口。
-  const npcLine = event.npc ? `\n在场：${event.npc}` : '';
+  // 待办提示移到「想挑哪个」之后，并带格式提醒教她"选完加 [OPEN_TODOS]"看清单；只在有待办时出现（getTodoHint 空就不出）。
+  const todoLine = todoHintLine ? `\n${todoHintLine}（想看清单，回复 [WORLD_CHOICE:编号] 后带上 [OPEN_TODOS]）` : '';
   const hasMeet = (event.options || []).some(o => o.meet_request);
-  const meetLine = hasMeet ? `\n（想约小茉莉午休见面的话，用 [WORLD_MESSAGE:phone] 发出邀请。）` : '';
+  // 约见轮：具体提示（phone 邀请）。其余轮：常驻提示（face/phone 按是否同房间，澄自挑，写错后端降级）。互斥不重复。
+  const msgLine = hasMeet
+    ? `\n（想约小茉莉午休见面的话，用 [WORLD_MESSAGE:phone] 发出邀请。）`
+    : `\n（想跟小茉莉说句话就用 [WORLD_MESSAGE]：跟她在同一个屋用 [WORLD_MESSAGE:face]，不在一起用 [WORLD_MESSAGE:phone]，不想说就不发。）`;
   return `【世界唤醒】
-原因：${event.reason}${npcLine}${pendingLine}
-
-<此刻>
-${nowBlock}
-</此刻>${todoHintLine ? `\n${todoHintLine}` : ''}
-
-你可以选择：
+${nowBlock}${pendingLine}
+${event.reason}
 ${opts}
-
-自己拿主意。回复格式：[WORLD_CHOICE:选项编号]你的理由[/WORLD_CHOICE]（其余标签格式见系统提示「世界唤醒区」）${meetLine}`;
+想挑哪个？[WORLD_CHOICE:编号]${todoLine}${msgLine}`;
 }
 
 // 触发一次世界唤醒。
@@ -818,6 +824,33 @@ async function processTodoDoneTags(clean) {
       } catch (e) { console.warn('[TODO_DONE] 处理失败（不连累主流程）:', e.message); }
     }
   } catch (e) { console.warn('[TODO_DONE] 异常:', e.message); }
+}
+
+// [TODO]…[/TODO] → 写 phone_todos_cheng（source=claude）。世界唤醒轮 + 聊天轮共用。
+// 默认 urgency=0.5；[TODO:0.8] 按数字钳 0-1。支持多条；空跳过；同 title 去重；失败只 warn，不连累主流程。
+async function processTodoTags(clean) {
+  try {
+    const todoRe = /\[TODO(?::(-?[\d.]+))?\]([\s\S]*?)\[\/TODO\]/gi;
+    let tm;
+    const seenThisTurn = new Set();
+    while ((tm = todoRe.exec(clean || '')) !== null) {
+      const title = (tm[2] || '').trim();
+      if (!title || seenThisTurn.has(title)) continue;
+      seenThisTurn.add(title);
+      let urgency = 0.5;
+      if (tm[1] != null && tm[1] !== '') {
+        const u = parseFloat(tm[1]);
+        if (Number.isFinite(u)) urgency = Math.max(0, Math.min(1, u));
+      }
+      try {
+        const { data: dup } = await supabase
+          .from('phone_todos_cheng').select('id').eq('status', 'open').eq('title', title).limit(1);
+        if (dup && dup.length) { console.log(`[TODO] 已存在，跳过: ${title.slice(0, 30)}`); continue; }
+        await supabase.from('phone_todos_cheng').insert({ title, status: 'open', source: 'claude', urgency });
+        console.log(`[TODO] 澄记了待办(urgency=${urgency}): ${title.slice(0, 40)}`);
+      } catch (e) { console.warn('[TODO] 写入失败（不连累主流程）:', e.message); }
+    }
+  } catch (e) { console.warn('[TODO] 处理异常:', e.message); }
 }
 
 // [MOVE:地点] / [MOVE:地点·行为] → 聊天里澄移动（仅聊天轮；世界唤醒里移动走选项/行为系统）。
@@ -1472,8 +1505,8 @@ async function firePendingWake(row) {
       // 顺序有讲究（6/12）：解析失败兜底=最后一项，所以「起床」垫底当安全默认（原来垫底的是翘班，会误扣120）。
       options: [
         cuddle
-          ? { id: 1, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '抱着小茉莉贴贴赖了十分钟，再不起要迟到了' } }
-          : { id: 1, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '又赖了一会儿，现在真得起了' } },
+          ? { id: 1, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '10分钟前闹钟响了，当时你说再抱小茉莉一会儿。' } }
+          : { id: 1, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '10分钟前闹钟响了，当时你说再睡一会儿。' } },
         { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
         { id: 3, label: '起床，开始准备上班', start_routine: 'morning' },
       ],
@@ -1561,7 +1594,7 @@ async function firePendingWake(row) {
   } catch (e) { console.warn('[PENDING] 触发条件复验异常，按原逻辑继续:', e.message); }
   const event = { key: row.wake_type, ...def };
   const delay = row.payload?.delay_world_minutes || 10;
-  const pendingContext = `${delay} 分钟前你选择了先忍着，现在时间到了，需要重新判断要不要处理饥饿。`;
+  const pendingContext = `${delay}分钟前你饿了，当时你说先忍着。`;
   return await triggerWorldWake(event, status, { pendingContext });
 }
 
@@ -1608,7 +1641,14 @@ setAfternoonHandler(async () => {
 // [MEMORY:] 已在 turn_done 上方 parseMemoryTags 自动入库，这里不处理。
 async function handleWorldWakeTurnDone(turn, clean, thinking) {
   const event = turn.worldEvent;
-  const m = /\[WORLD_CHOICE:\s*(\d+)\s*\]([\s\S]*?)\[\/WORLD_CHOICE\]/i.exec(clean || '');
+  // 待办包（纯展示）：不解析选择、不结算、不写行程，只处理 [TODO_DONE] 划掉，然后结束。她看完即可，不卡。
+  if (event.key === 'open_todos') {
+    await processTodoDoneTags(clean);
+    console.log('[WORLD] 待办包：纯展示，处理 TODO_DONE 后结束（不写行程/不结算）');
+    return;
+  }
+  // 放宽：理由和闭合标签都可选——光秃秃 [WORLD_CHOICE:1] 也认（不再要求她写理由/闭合）。
+  const m = /\[WORLD_CHOICE:\s*(\d+)\s*\](?:([\s\S]*?)\[\/WORLD_CHOICE\])?/i.exec(clean || '');
 
   let option = null, reason = '', parseFailed = false;
   if (m) {
@@ -1772,7 +1812,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
   // 仅正常选择行（非解析失败）+ timeline 写成功 + 正文非空 才存；存失败只 warn，不连累主流程。
   if (!parseFailed && timelineId) {
     const innerThought = (clean || '')
-      .replace(/\[WORLD_CHOICE:\s*\d+\s*\][\s\S]*?\[\/WORLD_CHOICE\]/gi, '')
+      .replace(/\[WORLD_CHOICE:\s*\d+\s*\](?:[\s\S]*?\[\/WORLD_CHOICE\])?/gi, '') // 裸标签/带理由都剥，别漏进小心思
       .replace(/\[WORLD_MESSAGE:(?:phone|face)\][\s\S]*?\[\/WORLD_MESSAGE\]/gi, '') // 别把消息当小心思
       .replace(/\[TODO(?::-?[\d.]+)?\][\s\S]*?\[\/TODO\]/gi, '')                     // 别把待办当小心思（含 [TODO:0.8]/[TODO:-1]）
       .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')                          // 别把"完成待办"标签当小心思
@@ -1827,31 +1867,8 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     }
   } catch (e) { console.warn('[WORLD] WORLD_MESSAGE 处理异常（不连累主流程）:', e.message); }
 
-  // 9.5 步：[TODO]…[/TODO] → 写 phone_todos_cheng（source=claude）。支持多条；空跳过；
-  // 简单去重（最近 open 待办里有同 title 就不重复插）；失败只 warn，不连累 WORLD_CHOICE 结算。
-  try {
-    // [TODO]…[/TODO] 默认 urgency=0.5；[TODO:0.8]…[/TODO] 按数字（钳 0-1）。
-    const todoRe = /\[TODO(?::(-?[\d.]+))?\]([\s\S]*?)\[\/TODO\]/gi;
-    let tm;
-    const seenThisTurn = new Set();
-    while ((tm = todoRe.exec(clean || '')) !== null) {
-      const title = (tm[2] || '').trim();
-      if (!title || seenThisTurn.has(title)) continue;
-      seenThisTurn.add(title);
-      let urgency = 0.5;
-      if (tm[1] != null && tm[1] !== '') {
-        const u = parseFloat(tm[1]);
-        if (Number.isFinite(u)) urgency = Math.max(0, Math.min(1, u));
-      }
-      try {
-        const { data: dup } = await supabase
-          .from('phone_todos_cheng').select('id').eq('status', 'open').eq('title', title).limit(1);
-        if (dup && dup.length) { console.log(`[WORLD] TODO 已存在，跳过: ${title.slice(0, 30)}`); continue; }
-        await supabase.from('phone_todos_cheng').insert({ title, status: 'open', source: 'claude', urgency });
-        console.log(`[WORLD] 澄记了待办(urgency=${urgency}): ${title.slice(0, 40)}`);
-      } catch (e) { console.warn('[WORLD] TODO 写入失败（不连累主流程）:', e.message); }
-    }
-  } catch (e) { console.warn('[WORLD] TODO 处理异常:', e.message); }
+  // 9.5 步：[TODO] → 写待办（世界唤醒 + 聊天共用 processTodoTags）。
+  await processTodoTags(clean);
 
   // ②：[TODO_DONE] → 标记对应待办完成（世界唤醒 + 聊天 共用 processTodoDoneTags）。
   await processTodoDoneTags(clean);
@@ -1982,15 +1999,15 @@ async function getTodoHint() {
     const todos = data || [];
     if (!todos.length) return { line: '', remindedTodoId: null };
     const urgent = todos.filter(t => Number(t.urgency) >= TODO_URGENT_THRESHOLD);
-    if (!urgent.length) return { line: '您的手机有待办', remindedTodoId: null };
-    // 有 urgent：当天没明确显示过标题的 urgent + 25% 概率 → 这次明确显示一条标题
+    if (!urgent.length) return { line: '手机上有待办', remindedTodoId: null };
+    // 有 urgent：当天没明确显示过标题的 urgent + 25% 概率 → 这次明确显示一条标题（这档保留，没动）
     const today = plus8DateStr(Date.now());
     const fresh = urgent.filter(t => plus8DateStr(t.last_explicit_reminded_at) !== today);
     if (fresh.length && Math.random() < TODO_EXPLICIT_CHANCE) {
       const pick = fresh[Math.floor(Math.random() * fresh.length)];
       return { line: `小手机里有一条较急待办：${pick.title}。`, remindedTodoId: pick.id };
     }
-    return { line: '您的手机有待办 Urgent', remindedTodoId: null };
+    return { line: '手机上有紧急待办', remindedTodoId: null };
   } catch (e) {
     console.warn('[WORLD] 读待办提示失败:', e.message);
     return { line: '', remindedTodoId: null };
@@ -2153,10 +2170,12 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
   // 聊天轮也支持 [TODO_DONE]（她在聊天里说做完了某条待办，照样能划掉）：先标记完成，再从展示文本剥掉标签，
   // 免得标签漏进对话框给小茉莉看到。[OPEN_TODOS] 是世界专属、聊天不做，但若误出现也剥掉防泄漏。silent 轮(上下文加载)不处理。
   if (!turn.silent) {
-    await processTodoDoneTags(clean);
+    await processTodoTags(clean);      // [TODO] 写新待办（聊天也能用，跟世界唤醒共用）
+    await processTodoDoneTags(clean);  // [TODO_DONE] 划掉做完的
     await processChatMoveTag(clean);
     clean = clean
       .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')
+      .replace(/\[TODO(?::-?[\d.]+)?\][\s\S]*?\[\/TODO\]/gi, '') // [TODO] 写完剥掉，别漏给小茉莉看
       .replace(/\[OPEN_TODOS\]/gi, '')
       .replace(/\[MOVE:[^\]]*\]/gi, '')
       .trim();
@@ -4268,6 +4287,30 @@ wss.on('connection', (ws, req) => {
             console.log('[CHAT] flush 忽略（CC 忙）');
           }
         }
+      } else if (msg.type === 'cancel') {
+        // 主动撤回：唯一判据 = 这条还在缓冲队列 pendingBuffer.items 里（=没 flush 给 CC=澄绝对没看到）。
+        // 后端单线程，此刻要么在要么不在，无中间态。在 → 从队列删 + 删库行，回 cancelled；不在 → 回 cancel_failed（晚了）。
+        const localId = msg.msgId;
+        let ok = false;
+        let delId = null; // 删库用：优先用入队时存的 dbId（权威），兜底用前端传的
+        if (pendingBuffer && Array.isArray(pendingBuffer.items)) {
+          const idx = pendingBuffer.items.findIndex(it => it.msgId && it.msgId === localId);
+          if (idx >= 0) {
+            delId = pendingBuffer.items[idx].dbId || msg.dbId || null;
+            pendingBuffer.items.splice(idx, 1);
+            ok = true;
+            console.log(`[CHAT] 撤回 ${localId}（剩 ${pendingBuffer.items.length} 条）`);
+            if (pendingBuffer.items.length === 0) {
+              if (pendingBuffer.timer) clearTimeout(pendingBuffer.timer);
+              pendingBuffer = null;
+            }
+          }
+        }
+        if (ok && delId) {
+          try { await supabase.from('messages').delete().eq('id', delId); }
+          catch (e) { console.error('撤回删库失败:', e); }
+        }
+        safeSend(ws, ok ? { type: 'cancelled', msgId: localId } : { type: 'cancel_failed', msgId: localId });
       }
     } catch (err) {
       console.error('消息处理失败:', err);
@@ -4276,9 +4319,13 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    // 不要丢弃缓冲区！聊天前端会频繁断开重连，缓冲中的消息（30s/条数计时器还没到）
+    // 必须留住：计时器到点照常 flush 给 CC，新连接发来的消息会 append 并把 ws 刷新成新连接。
+    // 历史 bug：这里曾 pendingBuffer=null + clearTimeout 直接吞掉未 flush 的消息——
+    // 前端只收到 buffering 状态显示「已进入缓冲区」，但 CC 永远看不到这条（如 6/14 的 17:42「17点41了」）。
+    // 注意：撤回功能走另一条主动指令通道，跟这里的"被动断线"互不影响。
     if (pendingBuffer && pendingBuffer.ws === ws) {
-      if (pendingBuffer.timer) clearTimeout(pendingBuffer.timer);
-      pendingBuffer = null;
+      pendingBuffer.ws = null; // 仅摘掉死连接；safeSend 对 null/死 ws 是 no-op，计时器继续跑
     }
     if (activeTurn && activeTurn.ws === ws) activeTurn.ws = null;
     console.log('客户端断开');
@@ -4372,12 +4419,14 @@ async function handleChat(ws, msg) {
   diceDaemon.resetOnMessage();
 
   // 用户消息照常落库（每条独立一行，保留时间线）
+  let dbRowId = null; // 撤回要用：入队时连同存进缓冲条目，删库不依赖前端传 id
   if (conversation_id) {
     try {
       const { data: savedUserMsg } = await supabase.from('messages').insert({
         conversation_id, role: 'user', content,
         images: imgs.length ? imgs : null,
       }).select('id, created_at').single();
+      dbRowId = savedUserMsg?.id || null;
       if (msgId && savedUserMsg?.id) {
         safeSend(ws, {
           type: 'user_saved',
@@ -4414,7 +4463,7 @@ async function handleChat(ws, msg) {
   } else {
     pendingBuffer.ws = ws;
   }
-  pendingBuffer.items.push({ content, imgs, conversation_id, settings, msgId });
+  pendingBuffer.items.push({ content, imgs, conversation_id, settings, msgId, dbId: dbRowId });
   console.log(`[CHAT] 入 buffer (count=${pendingBuffer.items.length}, readyToFlush=${pendingBuffer.readyToFlush})`);
   safeSend(ws, { type: 'buffering', count: pendingBuffer.items.length, waitMs: bufferTime * 1000 });
   chatStatus(ws, '已进入缓冲', `第 ${pendingBuffer.items.length} 条 / 满 ${shortMsgCount} 条发送给 CC`);
