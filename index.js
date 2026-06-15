@@ -28,6 +28,7 @@ import { DiceDaemon } from './dice.js';
 import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WORLD_EVENTS, syncWorldTimeToRealTime } from './world-tick.js';
 import { PendingWakeDaemon } from './world-pending.js';
 import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction, scheduleActivityEnd } from './world-actions.js';
+import { CHAT_MOVE_LOCATIONS, processJointMove } from './world-move.js';
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
@@ -859,9 +860,16 @@ async function processTodoTags(clean) {
 // 只改 location/activity 两个描述字段，不结算任何数值——带后果的事（吃饭/花钱）仍走世界系统。
 // 规则：地点白名单 + 只许同栋楼内移动（跨楼忽略）；一条回复里出现多个 MOVE 只认最后一个；
 // 地点可省「家/公司」前缀（房间名在两栋楼里不重名）。行为复用 scheduleActivityEnd 自动收尾。
-const CHAT_MOVE_LOCATIONS = ['家 · 卧室', '家 · 客厅', '家 · 厨房', '家 · 浴室', '公司 · 工位', '公司 · 澄休息室', '公司 · 小茉莉休息室', '公司 · 茶水间'];
-async function processChatMoveTag(text) {
+// CHAT_MOVE_LOCATIONS 白名单 + resolveMoveRoom + 共同移动 processJointMove 已移到 world-move.js（单人/共同移动共用），此处 import。
+async function processChatMoveTag(text, turnStartedAt = null) {
   try {
+    // 共同移动 [MOVE_BOTH:地点|澄行为|小茉莉行为]：两人一起到同一地点，同时更新两人 location/activity。
+    // 段间用 | 不用 ·（地点/行为本身可能含 ·）；只认明确标签、不猜正文；优先于单人 MOVE（出现就只走共同移动）。
+    const reBoth = /\[MOVE_BOTH:([^\]]+)\]/gi;
+    let mb, lastBoth = null;
+    while ((mb = reBoth.exec(text || '')) !== null) lastBoth = mb[1];
+    if (lastBoth) { await processJointMove(lastBoth, turnStartedAt); return; }
+
     const re = /\[MOVE:([^\]]+)\]/gi;
     let m, last = null;
     while ((m = re.exec(text || '')) !== null) last = m[1];
@@ -1819,7 +1827,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       .replace(/\[TODO(?::-?[\d.]+)?\][\s\S]*?\[\/TODO\]/gi, '')                     // 别把待办当小心思（含 [TODO:0.8]/[TODO:-1]）
       .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')                          // 别把"完成待办"标签当小心思
       .replace(/\[OPEN_TODOS\]/gi, '')                                                // 别把"打开待办"标记当小心思
-      .replace(/\[MOVE:[^\]]*\]/gi, '')                                               // MOVE 是聊天专属，世界轮误出现只剥掉防泄漏
+      .replace(/\[MOVE(?:_BOTH)?:[^\]]*\]/gi, '')                                               // MOVE 是聊天专属，世界轮误出现只剥掉防泄漏
       .trim();
     if (innerThought) {
       try {
@@ -2177,12 +2185,12 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
   if (!turn.silent) {
     await processTodoTags(clean);      // [TODO] 写新待办（聊天也能用，跟世界唤醒共用）
     await processTodoDoneTags(clean);  // [TODO_DONE] 划掉做完的
-    await processChatMoveTag(clean);
+    await processChatMoveTag(clean, turn.startedAt);
     clean = clean
       .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')
       .replace(/\[TODO(?::-?[\d.]+)?\][\s\S]*?\[\/TODO\]/gi, '') // [TODO] 写完剥掉，别漏给小茉莉看
       .replace(/\[OPEN_TODOS\]/gi, '')
-      .replace(/\[MOVE:[^\]]*\]/gi, '')
+      .replace(/\[MOVE(?:_BOTH)?:[^\]]*\]/gi, '')
       .trim();
   }
 
@@ -4556,7 +4564,7 @@ async function flushPendingToCC(ws, items) {
   const conversation_id = last.conversation_id;
   const settings = last.settings;
 
-  activeTurn = { ws, conversationId: conversation_id, settings, tools: [] };
+  activeTurn = { ws, conversationId: conversation_id, settings, tools: [], startedAt: new Date().toISOString() };
 
   try {
     // [时间标记] 前缀已停用（2026-06-12 用户要求）：<此刻> 每条都带现算时间，这行和它重复。
