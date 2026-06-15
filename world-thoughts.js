@@ -2,6 +2,12 @@
 // 只收集/去重/排序/展示，验证念头池本身稳定。【严禁】喂 Claude / 进 <此刻>/唤醒包/聊天md/surfacing/记忆库；
 // 【严禁】写回 mood/longing/libido/social/stress/focus/comfort。念头池=短中期"当前浮现素材池"，不是真实感受值。
 //
+// 【12B v1 冻结范围 · 2026-06-15】念头池 v1 当前只承担"未完成待办的跨窗口保留 + 克制浮现"，
+// 不承担完整生活事件池或情绪驱动功能。数据源=phone_todos_cheng 未完成待办；category 只 unresolved_intent；
+// 排序用现有 base salience；防重复用 24–36h base-salience 冷却；待办做完由 collector archive。
+// 12B-3「7 个后台驱动排序器」spec 已作废：候选全属同一 category，类别驱动给所有念头加相同权重=空转。
+// 故：不建 drive table、不做 effective_score、不做 decay 倍率、不恢复已停用的 collector / decay。
+//
 // 念头来源(source_type)：timeline / todo / inner_thought / world_message / pending_wake。
 // 去重唯一键：source_type + source_id + category（source_id NOT NULL）。
 // 工程分类(category)：relationship / unresolved_intent / curiosity / work / object / bodily_need / life_event。
@@ -47,6 +53,7 @@ async function upsertThoughts(cands) {
 // ── 各来源「采集候选」（不 upsert、不推水位线）。候选带 created_at(源行)+_wl(水位线源键)。──────────────
 const MAX_NEW_PER_COLLECT = 8; // 每轮最多新增 active 念头数，避免一波新事件冲掉旧念头
 
+// ⚠️【disabled by current design / not called · 12B v1】timeline 来源已主动移除（错标没收尾 + 漏 ignored 情绪），不恢复。保留代码仅备查，不是漏接/故障。
 async function gatherTimeline() {
   const wl = await getWaterline('timeline');
   const { data } = await supabase.from('daily_timeline_cheng')
@@ -76,6 +83,7 @@ async function gatherTodos() {
     return { source_type: 'todo', source_id: String(t.id), category: 'unresolved_intent', content: `小手机里还有一条待办：${truncate(t.title, 40)}`, salience: sal, status: 'active', created_at: t.created_at, _wl: 'todo', metadata: { urgency: t.urgency, title: t.title } };
   });
 }
+// ⚠️【disabled by current design / not called · 12B v1】小心思来源已主动移除（演的戏 / 漏闭合标签漏情绪），不恢复。保留代码仅备查，不是漏接/故障。
 async function gatherInnerThoughts() {
   const wl = await getWaterline('inner_thought');
   const { data } = await supabase.from('world_inner_thoughts_cheng')
@@ -85,6 +93,7 @@ async function gatherInnerThoughts() {
     content: `之前留下一段小心思：${truncate(stripTags(firstBubble(it.content)), 40)}`, salience: 0.55, status: 'active', created_at: it.created_at, _wl: 'inner_thought', metadata: { timeline_id: it.timeline_id, full: it.content },
   }));
 }
+// ⚠️【disabled by current design / not called · 12B v1】pending_wake 来源已主动移除（系统自会唤醒，无需再浮现），不恢复。保留代码仅备查，不是漏接/故障。
 async function gatherPending() {
   const wl = await getWaterline('pending_wake');
   const { data } = await supabase.from('pending_wake_cheng')
@@ -92,6 +101,7 @@ async function gatherPending() {
   return (data || []).map(p => ({ source_type: 'pending_wake', source_id: String(p.id), category: 'unresolved_intent', content: '还有一个等待中的后续事件没有完成。', salience: 0.7, status: 'active', created_at: p.created_at, _wl: 'pending_wake', metadata: { wake_type: p.wake_type, reason: p.reason } }));
 }
 // world_message 未回应：最近一条 world_message，发出超 30min 且其后无 user 消息。无水位线(每轮重判，靠去重)。
+// ⚠️【disabled by current design / not called · 12B v1】world_message 来源已主动移除（上下文都在 / 回话即归档），不恢复。保留代码仅备查，不是漏接/故障。
 async function gatherWorldMessage() {
   const { data: wm } = await supabase.from('messages').select('id, created_at').eq('event', 'world_message').order('created_at', { ascending: false }).limit(1);
   const m = wm?.[0];
@@ -158,6 +168,7 @@ async function settleResolved(stats) {
 }
 
 // ── 衰减：active 超 7 天，每天最多 ×0.9 一次；<0.1 archive；active 超 50 砍最低；不碰旧感受字段 ──────────────
+// ⚠️【disabled by current design / not called · 12B v1】decay 已主动关闭：待办要一直提醒到做完，不因时间褪色。不恢复。保留代码仅备查，不是漏接/故障。
 async function decayThoughts(stats) {
   const today = plus8Date(Date.now());
   const cutoff = new Date(Date.now() - DECAY_AGE_MS).toISOString();
