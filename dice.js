@@ -118,6 +118,15 @@ export class DiceDaemon {
     if (this._busy) return;
     this._busy = true;
     try {
+      // 安静时段（dice_quiet_hours，默认 [1,8]，+8 时区，见 getLocalHour）：这段不主动打扰小茉莉，
+      // 直接跳过本轮（_tick 在 _roll 之后照常 _scheduleNext 重排下一轮）。区间含起点不含终点，支持跨午夜。
+      const qh = cfg.dice_quiet_hours;
+      if (Array.isArray(qh) && qh.length === 2) {
+        const h = getLocalHour();
+        const [qs, qe] = qh;
+        const inQuiet = qs <= qe ? (h >= qs && h < qe) : (h >= qs || h < qe);
+        if (inQuiet) { console.log(`[DICE] 安静时段(${qs}-${qe}点, 现在${h}点 +8)，跳过本轮`); return; }
+      }
       const lastMsg = await getLastMessageTime();
       const tHours = lastMsg ? (Date.now() - lastMsg.getTime()) / 3600000 : 24;
       const lambda = cfg.lambda || 0.15;
