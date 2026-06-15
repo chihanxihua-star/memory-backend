@@ -3,6 +3,8 @@
 // 不接 AI、不加事件、不加地点、不做复杂联动。
 import { supabase } from './memory.js';
 import { realWorldTime } from './world-narration.js';
+import { evaluateHealth } from './world-health.js';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -80,8 +82,20 @@ function advanceHour(t) {
 }
 
 // ── 核心：推进一个 tick ─────────────────────────────────
-// 读澄那一行 → 时间 +1h → 4 项衰减/增长（带上下限）→ updated_at → 写回。
-export async function advanceOneTick() {
+// 读澄那一行 → 时间 +1h → 4 项衰减（带上下限）→ updated_at → 写回 → 13B 健康联动结算。
+// 串行锁：自动 tick(daemon) 和 force tick(POST /api/world/tick) 都走 advanceOneTick，用同一把链式锁串行，
+// 避免两条路并发导致健康计数重复结算 / 旧值覆盖（v1 单进程足够；真多进程以后再换 DB 事务/RPC）。
+let _tickChain = Promise.resolve();
+export function advanceOneTick() {
+  const run = () => _advanceOneTick();
+  const r = _tickChain.then(run, run); // 上一个失败也继续排队
+  _tickChain = r.catch(() => {});       // 链不被 reject 卡死
+  return r;
+}
+
+async function _advanceOneTick() {
+  // 13B：本轮唯一 tickId，只生成一次；衰减行程 + 健康联动共用它做幂等（同一 tick 不重复累计/扣血）。
+  const tickId = randomUUID();
   const { data: rows, error } = await supabase
     .from('character_status_cheng')
     .select('*')
@@ -91,12 +105,11 @@ export async function advanceOneTick() {
   const row = rows && rows[0];
   if (!row) throw new Error('character_status_cheng 没有澄那一行');
 
-  // 12A 止血：只保留身体/生活字段的物理衰减。longing 等感受字段不再每 tick 自动增长
-  //（历史值原样冻结，不 drop 字段；以后 12B 改成后台 salience/weight）。
+  // 12A 止血：只保留身体/生活字段的物理衰减。longing 等感受字段不再每 tick 自动增长。
   const patch = {
     world_time: advanceHour(row.world_time),
     energy: clamp(row.energy - 2, 0, 100),      // 体力 下限 0
-    satiety: clamp(row.satiety - 2, 0, 100),    // 饱腹 下限 0（6/13 -3→-2）
+    satiety: clamp(row.satiety - 2, 0, 100),    // 饱腹 下限 0
     cleanliness: clamp(row.cleanliness - 1, 0, 100), // 清洁 下限 0
     updated_at: new Date().toISOString(),
   };
@@ -109,18 +122,22 @@ export async function advanceOneTick() {
     .single();
   if (e2) throw e2;
 
-  // 第 3 步：每个 tick 往行程表留一条客观记录（source=tick，固定"自然衰减"）。
-  // 写失败不影响 tick 主流程，只打日志。
+  // 第 3 步：每个 tick 往行程表留一条客观记录（source=tick）。13B：detail 修正为真实衰减值
+  //（饱腹之前误记 -3，实际 patch 是 -2，统一改 -2，只修日志不改衰减）；带 tick_id 便于跟健康联动对账。
   const { error: e3 } = await supabase
     .from('daily_timeline_cheng')
     .insert({
       world_time: realWorldTime(),
       location: row.location,
       action: '自然衰减',
-      detail: { energy: -2, satiety: -3, cleanliness: -1 },
+      detail: { energy: -2, satiety: -2, cleanliness: -1, tick_id: tickId },
       source: 'tick',
     });
   if (e3) console.error('[WORLD] 行程表写入失败:', e3.message);
+
+  // 13B：健康联动结算（用衰减后的 updated 身体值；幂等靠 tickId）。失败不连累 tick 主流程。
+  try { await evaluateHealth(updated, tickId); }
+  catch (e) { console.error('[WORLD] 健康联动异常:', e.message); }
 
   return updated;
 }
