@@ -205,8 +205,14 @@ export class DiceDaemon {
     if (!fire) return false;
     this._pendingFire = null;
 
-    const clean = (text || '').replace(/\[SKIP\]/gi, '').trim();
-    const skip = /\[SKIP\]/i.test(text || '');
+    // dice 是普通主动消息，不走世界 WORLD_MESSAGE 管线；但澄偶尔会误用该标签
+    // （系统提示「世界唤醒区」教过"想跟小茉莉说话用 [WORLD_MESSAGE:phone/face]"，dice 这句"好久没说话了想说就说"
+    //  太像世界消息触发）。只剥 phone/face 两种壳、保留里面要说的话，避免裸标签漏进聊天消息/Bark。
+    //  其它标签（TODO/MOVE/OPEN_TODOS 等）dice 实测用不到，不处理。
+    text = String(text || '').replace(/\[\/?WORLD_MESSAGE(?::(?:phone|face))?\]/gi, '');
+
+    const clean = text.replace(/\[SKIP\]/gi, '').trim();
+    const skip = /\[SKIP\]/i.test(text);
 
     if (skip) {
       console.log('[DICE] CC 选择跳过');
