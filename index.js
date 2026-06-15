@@ -255,7 +255,9 @@ async function recordTmuxSessionStart(sessionId, { forgedFromSession = null } = 
 
 async function startCCAndRecordSession() {
   await cc.start();
-  if (USE_TMUX) await recordTmuxSessionStart(cc.sessionId);
+  // cc.reused：start() 接管了已存在的会话（后端重启没杀 CC）→ 是同一个 session 在续，
+  // sessions_cheng 里那条 active 行还在，别再 mark-ended+insert 新行（会凭空多一条/把活的标 ended）。
+  if (USE_TMUX && !cc.reused) await recordTmuxSessionStart(cc.sessionId);
 }
 
 async function restartCCAndRecordSession(options = {}, meta = {}) {
@@ -637,7 +639,7 @@ async function checkContextThreshold(conversationId, settings) {
 }
 
 function maybeFireSummary() {
-  if (!pendingSummary || activeTurn || !cc.isRunning()) return;
+  if (!pendingSummary || activeTurn || !cc.isRunning() || cc.isBusy?.()) return;   // isBusy：接管旧澄正排空孤儿轮时别注入
   const { conversationId, summaryLength } = pendingSummary;
   pendingSummary = null;
   const prompt = `【系统任务·自动小结】\n请根据我们当前对话已发生的上下文，写一段约 ${summaryLength} 字的中文摘要，概括关键内容、重要决定、情感状态与未完成事项。除记忆标记外不要输出其他任何内容。格式必须是：\n[MEMORY:diary]在此填写摘要正文|tags:小结|importance:0.7[/MEMORY]`;
@@ -735,7 +737,7 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
   // 唤醒原因变体抽取（await 必须在 check-and-set activeTurn 之前，保住原子性）。
   const reasonText = await pickWakeReason(event.key, event.reason);
 
-  if (!cc.isRunning() || activeTurn || pendingBuffer) {
+  if (!cc.isRunning() || activeTurn || pendingBuffer || cc.isBusy?.()) {   // isBusy：接管旧澄正排空孤儿轮时别唤醒
     console.log('[WORLD] CC 忙或未运行，唤醒跳过');
     return { fired: false, reason: 'cc_busy' };
   }
@@ -2016,6 +2018,9 @@ async function getTodoHint() {
 
 cc.on('state', (state) => broadcast({ type: 'cc_status', status: state }));
 
+// 接管旧澄时它还在生成的「孤儿轮」排空完毕（busy→false）：把这期间攒进缓冲的消息放出去。
+cc.on('drained', () => { console.log('[tmux] 孤儿轮排空完毕，flush 缓冲'); try { flushOrGrace(); } catch (e) { console.error('drained flush:', e); } });
+
 cc.on('turn_start', () => {
   if (activeTurn) safeSend(activeTurn.ws, { type: 'start' });
 });
@@ -2278,7 +2283,7 @@ let _barkTickBusy = false;
 async function tryFireBark() {
   if (_barkTickBusy) return;
   if (activeTurn || pendingBuffer) return;
-  if (!cc.isRunning()) return;
+  if (!cc.isRunning() || cc.isBusy?.()) return;   // isBusy：接管旧澄正排空孤儿轮时别注入
   if (!process.env.BARK_DEVICE_KEY) return;
   _barkTickBusy = true;
   try {
@@ -4536,8 +4541,9 @@ function flushOrGrace() {
 
 async function flushPendingToCC(ws, items) {
   if (!items?.length) return;
-  if (activeTurn) {
-    // 不应该发生，但兜底
+  // activeTurn：正常一轮在进行；cc.isBusy()：接管旧澄、它还在生成「孤儿轮」的排空窗口。
+  // 两种情况都先回缓冲，别把新消息粘进还在工作的 Claude（孤儿轮排空完会 emit 'drained' → flushOrGrace 放出来）。
+  if (activeTurn || cc.isBusy?.()) {
     if (!pendingBuffer) pendingBuffer = { ws, items: [], timer: null, readyToFlush: true };
     pendingBuffer.items.unshift(...items);
     return;
@@ -4598,5 +4604,15 @@ server.listen(PORT, '127.0.0.1', () => {
   setInterval(() => { collectWorldThoughts(); }, 15 * 60 * 1000);
 });
 
-process.on('SIGTERM', () => { cc.stop(); process.exit(0); });
-process.on('SIGINT', () => { cc.stop(); process.exit(0); });
+// 退出时「不杀 CC」：tmux 驱动用 detach()（只清看门狗、留会话活着，重启后端 start() 探活复用 → 澄不失忆）；
+// stream-json 驱动没有 detach，退回 stop()（杀子进程，原行为）。需要彻底杀 CC 用 amnesia/restart 或手动 kill-session。
+// once + await：detach 是同步、stop 是异步（stream-json），等清理跑完再 exit；exiting 防重入。
+let _exiting = false;
+const onExit = async () => {
+  if (_exiting) return;
+  _exiting = true;
+  try { await (cc.detach ? cc.detach() : cc.stop()); }
+  finally { process.exit(0); }
+};
+process.once('SIGTERM', onExit);
+process.once('SIGINT', onExit);
