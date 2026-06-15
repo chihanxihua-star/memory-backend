@@ -3784,7 +3784,8 @@ app.post('/api/world/thoughts/:id/archive', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 12B-2.1：小世界浮现观测（只读 debug；受上面 Bearer JWT 中间件保护，无 token→401；后端又 127.0.0.1-only）。
+// 12B-2.1：小世界浮现观测（只读 debug）。受全局 Bearer JWT 中间件保护：无/错 token → 401，有效 JWT 才能读。
+// 后端自身监听 127.0.0.1、经 nginx 反代对外——这是网络层的事，不是这个路由自己做了 loopback 限制。
 // 不重新 pick、不触发 collector、不改 cooldown/状态/库——只返最近内存观测。
 app.get('/api/debug/world-thought-surfacing', (req, res) => {
   res.json(getSurfacingDebug());
