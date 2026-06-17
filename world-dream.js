@@ -3,7 +3,7 @@
 // 生成走 world-dream-gen.js 的独立 API；失败只 warning，不连累睡眠/tick。
 import { supabase } from './memory.js';
 import { realWorldTime } from './world-narration.js';
-import { generateDream } from './world-dream-gen.js';
+import { generateDream, readDreamConfig } from './world-dream-gen.js';
 
 // ── 周目标 ───────────────────────────────────────────────
 // Asia/Shanghai 自然周（周一到周日）。weekKey = 本周周一的 YYYY-MM-DD。
@@ -29,7 +29,10 @@ async function ensureWeekTarget() {
   const { weekKey } = weekInfo();
   const wk = await readWeek();
   if (!wk || wk.week_key !== weekKey) {
-    const target = 2 + Math.floor(Math.random() * 3); // 2/3/4
+    const cfg = await readDreamConfig();                       // 每周次数范围网页可调
+    const lo = Number.isFinite(cfg?.week_min) ? cfg.week_min : 2;
+    const hi = Math.max(lo, Number.isFinite(cfg?.week_max) ? cfg.week_max : 4);
+    const target = lo + Math.floor(Math.random() * (hi - lo + 1));
     const { data } = await supabase.from('world_dream_week_state_cheng')
       .update({ week_key: weekKey, target_count: target, generated_count: 0, updated_at: new Date().toISOString() })
       .eq('name', '澄').select().single();
@@ -103,7 +106,8 @@ export async function triggerDreamIfDue(sleepSessionId, sleptHours) {
       dream_status: 'generated', dream_type: result.dream_type, full_dream: result.full_dream,
       recall_variants: result.recall_variants, occurred_after_hours: sleptHours, occurred_at: now,
       source_snapshot: result.material || null, generated_by: `${result.provider}/${result.model}`,
-      about_me: result.about_me ?? null, dream_category: result.dream_category ?? null, updated_at: now,
+      about_me: result.about_me ?? null, dream_category: result.dream_category ?? null,
+      dream_tags: (result.material && result.material.dreamTags) || [], updated_at: now,
     }).eq('sleep_session_id', sleepSessionId).eq('dream_status', 'scheduled').select(); // guard 防并发重复
     if (!upd || !upd.length) return; // 已被别处处理
     await bumpWeekGenerated();
@@ -117,7 +121,13 @@ export async function triggerDreamIfDue(sleepSessionId, sleptHours) {
 }
 
 // ── 醒来：定记忆程度 / 取消未触发的梦 ─────────────────────
-const BASE_RECALL = { full: 0.15, partial: 0.45, trace: 0.30, forgotten: 0.10 };
+// 记忆程度概率（4 档）默认值，按醒来方式分 4 套。网页可在 world_dream_config_cheng.recall_probs 覆盖。
+const DEFAULT_RECALL = {
+  base:          { full: 0.15, partial: 0.45, trace: 0.30, forgotten: 0.10 }, // 自然睡醒
+  alarm:         { full: 0.07, partial: 0.38, trace: 0.37, forgotten: 0.18 }, // 工作日闹钟叫醒
+  manual_recent: { full: 0.40, partial: 0.42, trace: 0.13, forgotten: 0.05 }, // [WAKE] 梦后1h内
+  manual:        { full: 0.22, partial: 0.46, trace: 0.24, forgotten: 0.08 }, // [WAKE] 其它
+};
 // 记忆程度→实际内容映射（6/17 用户上调一档，觉得记太少）：full=完整梦，partial=原full版，trace=原partial版，forgotten不变。
 export function recallContentFor(dream, level) {
   const v = (dream && dream.recall_variants) || {};
@@ -151,14 +161,16 @@ export async function onWake(sleepSessionId, wakeReason, sleptHours) {
     }
     if (dream.dream_status !== 'generated') return; // 已 recalled/surfaced/cancelled
 
-    // 概率按醒来方式微调（spec 十）：闹钟吵醒→更易忘；梦后1h内提前醒→更易记清；正常睡够→基础。
-    let w = { ...BASE_RECALL };
-    if (wakeReason === 'morning_alarm') w = { full: 0.07, partial: 0.38, trace: 0.37, forgotten: 0.18 };
+    // 概率按醒来方式选档（网页可在 recall_probs 覆盖；缺省用 DEFAULT_RECALL）：闹钟更易忘、梦后1h内提前醒更易记清。
+    const cfg = await readDreamConfig();
+    const rp = (cfg && cfg.recall_probs) || {};
+    let profile;
+    if (wakeReason === 'morning_alarm') profile = rp.alarm || DEFAULT_RECALL.alarm;
     else if (wakeReason === 'manual') {
       const recent = Number.isFinite(sleptHours) && dream.occurred_after_hours != null && (sleptHours - dream.occurred_after_hours) <= 1;
-      w = recent ? { full: 0.40, partial: 0.42, trace: 0.13, forgotten: 0.05 } : { full: 0.22, partial: 0.46, trace: 0.24, forgotten: 0.08 };
-    }
-    const level = weightedPick(w);
+      profile = recent ? (rp.manual_recent || DEFAULT_RECALL.manual_recent) : (rp.manual || DEFAULT_RECALL.manual);
+    } else profile = rp.base || DEFAULT_RECALL.base;
+    const level = weightedPick(profile);
     const content = recallContentFor(dream, level);
     await supabase.from('world_dreams_cheng').update({
       dream_status: 'recalled', recall_level: level, recalled_content: content, wake_reason: wakeReason, updated_at: now,

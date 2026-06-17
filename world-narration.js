@@ -219,7 +219,7 @@ function sameRoomAsCheng(chengStatus, user) {
 export function formatUserStatus(user, chengStatus) {
   const u = user || {};
   const act = (u.activity || '休息').replace(/澄/g, '我');
-  if (sameRoomAsCheng(chengStatus, u)) return `在我旁边，正${act}`;
+  if (sameRoomAsCheng(chengStatus, u)) return `就在我身边——我们在同一个房间，此刻是面对面当面说话（不是隔着手机发消息），她正${act}`;
   // 转述：不同房间，澄看不见。同一栋楼（都在公司/都在家）省掉楼名只说房间（"工位"）；
   // 不同栋楼保留全名（"公司的工位"），不然澄不知道她在哪栋。
   const uLoc = u.location || '家 · 客厅';

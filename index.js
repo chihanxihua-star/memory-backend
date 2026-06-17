@@ -3606,7 +3606,7 @@ app.get('/api/world/dream/config', async (req, res) => {
 // 改配置（不含 key）。只认白名单字段。
 app.post('/api/world/dream/config', async (req, res) => {
   try {
-    const allow = ['provider', 'model', 'system_prompt', 'temperature', 'enabled', 'material_exclude', 'material_extra', 'material_use_memory', 'prompt_self', 'prompt_other', 'self_pct'];
+    const allow = ['provider', 'model', 'system_prompt', 'temperature', 'enabled', 'material_exclude', 'material_extra', 'material_use_memory', 'prompt_self', 'prompt_other', 'self_pct', 'week_min', 'week_max', 'recall_probs'];
     const patch = {};
     for (const k of allow) if (req.body && Object.prototype.hasOwnProperty.call(req.body, k)) patch[k] = req.body[k];
     if (!Object.keys(patch).length) return res.status(400).json({ error: '没有可更新字段' });
@@ -3653,7 +3653,7 @@ app.post('/api/world/dream/test', async (req, res) => {
 app.get('/api/world/dream/list', async (req, res) => {
   try {
     const { data, error } = await supabase.from('world_dreams_cheng')
-      .select('id, occurred_at, created_at, dream_type, recall_level, recalled_content, recall_variants, full_dream, dream_status, generated_by, about_me, dream_category')
+      .select('id, occurred_at, created_at, dream_type, recall_level, recalled_content, recall_variants, full_dream, dream_status, generated_by, about_me, dream_category, dream_tags')
       .in('dream_status', ['generated', 'recalled', 'surfaced'])
       .order('created_at', { ascending: false }).limit(100);
     if (error) throw error;
@@ -3689,6 +3689,17 @@ app.post('/api/world/dream/dev/trigger', async (req, res) => {
     await triggerDreamIfDue(data[0].sleep_session_id, 99);
     const { data: d2 } = await supabase.from('world_dreams_cheng').select('*').eq('sleep_session_id', data[0].sleep_session_id).limit(1);
     res.json({ ok: true, dream: (d2 && d2[0]) || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 重置：丢弃当前在途的梦（scheduled/generated/recalled），删掉它 → 可重新走流程（排梦解锁）。
+app.post('/api/world/dream/dev/reset', async (req, res) => {
+  try {
+    const { data } = await supabase.from('world_dreams_cheng').select('id')
+      .in('dream_status', ['scheduled', 'generated', 'recalled']).order('created_at', { ascending: false }).limit(1);
+    if (!data || !data.length) return res.json({ ok: true, reset: false });
+    await supabase.from('world_dreams_cheng').delete().eq('id', data[0].id);
+    res.json({ ok: true, reset: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
