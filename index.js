@@ -31,7 +31,7 @@ import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction, sche
 import { CHAT_MOVE_LOCATIONS, processJointMove } from './world-move.js';
 import { processSleep, processSleepBoth, processWake, wakeIfSleeping, readSleepState } from './world-sleep.js';
 import { generateDream, readDreamConfig, dreamKeyStatus, dreamProviders, gatherDreamMaterial } from './world-dream-gen.js';
-import { consumeDreamResidue, triggerDreamIfDue } from './world-dream.js';
+import { consumeDreamResidue, triggerDreamIfDue, recallContentFor } from './world-dream.js';
 import { randomUUID as dreamUUID } from 'crypto';
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
@@ -3703,7 +3703,7 @@ app.post('/api/world/dream/dev/recall', async (req, res) => {
       .order('created_at', { ascending: false }).limit(1);
     if (!data || !data.length) return res.status(409).json({ error: '没有可定记忆程度的梦（先排梦 + 触发生成）' });
     const dream = data[0];
-    const content = (dream.recall_variants && dream.recall_variants[level]) || '';
+    const content = recallContentFor(dream, level);
     const { data: upd } = await supabase.from('world_dreams_cheng').update({
       dream_status: 'recalled', recall_level: level, recalled_content: content, wake_reason: 'dev', updated_at: new Date().toISOString(),
     }).eq('id', dream.id).select().single();

@@ -118,6 +118,17 @@ export async function triggerDreamIfDue(sleepSessionId, sleptHours) {
 
 // ── 醒来：定记忆程度 / 取消未触发的梦 ─────────────────────
 const BASE_RECALL = { full: 0.15, partial: 0.45, trace: 0.30, forgotten: 0.10 };
+// 记忆程度→实际内容映射（6/17 用户上调一档，觉得记太少）：full=完整梦，partial=原full版，trace=原partial版，forgotten不变。
+export function recallContentFor(dream, level) {
+  const v = (dream && dream.recall_variants) || {};
+  switch (level) {
+    case 'full': return (dream && dream.full_dream) || v.full || '';
+    case 'partial': return v.full || '';
+    case 'trace': return v.partial || '';
+    case 'forgotten': return v.forgotten || '';
+    default: return v[level] || '';
+  }
+}
 function weightedPick(weights) {
   const entries = Object.entries(weights);
   const total = entries.reduce((s, [, w]) => s + w, 0);
@@ -148,7 +159,7 @@ export async function onWake(sleepSessionId, wakeReason, sleptHours) {
       w = recent ? { full: 0.40, partial: 0.42, trace: 0.13, forgotten: 0.05 } : { full: 0.22, partial: 0.46, trace: 0.24, forgotten: 0.08 };
     }
     const level = weightedPick(w);
-    const content = (dream.recall_variants && dream.recall_variants[level]) || '';
+    const content = recallContentFor(dream, level);
     await supabase.from('world_dreams_cheng').update({
       dream_status: 'recalled', recall_level: level, recalled_content: content, wake_reason: wakeReason, updated_at: now,
     }).eq('sleep_session_id', sleepSessionId).eq('dream_status', 'generated');

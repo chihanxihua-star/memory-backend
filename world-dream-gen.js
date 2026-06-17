@@ -165,14 +165,15 @@ function parseDream(content) {
   if (fence) s = fence[1].trim();
   const obj = JSON.parse(s);
   const rv = obj.recall_variants || {};
-  for (const k of ['full', 'partial', 'trace', 'forgotten']) {
+  // trace 已弃用（记忆程度上调一档后没人用 recall_variants.trace），只强制 full/partial/forgotten。
+  for (const k of ['full', 'partial', 'forgotten']) {
     if (typeof rv[k] !== 'string' || !rv[k].trim()) throw new Error(`recall_variants.${k} 缺失`);
   }
   if (typeof obj.full_dream !== 'string' || !obj.full_dream.trim()) throw new Error('full_dream 缺失');
   return {
     dream_type: obj.dream_type === 'erotic' ? 'erotic' : 'normal',
     full_dream: obj.full_dream.trim(),
-    recall_variants: { full: rv.full.trim(), partial: rv.partial.trim(), trace: rv.trace.trim(), forgotten: rv.forgotten.trim() },
+    recall_variants: { full: rv.full.trim(), partial: rv.partial.trim(), trace: (rv.trace || '').trim(), forgotten: rv.forgotten.trim() },
   };
 }
 
