@@ -4,6 +4,7 @@
 import { supabase } from './memory.js';
 import { realWorldTime } from './world-narration.js';
 import { evaluateHealth } from './world-health.js';
+import { evaluateSleepTick, readSleepState, isChengSleeping, SLEEP_ENERGY_GAIN } from './world-sleep.js';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -105,12 +106,18 @@ async function _advanceOneTick() {
   const row = rows && rows[0];
   if (!row) throw new Error('character_status_cheng 没有澄那一行');
 
+  // 14A：睡着时这一 tick 体力额外 +10（自然衰减 -2 照常 → 净 +8）。读睡眠表判断。
+  const sleep = await readSleepState();
+  const sleeping = !!(sleep && sleep.status === 'sleeping');
+  const energyGain = sleeping ? SLEEP_ENERGY_GAIN : 0;
+  const energyDelta = -2 + energyGain; // 醒着 -2 / 睡着 +8
+
   // 12A 止血：只保留身体/生活字段的物理衰减。longing 等感受字段不再每 tick 自动增长。
   const patch = {
     world_time: advanceHour(row.world_time),
-    energy: clamp(row.energy - 2, 0, 100),      // 体力 下限 0
-    satiety: clamp(row.satiety - 2, 0, 100),    // 饱腹 下限 0
-    cleanliness: clamp(row.cleanliness - 1, 0, 100), // 清洁 下限 0
+    energy: clamp(row.energy + energyDelta, 0, 100), // 醒着 -2 / 睡着净 +8（下限 0 上限 100）
+    satiety: clamp(row.satiety - 2, 0, 100),    // 饱腹 下限 0（睡觉也照减）
+    cleanliness: clamp(row.cleanliness - 1, 0, 100), // 清洁 下限 0（睡觉也照减）
     updated_at: new Date().toISOString(),
   };
 
@@ -129,11 +136,16 @@ async function _advanceOneTick() {
     .insert({
       world_time: realWorldTime(),
       location: row.location,
-      action: '自然衰减',
-      detail: { energy: -2, satiety: -2, cleanliness: -1, tick_id: tickId },
+      action: sleeping ? '睡眠中' : '自然衰减',
+      detail: { energy: energyDelta, satiety: -2, cleanliness: -1, tick_id: tickId, ...(sleeping ? { sleeping: true } : {}) },
       source: 'tick',
     });
   if (e3) console.error('[WORLD] 行程表写入失败:', e3.message);
+
+  // 14A：睡眠结算（slept+1/remaining-1，到点按 nap/工作日规则自动醒）。在体力恢复之后、健康引擎之前——
+  // 健康引擎读的是睡眠恢复后的最终身体值。幂等靠同一 tickId。失败不连累 tick 主流程。
+  try { await evaluateSleepTick(tickId); }
+  catch (e) { console.error('[WORLD] 睡眠结算异常:', e.message); }
 
   // 13B：健康联动结算（用衰减后的 updated 身体值；幂等靠 tickId）。失败不连累 tick 主流程。
   try { await evaluateHealth(updated, tickId); }
@@ -242,8 +254,11 @@ export class WorldTickDaemon {
         try { const u = await this._onWorkdayTick(cur); if (u) cur = u; }
         catch (e) { console.error('[WORLD] 作息 tick 异常:', e.message); }
       }
+      // 14A：澄睡着时跳过事件检测（hungry/随机/工作随机/自主全停，不被吵醒）。
+      // workdayTick 的上下班闹铃在上面已照常跑——那是兜底，不归这里停。睡眠结算可能刚把她叫醒，故重读。
+      const stillSleeping = await isChengSleeping();
       // 事件优先级：hungry 命中就只走 hungry；否则才轮普通随机事件。同一 tick 最多一个。
-      if (this._onEvent) {
+      if (this._onEvent && !stillSleeping) {
         const ev = detectWorldEvent(cur);
         if (ev) {
           try { await this._onEvent(ev, cur); }

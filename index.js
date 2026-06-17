@@ -29,6 +29,10 @@ import { WorldTickDaemon, advanceOneTick, readWorldConfig, writeWorldConfig, WOR
 import { PendingWakeDaemon } from './world-pending.js';
 import { ACTIONS as WORLD_ACTIONS, getAvailableActions, executeWorldAction, scheduleActivityEnd } from './world-actions.js';
 import { CHAT_MOVE_LOCATIONS, processJointMove } from './world-move.js';
+import { processSleep, processSleepBoth, processWake, wakeIfSleeping, readSleepState } from './world-sleep.js';
+import { generateDream, readDreamConfig, dreamKeyStatus, dreamProviders, gatherDreamMaterial } from './world-dream-gen.js';
+import { consumeDreamResidue, triggerDreamIfDue } from './world-dream.js';
+import { randomUUID as dreamUUID } from 'crypto';
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
@@ -112,6 +116,23 @@ function persistAuthPassword(newPassword) {
   fs.writeFileSync(ENV_PATH, lines.join('\n'), 'utf-8');
   AUTH_PASSWORD = newPassword;
   process.env.AUTH_PASSWORD = newPassword;
+}
+
+// 通用：把 .env 里 NAME 那行改写成新值（没有就追加），同时同步进程内变量（立即生效、不用重启）。
+// 给梦境 API key（GLM_API_KEY / DEEPSEEK_API_KEY）从网页保存用——key 进 .env 不进库、前端不回显。
+function setEnvVar(name, value) {
+  if (!/^[A-Z0-9_]+$/.test(name)) throw new Error('非法变量名');
+  let raw = '';
+  try { raw = fs.readFileSync(ENV_PATH, 'utf-8'); } catch { raw = ''; }
+  const lines = raw.split(/\r?\n/);
+  const re = new RegExp(`^${name}\\s*=`);
+  let replaced = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (re.test(lines[i])) { lines[i] = `${name}=${value}`; replaced = true; break; }
+  }
+  if (!replaced) lines.push(`${name}=${value}`);
+  fs.writeFileSync(ENV_PATH, lines.join('\n'), 'utf-8');
+  process.env[name] = value;
 }
 
 // 公开（仅本机）：forge 触发的无缝 restart
@@ -674,11 +695,13 @@ async function pickWakeReason(eventKey, fallback) {
   return fallback;
 }
 
-function buildWorldWakePrompt(event, pendingContext = null, todoHintLine = '', nowBlock = '') {
+function buildWorldWakePrompt(event, pendingContext = null, todoHintLine = '', nowBlock = '', dreamResidue = '') {
+  // 14B-1：梦境残留放在最前（刚醒的情境），只此一次（消费在 triggerWorldWake，已标 surfaced）。完整梦永不在此。
+  const dreamBlock = dreamResidue ? `<梦境残留>\n${dreamResidue}\n</梦境残留>\n` : '';
   // 待办包（open_todos）= 纯展示：只列清单 + 一句"看完就行"，不放选项/此刻/发消息提示，她不用做选择。
   // 收尾在 handleWorldWakeTurnDone 里特判（只处理 [TODO_DONE]，不解析 WORLD_CHOICE、不写行程）。
   if (event.key === 'open_todos') {
-    return `【世界唤醒】
+    return `${dreamBlock}【世界唤醒】
 ${pendingContext || '你打开手机看了看待办，没有要做的事。'}
 （看完就行，不用选。）`;
   }
@@ -695,7 +718,7 @@ ${pendingContext || '你打开手机看了看待办，没有要做的事。'}
   const msgLine = hasMeet
     ? `\n（想约小茉莉午休见面的话，用 [WORLD_MESSAGE:phone] 发出邀请。）`
     : `\n（想跟小茉莉说句话就用 [WORLD_MESSAGE]：跟她在同一个屋用 [WORLD_MESSAGE:face]，不在一起用 [WORLD_MESSAGE:phone]，不想说就不发。）`;
-  return `【世界唤醒】
+  return `${dreamBlock}【世界唤醒】
 ${nowBlock}${pendingLine}
 ${event.reason}
 ${opts}
@@ -756,7 +779,10 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
     reason: reasonText,
     options: (typeof event.optionsFor === 'function') ? event.optionsFor(status) : event.options,
   };
-  const prompt = buildWorldWakePrompt(eventForTurn, pendingContext, todoHint.line, nowBlock);
+  // 14B-1：消费梦境残留（到这已过 cc-busy/冷却检查、确定要发，才消费——避免 CC 忙时白白标 surfaced 丢内容）。
+  let dreamResidue = '';
+  try { dreamResidue = (await consumeDreamResidue()) || ''; } catch (e) { console.warn('[WORLD] 梦境残留消费失败:', e.message); }
+  const prompt = buildWorldWakePrompt(eventForTurn, pendingContext, todoHint.line, nowBlock, dreamResidue);
   // 12B-2.1 tripwire：唤醒包 build 后扫一次有没有 <小世界浮现>（正常恒 false；只观测、不读 pick、不注入）。
   recordWakeInjectionScan(prompt);
   activeTurn = {
@@ -914,6 +940,24 @@ async function processChatMoveTag(text, turnStartedAt = null) {
   } catch (e) { console.warn('[MOVE] 处理失败（不连累主流程）:', e.message); }
 }
 
+// 14A：聊天里的睡眠标签 [SLEEP:Nh] / [SLEEP_BOTH:Nh] / [WAKE]（仅聊天轮）。
+// 顺序：必须在 processChatMoveTag 之后调（同一回复可先移动再睡；共同移动失败 SLEEP_BOTH 自然会因两人不同地点被拒）。
+// 一条回复里同类标签只认最后一个；解析/校验/状态机全在 world-sleep.js，这里只抽标签转发。
+async function processChatSleepTag(text) {
+  try {
+    const t = text || '';
+    if (/\[WAKE\]/i.test(t)) { await processWake(); return; } // 醒来优先：出现 [WAKE] 就只处理醒来
+    const reBoth = /\[SLEEP_BOTH:([^\]]+)\]/gi;
+    let mb, lastBoth = null;
+    while ((mb = reBoth.exec(t)) !== null) lastBoth = mb[1];
+    if (lastBoth != null) { await processSleepBoth(lastBoth); return; } // 共同睡优先于独自睡
+    const re = /\[SLEEP:([^\]]+)\]/gi;
+    let m, last = null;
+    while ((m = re.exec(t)) !== null) last = m[1];
+    if (last != null) await processSleep(last);
+  } catch (e) { console.warn('[SLEEP] 处理失败（不连累主流程）:', e.message); }
+}
+
 // 「打开待办」续唤醒的上下文：列出全部 open 待办，按 urgency（轻重缓急）降序，urgency≥阈值标「急」。
 // 不设条数上限（用户定：打开就全显）；给 [OPEN_TODOS] 用，塞进唤醒包「补充：」让澄读 + 可 [TODO_DONE]。
 async function buildOpenTodosContext() {
@@ -995,12 +1039,21 @@ function commuteSteps(cmKey, badWeather, dir) {
     : [{ activity: '去地铁站', location: '外出 · 路上', dur: [3, 9] }, commuteStep('subway', badWeather), { activity: '从地铁站走到公司', location: '外出 · 路上', dur: [3, 9] }];
 }
 
-function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, badWeather = false) {
+function buildMorningRoutine(bk = DEFAULT_BREAKFAST, cm = DEFAULT_COMMUTE, badWeather = false, rush = false) {
   const cmKey = COMMUTE_OPTS[cm] ? cm : DEFAULT_COMMUTE;
   const steps = [
     { activity: '穿衣服', location: '家 · 卧室', dur: [3, 9] },
     { activity: '洗漱',   location: '家 · 浴室', dur: [10, 15] },
   ];
+  // 14A 赶时间版（rush，第 3 次闹钟用）：跳过早饭 + 通勤选择（cm 已由选项强制），穿衣→洗漱→直接通勤。
+  // 打车 rush 各通勤步取最快固定分钟（dur 收成 [lo,lo]）——"打车不迟到"靠选项直接判定，分钟只做表现，固定最快更贴。
+  if (rush) {
+    let cs = commuteSteps(cmKey, badWeather, 'to');
+    if (cmKey === 'taxi') cs = cs.map(s => (Array.isArray(s.dur) ? { ...s, dur: [s.dur[0], s.dur[0]] } : s));
+    steps.push(...cs);
+    steps.push({ activity: '工作', location: '公司 · 工位', dur: null });
+    return steps;
+  }
   // 「交通工具选择」步：恒在链里、不分天气/不分 cm——链形状一致，选完用新 cm 重建 next_index 不错位。
   if (bk === 'buy') {
     steps.push({ activity: '去便利店', location: '外出 · 路上',   dur: [3, 9] });
@@ -1099,7 +1152,7 @@ async function autoSetUserLunchLocation() {
 }
 
 function getRoutineSteps(routineName, opts = {}) {
-  if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm, opts.bad_weather);
+  if (routineName === 'morning') return buildMorningRoutine(opts.bk, opts.cm, opts.bad_weather, opts.rush);
   if (routineName === 'lunch') return buildLunchRoutine(opts.method);
   if (routineName === 'evening') return buildEveningRoutine(opts.cm, opts.bad_weather);
   return [];
@@ -1198,7 +1251,7 @@ async function advanceRoutine(routineName, idx, opts = {}) {
       await supabase.from('pending_wake_cheng').insert({
         wake_type: 'routine_step', reason: `${routineName}流程推进`, status: 'queued',
         scheduled_at: new Date(Date.now() + delaySec * 1000).toISOString(),
-        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method, bad_weather: opts.bad_weather, meal: opts.meal },
+        payload: { routine: routineName, next_index: idx + 1, expected_activity: act, bk: opts.bk, cm: opts.cm, method: opts.method, bad_weather: opts.bad_weather, meal: opts.meal, rush: opts.rush },
         attempts: 0,
       });
     }
@@ -1450,7 +1503,7 @@ async function firePendingWake(row) {
       console.log(`[ROUTINE] 「${expected}」被打断（现在「${st?.activity}」），链中止`);
       return { fired: true, system: true };
     }
-    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method, bad_weather: p.bad_weather, meal: p.meal });
+    await advanceRoutine(p.routine, p.next_index, { bk: p.bk, cm: p.cm, method: p.method, bad_weather: p.bad_weather, meal: p.meal, rush: p.rush });
     return { fired: true, system: true };
   }
   // 下班选择包（用户 6/12 定）：16 点没骰中加班 → 排这条 pending（daemon 自带 cc_busy 重试）。
@@ -1497,33 +1550,54 @@ async function firePendingWake(row) {
   // 起床=1次 engage：①起床洗漱（→洗漱走流程，后续接早饭/通勤=下个增量）②再睡10分钟（排 pending 重问）
   // ③翘班（扣 120≈一天工资，留在家）。force=确保到点必发、不被 30min 冷却挡（每天就这一下）。
   if (row.wake_type === 'morning_wakeup') {
+    // 14A：工作日早 8 点闹钟优先——澄要是 night 睡过点了，闹钟把她从睡眠里拽起来（翻成 awake，activity 交给起床流程接管）。
+    try { await wakeIfSleeping('morning_alarm'); } catch (e) { console.warn('[WORK] 闹钟叫醒失败:', e.message); }
     const { data: rows } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
     const status = rows && rows[0];
     if (!status) return { fired: false, reason: 'no_status_row' };
-    // 贴贴变体（6/12）：小茉莉在家、跟澄同一个房间、还躺着（睡/休息）→「再睡」变「抱着小茉莉贴贴」。
-    // 每次到点现查——十分钟后她起床走了，选项就变回普通再睡。
-    let cuddle = false;
-    try {
-      const { data: us } = await supabase.from('user_status_cheng')
-        .select('presence, location, activity').eq('name', 'user').limit(1);
-      const u = us && us[0];
-      cuddle = !!(u && u.presence === '在家' && u.location === status.location && /睡|躺|休息/.test(u.activity || ''));
-    } catch { /* 读不到按普通再睡 */ }
-    const event = {
-      key: 'morning_wakeup',
-      reason: '闹钟响了，该起床准备上班了',
-      // 顺序有讲究（6/12）：解析失败兜底=最后一项，所以「起床」垫底当安全默认（原来垫底的是翘班，会误扣120）。
-      options: [
-        cuddle
-          ? { id: 1, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '10分钟前闹钟响了，当时你说再抱小茉莉一会儿。' } }
-          : { id: 1, label: '再睡 10 分钟', effects: {}, pending: { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: '10分钟前闹钟响了，当时你说再睡一会儿。' } },
-        { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
-        { id: 3, label: '起床，开始准备上班', start_routine: 'morning' },
-      ],
-      wmHint: false,
-    };
-    // 赖床续唤醒（payload 带 option_id=上一轮的选择）带上补充行，跟第一次响铃区分开。
-    const snoozed = !!(row.payload && row.payload.option_id);
+    // 赖床次数（payload 带 snooze_count；初次闹钟没有=0）。赖 2 次封顶：第 3 次闹钟(count>=2)不再给"再睡"。
+    const snoozeCount = Number(row.payload && row.payload.snooze_count) || 0;
+    const snoozed = snoozeCount > 0 || !!(row.payload && row.payload.option_id);
+    let event;
+    if (snoozeCount >= 2) {
+      // 第 3 次闹钟：快迟到了，只给 起床打车(不迟到)/起床坐地铁(迟到扣¥45)/翘班(扣120)，不能再赖。
+      // 顺序：解析失败兜底=最后一项 → 打车垫底（到岗、无罚款，最安全的默认）。地铁/翘班的扣钱只在解析成功时执行。
+      event = {
+        key: 'morning_wakeup',
+        reason: '一直赖床，现在马上要上班迟到了',
+        options: [
+          { id: 1, label: '起床坐地铁去公司（会迟到，扣¥45）', effects: { wallet_balance: -45 }, start_routine: 'morning', routine_opts: { cm: 'subway', rush: true } },
+          { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
+          { id: 3, label: '起床打车去公司（不迟到）', start_routine: 'morning', routine_opts: { cm: 'taxi', rush: true } },
+        ],
+        wmHint: false,
+      };
+    } else {
+      // 贴贴变体（6/12）：小茉莉在家、跟澄同一个房间、还躺着（睡/休息）→「再睡」变「抱着小茉莉贴贴」。
+      // 每次到点现查——十分钟后她起床走了，选项就变回普通再睡。再睡的 pending 带上 snooze_count+1（赖床计数）。
+      let cuddle = false;
+      try {
+        const { data: us } = await supabase.from('user_status_cheng')
+          .select('presence, location, activity').eq('name', 'user').limit(1);
+        const u = us && us[0];
+        cuddle = !!(u && u.presence === '在家' && u.location === status.location && /睡|躺|休息/.test(u.activity || ''));
+      } catch { /* 读不到按普通再睡 */ }
+      const snoozePending = { wake_type: 'morning_wakeup', delay_world_minutes: 10, reason: cuddle ? '10分钟前闹钟响了，当时你说再抱小茉莉一会儿。' : '10分钟前闹钟响了，当时你说再睡一会儿。', payload_extra: { snooze_count: snoozeCount + 1 } };
+      event = {
+        key: 'morning_wakeup',
+        reason: '闹钟响了，该起床准备上班了',
+        // 顺序有讲究（6/12）：解析失败兜底=最后一项，所以「起床」垫底当安全默认（原来垫底的是翘班，会误扣120）。
+        options: [
+          cuddle
+            ? { id: 1, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: snoozePending }
+            : { id: 1, label: '再睡 10 分钟', effects: {}, pending: snoozePending },
+          { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
+          { id: 3, label: '起床，开始准备上班', start_routine: 'morning' },
+        ],
+        wmHint: false,
+      };
+    }
+    // 赖床续唤醒（snoozed）带上补充行，跟第一次响铃区分开。
     return await triggerWorldWake(event, status, { force: true, pendingContext: snoozed ? row.reason : null });
   }
   // 周末规划：定下周早饭计划（自己做/买）。写进 world_plan_cheng，早晨链 start 时读它决定走哪条。
@@ -1828,6 +1902,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
       .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')                          // 别把"完成待办"标签当小心思
       .replace(/\[OPEN_TODOS\]/gi, '')                                                // 别把"打开待办"标记当小心思
       .replace(/\[MOVE(?:_BOTH)?:[^\]]*\]/gi, '')                                               // MOVE 是聊天专属，世界轮误出现只剥掉防泄漏
+      .replace(/\[SLEEP(?:_BOTH)?:[^\]]*\]/gi, '').replace(/\[WAKE\]/gi, '')                    // SLEEP/WAKE 同 MOVE，聊天专属，世界轮误出现剥掉防泄漏
       .trim();
     if (innerThought) {
       try {
@@ -2186,11 +2261,14 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
     await processTodoTags(clean);      // [TODO] 写新待办（聊天也能用，跟世界唤醒共用）
     await processTodoDoneTags(clean);  // [TODO_DONE] 划掉做完的
     await processChatMoveTag(clean, turn.startedAt);
+    await processChatSleepTag(clean);  // 14A：[SLEEP]/[SLEEP_BOTH]/[WAKE]——MOVE 之后调（先移动再睡）
     clean = clean
       .replace(/\[TODO_DONE\][\s\S]*?\[\/TODO_DONE\]/gi, '')
       .replace(/\[TODO(?::-?[\d.]+)?\][\s\S]*?\[\/TODO\]/gi, '') // [TODO] 写完剥掉，别漏给小茉莉看
       .replace(/\[OPEN_TODOS\]/gi, '')
       .replace(/\[MOVE(?:_BOTH)?:[^\]]*\]/gi, '')
+      .replace(/\[SLEEP(?:_BOTH)?:[^\]]*\]/gi, '')                // 14A：睡眠标签写完剥掉，别漏给小茉莉看
+      .replace(/\[WAKE\]/gi, '')
       .trim();
   }
 
@@ -3486,6 +3564,151 @@ app.post('/api/world/tick', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// 14A 睡眠测试端点（DevPanel 用）。读睡眠状态。
+app.get('/api/world/sleep', async (req, res) => {
+  try { res.json({ ok: true, sleep: await readSleepState() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 开始睡：{ hours:1-12, both:true=和小茉莉一起 }。走 processSleep/processSleepBoth（含地点/在场校验）。
+app.post('/api/world/sleep/start', async (req, res) => {
+  try {
+    const hours = Number(req.body?.hours) || 8;
+    const both = !!req.body?.both;
+    const r = both ? await processSleepBoth(`${hours}h`) : await processSleep(`${hours}h`);
+    if (r.ok) return res.json({ ok: true, ...r, sleep: await readSleepState() });
+    return res.status(409).json({ ok: false, ...r });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 提前醒来（等同澄输出 [WAKE]）
+app.post('/api/world/sleep/wake', async (req, res) => {
+  try { const r = await processWake(); res.json({ ...r, sleep: await readSleepState() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 强制推进一个睡眠 tick（= advanceOneTick：体力 +10/-2、倒计时、到点自动醒、健康联动；走串行锁）
+app.post('/api/world/sleep/tick', async (req, res) => {
+  try { const row = await advanceOneTick(); res.json({ ok: true, status: row, sleep: await readSleepState() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 14B-1 梦境配置（「梦境」板块）────────────────────────────
+// 配置（provider/model/提示词/temperature/enabled）存表可改；key 存 .env 不回显，只返"是否已配"。
+app.get('/api/world/dream/config', async (req, res) => {
+  try {
+    res.json({ ok: true, config: await readDreamConfig(), providers: dreamProviders(), keys: dreamKeyStatus() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 改配置（不含 key）。只认白名单字段。
+app.post('/api/world/dream/config', async (req, res) => {
+  try {
+    const allow = ['provider', 'model', 'system_prompt', 'temperature', 'enabled', 'material_exclude', 'material_extra', 'material_use_memory', 'prompt_self', 'prompt_other', 'self_pct'];
+    const patch = {};
+    for (const k of allow) if (req.body && Object.prototype.hasOwnProperty.call(req.body, k)) patch[k] = req.body[k];
+    if (!Object.keys(patch).length) return res.status(400).json({ error: '没有可更新字段' });
+    patch.updated_at = new Date().toISOString();
+    const { data, error } = await supabase.from('world_dream_config_cheng').update(patch).eq('name', '澄').select().single();
+    if (error) throw error;
+    res.json({ ok: true, config: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 保存某 provider 的 API key → 写进 .env（不进库、不回显）。{ provider, key }
+app.post('/api/world/dream/key', async (req, res) => {
+  try {
+    const provider = String(req.body?.provider || '').trim();
+    const key = String(req.body?.key || '').trim();
+    const envName = provider === 'glm' ? 'GLM_API_KEY' : provider === 'deepseek' ? 'DEEPSEEK_API_KEY' : null;
+    if (!envName) return res.status(400).json({ error: '未知 provider（glm / deepseek）' });
+    if (!key) return res.status(400).json({ error: 'key 不能为空' });
+    setEnvVar(envName, key);
+    res.json({ ok: true, keys: dreamKeyStatus() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 素材预览：看现在会喂给梦生成的素材（已应用排除词/额外素材），给「梦境」设置页可视化用。
+app.get('/api/world/dream/material', async (req, res) => {
+  try { res.json({ ok: true, material: await gatherDreamMaterial() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 测试生成：用当前配置 + key 立即生成一段梦并返回（开发用，不持久化、不注入澄）。
+app.post('/api/world/dream/test', async (req, res) => {
+  try {
+    const dream = await generateDream();
+    res.json({ ok: true, dream });
+  } catch (e) {
+    const m = e.message || '';
+    if (m.startsWith('no_key')) return res.status(400).json({ error: '该 provider 还没配 API key' });
+    res.status(500).json({ error: m });
+  }
+});
+
+// 梦境收藏：列出做过的梦（generated/recalled/surfaced，有内容的），给「梦境」板块收藏馆用。
+// 含 full_dream + 四版本——给小茉莉看的私藏视图（前端鉴权后才进），不是澄的上下文。只读、不建表。
+app.get('/api/world/dream/list', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('world_dreams_cheng')
+      .select('id, occurred_at, created_at, dream_type, recall_level, recalled_content, recall_variants, full_dream, dream_status, generated_by, about_me, dream_category')
+      .in('dream_status', ['generated', 'recalled', 'surfaced'])
+      .order('created_at', { ascending: false }).limit(100);
+    if (error) throw error;
+    res.json({ ok: true, dreams: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 14B-1 梦境生命周期开发测试（DevPanel）──────────────────
+// 看最新一条梦的全貌（含 full_dream，仅开发/小茉莉可见）。
+app.get('/api/world/dream/state', async (req, res) => {
+  try {
+    const { data } = await supabase.from('world_dreams_cheng').select('*').order('created_at', { ascending: false }).limit(1);
+    res.json({ ok: true, dream: (data && data[0]) || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 排一条梦（新 session，触发点睡满1h；走真实状态机，不依赖澄在睡）。
+app.post('/api/world/dream/dev/schedule', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('world_dreams_cheng')
+      .insert({ sleep_session_id: 'dev-' + dreamUUID(), dream_status: 'scheduled', trigger_after_hours: 1 }).select().single();
+    if (error) throw error;
+    res.json({ ok: true, dream: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 立即触发最新 scheduled 梦的生成（绕睡满判断，强制睡满99h）。
+app.post('/api/world/dream/dev/trigger', async (req, res) => {
+  try {
+    const { data } = await supabase.from('world_dreams_cheng').select('sleep_session_id')
+      .eq('dream_status', 'scheduled').order('created_at', { ascending: false }).limit(1);
+    if (!data || !data.length) return res.status(409).json({ error: '没有 scheduled 状态的梦，先排一个' });
+    await triggerDreamIfDue(data[0].sleep_session_id, 99);
+    const { data: d2 } = await supabase.from('world_dreams_cheng').select('*').eq('sleep_session_id', data[0].sleep_session_id).limit(1);
+    res.json({ ok: true, dream: (d2 && d2[0]) || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 模拟醒来记忆程度：把最新 generated 梦设成指定 recall_level（full/partial/trace/forgotten）。
+app.post('/api/world/dream/dev/recall', async (req, res) => {
+  try {
+    const level = String(req.body?.level || '');
+    if (!['full', 'partial', 'trace', 'forgotten'].includes(level)) return res.status(400).json({ error: 'level 须为 full/partial/trace/forgotten' });
+    // dev 用：generated 或 recalled 都能改（让你反复切 4 个版本对比同一个梦；真实流程里 onWake 只 recall 一次）。
+    const { data } = await supabase.from('world_dreams_cheng').select('*')
+      .in('dream_status', ['generated', 'recalled']).not('recall_variants', 'is', null)
+      .order('created_at', { ascending: false }).limit(1);
+    if (!data || !data.length) return res.status(409).json({ error: '没有可定记忆程度的梦（先排梦 + 触发生成）' });
+    const dream = data[0];
+    const content = (dream.recall_variants && dream.recall_variants[level]) || '';
+    const { data: upd } = await supabase.from('world_dreams_cheng').update({
+      dream_status: 'recalled', recall_level: level, recalled_content: content, wake_reason: 'dev', updated_at: new Date().toISOString(),
+    }).eq('id', dream.id).select().single();
+    res.json({ ok: true, dream: upd });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 读当前世界配置
