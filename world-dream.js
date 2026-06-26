@@ -91,15 +91,15 @@ async function readDreamBySession(sleepSessionId) {
 export async function triggerDreamIfDue(sleepSessionId, sleptHours) {
   try {
     const dream = await readDreamBySession(sleepSessionId);
-    if (!dream || dream.dream_status !== 'scheduled') return;
-    if (sleptHours < (dream.trigger_after_hours || 99)) return; // 还没到触发点
+    if (!dream || dream.dream_status !== 'scheduled') return null;
+    if (sleptHours < (dream.trigger_after_hours || 99)) return null; // 还没到触发点
     let result;
     try { result = await generateDream(); }
     catch (e) {
       console.warn('[DREAM] 生成失败，本次梦取消:', e.message);
       await supabase.from('world_dreams_cheng').update({ dream_status: 'cancelled', updated_at: new Date().toISOString() })
         .eq('sleep_session_id', sleepSessionId).eq('dream_status', 'scheduled');
-      return;
+      return null;
     }
     const now = new Date().toISOString();
     const { data: upd } = await supabase.from('world_dreams_cheng').update({
@@ -109,7 +109,7 @@ export async function triggerDreamIfDue(sleepSessionId, sleptHours) {
       about_me: result.about_me ?? null, dream_category: result.dream_category ?? null,
       dream_tags: (result.material && result.material.dreamTags) || [], updated_at: now,
     }).eq('sleep_session_id', sleepSessionId).eq('dream_status', 'scheduled').select(); // guard 防并发重复
-    if (!upd || !upd.length) return; // 已被别处处理
+    if (!upd || !upd.length) return null; // 已被别处处理
     await bumpWeekGenerated();
     // 13：timeline 只记"做梦"，完整梦不进 timeline（更不进 Claude）
     await supabase.from('daily_timeline_cheng').insert({
@@ -117,7 +117,8 @@ export async function triggerDreamIfDue(sleepSessionId, sleptHours) {
       detail: { via: 'dream', note: '梦境已生成，醒后记忆程度待定', dream_type: result.dream_type }, source: 'system',
     });
     console.log(`[DREAM] 生成成功（${result.dream_type}，睡满${sleptHours}h）`);
-  } catch (e) { console.warn('[DREAM] 触发生成异常（不连累睡眠）:', e.message); }
+    return upd[0];
+  } catch (e) { console.warn('[DREAM] 触发生成异常（不连累睡眠）:', e.message); return null; }
 }
 
 // ── 醒来：定记忆程度 / 取消未触发的梦 ─────────────────────

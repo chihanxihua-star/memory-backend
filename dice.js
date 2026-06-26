@@ -14,6 +14,23 @@ function readConfig() {
   } catch { return {}; }
 }
 
+// dice 下次触发时间持久化：让倒计时跨后端重启续上，而不是每次重启都重新算满一轮。
+// 后端内部状态，放 server 目录（不进 SANDBOX_DIR，CC 看不到）。
+const DICE_NEXT_PATH = path.join(__dirname, '.dice-next.json');
+
+function readNextFire() {
+  try {
+    const t = Date.parse(JSON.parse(fs.readFileSync(DICE_NEXT_PATH, 'utf-8')).next_fire_at);
+    return Number.isFinite(t) ? t : null;
+  } catch { return null; }
+}
+
+function writeNextFire(ts) {
+  try {
+    fs.writeFileSync(DICE_NEXT_PATH, JSON.stringify({ next_fire_at: new Date(ts).toISOString() }), 'utf-8');
+  } catch (e) { console.warn('[DICE] 写下次触发时间失败:', e.message); }
+}
+
 function getLocalHour() {
   const now = new Date(Date.now() + TZ_OFFSET * 3600000);
   return now.getUTCHours();
@@ -70,7 +87,7 @@ export class DiceDaemon {
       return;
     }
     console.log('[DICE] daemon 启动');
-    this._scheduleNext();
+    this._resume();
   }
 
   stop() {
@@ -93,9 +110,27 @@ export class DiceDaemon {
     const minMs = (cfg.dice_interval_min || 30) * 60000;
     const maxMs = (cfg.dice_interval_max || 50) * 60000;
     const delay = minMs + Math.random() * (maxMs - minMs);
+    writeNextFire(Date.now() + delay);   // 持久化下次触发时间，重启可续
     this._timer = setTimeout(() => this._tick(), delay);
     const mins = Math.round(delay / 60000);
     console.log(`[DICE] 下一轮 ${mins} 分钟后`);
+  }
+
+  // 重启续命：读上次存的触发时间，只排剩下的时间，不重新算满一轮。
+  // 没存档 → 照常排新一轮；已过点（停机期间到点）→ 10 秒后补一轮。
+  _resume() {
+    const cfg = readConfig();
+    if (cfg.dice_enabled === false) return;
+    const target = readNextFire();
+    if (target == null) { this._scheduleNext(); return; }
+    const remaining = target - Date.now();
+    if (remaining <= 0) {
+      this._timer = setTimeout(() => this._tick(), 10000);
+      console.log('[DICE] 上次倒计时停机期间已到点，10 秒后补一轮');
+    } else {
+      this._timer = setTimeout(() => this._tick(), remaining);
+      console.log(`[DICE] 续上次倒计时，还剩 ${Math.round(remaining / 60000)} 分钟`);
+    }
   }
 
   async _tick() {

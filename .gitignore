@@ -6,3 +6,9 @@ node_modules/
 .claude/
 index.js.backup
 cc-runtime.json
+nohup.out
+server.log
+server.pid
+.dice-next.json
+.toggle-drafts.json
+index.js.bak-*

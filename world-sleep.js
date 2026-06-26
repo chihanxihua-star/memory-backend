@@ -10,6 +10,12 @@ import { supabase } from './memory.js';
 import { realWorldTime } from './world-narration.js';
 import { randomUUID } from 'crypto';
 import { maybeScheduleDream, triggerDreamIfDue, onWake } from './world-dream.js';
+import {
+  scheduleNightMorningCheck,
+  cancelScheduledNightInterruption,
+  maybeTriggerDreamWake,
+  maybeTriggerMorningErection,
+} from './world-night.js';
 
 // 睡着时每 world 小时额外回体力（自然衰减 -2 由 world-tick 照常扣 → 净 +8）。
 export const SLEEP_ENERGY_GAIN = 10;
@@ -52,7 +58,7 @@ export async function readSleepState() {
 // tick 用：澄是否正在睡（world-tick 据此决定加不加 +10、要不要跳过事件检测）。
 export async function isChengSleeping() {
   const s = await readSleepState();
-  return !!(s && s.status === 'sleeping');
+  return !!(s && (s.status === 'sleeping' || s.status === 'interrupted_awake'));
 }
 
 async function isWorkdayNow() {
@@ -107,6 +113,7 @@ async function enterSleep(cheng, kind, hours, withUser) {
   if (kind === 'night') {
     const workday = await isWorkdayNow();
     await maybeScheduleDream({ sleepSessionId, kind, plannedHours: hours, worldTime: cheng.world_time, workday });
+    await scheduleNightMorningCheck({ sleepSessionId, kind, worldTime: cheng.world_time });
   }
 }
 
@@ -170,6 +177,7 @@ export async function processWake() {
   }).eq('name', '澄');
   await supabase.from('character_status_cheng').update({ activity: '醒来', updated_at: now }).eq('name', '澄');
   await writeWakeTimeline('manual', sleep);
+  await cancelScheduledNightInterruption(sleep.sleep_session_id, 'manual_wake');
   await onWake(sleep.sleep_session_id, 'manual', sleep.slept_hours); // 14B-1：定记忆程度/取消未触发的梦
   console.log('[WAKE] 提前醒来');
   return { ok: true };
@@ -179,12 +187,13 @@ export async function processWake() {
 // 这就是"工作日早 8 点闹钟优先"的落地：night 睡过点也会被闹钟拽起来。返回是否真叫醒了。
 export async function wakeIfSleeping(wakeReason = 'alarm') {
   const sleep = await readSleepState();
-  if (!sleep || sleep.status !== 'sleeping') return false;
+  if (!sleep || !['sleeping', 'interrupted_awake'].includes(sleep.status)) return false;
   const now = new Date().toISOString();
   await supabase.from('world_sleep_state_cheng').update({
     status: 'awake', wake_reason: wakeReason, remaining_hours: 0, planned_hours: null, with_user: false, updated_at: now,
   }).eq('name', '澄');
   await writeWakeTimeline(wakeReason, sleep);
+  await cancelScheduledNightInterruption(sleep.sleep_session_id, wakeReason);
   await onWake(sleep.sleep_session_id, wakeReason, sleep.slept_hours); // 14B-1：定记忆程度/取消未触发的梦
   console.log(`[SLEEP] 闹钟叫醒（${wakeReason}）`);
   return true;
@@ -217,12 +226,19 @@ export async function evaluateSleepTick(tickId) {
     await supabase.from('character_status_cheng').update({ activity: '刚醒', updated_at: now }).eq('name', '澄');
     await writeWakeTimeline('planned_duration_complete', sleep, slept);
     console.log(`[SLEEP] 自动醒来（睡了 ${slept} 世界小时，kind=${sleep.sleep_kind}）`);
+    await cancelScheduledNightInterruption(sleep.sleep_session_id, 'planned_duration_complete');
     await onWake(sleep.sleep_session_id, 'planned_duration_complete', slept); // 14B-1：定记忆程度/取消未触发的梦
   } else {
     await supabase.from('world_sleep_state_cheng').update({
       slept_hours: slept, remaining_hours: Math.max(0, remaining),
       last_processed_tick_id: tickId, updated_at: new Date().toISOString(),
     }).eq('name', '澄').or(guard);
-    await triggerDreamIfDue(sleep.sleep_session_id, slept); // 14B-1：睡满到点则后台生成梦
+    const updatedSleep = { ...sleep, slept_hours: slept, remaining_hours: Math.max(0, remaining), status: 'sleeping' };
+    const dream = await triggerDreamIfDue(sleep.sleep_session_id, slept); // 14B-1：睡满到点则后台生成梦
+    const dreamWake = dream ? await maybeTriggerDreamWake({ sleep: updatedSleep, dream, sleptHours: slept }) : null;
+    if (!dreamWake) {
+      const cheng = await readCheng();
+      await maybeTriggerMorningErection({ sleep: updatedSleep, worldTime: cheng?.world_time, sleptHours: slept });
+    }
   }
 }

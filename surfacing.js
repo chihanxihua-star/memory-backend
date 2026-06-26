@@ -209,7 +209,12 @@ async function buildNowStatusLine() {
     const cheng = (cs.data && cs.data[0]) || {};
     const user = (us.data && us.data[0]) || {};
     const e = (env.data && env.data[0]) || {};
-    const result = buildNowInner(cheng, e, user, rules);
+    let physiology = null;
+    try {
+      const { getPhysiologySnapshot } = await import('./pulse-linkage.js');
+      physiology = getPhysiologySnapshot();
+    } catch {}
+    const result = buildNowInner(cheng, e, user, rules, physiology);
     // 聊天 <此刻> 也消费动作补叙：用过即清，避免下条消息重复（每个动作只补一次）
     if (Array.isArray(cheng.pending_narration) && cheng.pending_narration.length) await clearNarration();
     return result;

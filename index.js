@@ -36,9 +36,10 @@ import { randomUUID as dreamUUID } from 'crypto';
 import { formatWeather } from './world-env.js';
 import { RANDOM_EVENTS, detectRandomEvent, markRandomEventFired, onMidnightCross, bumpRandomTick, forceRandomEvent, listEvents } from './world-random-events.js';
 import { computeDeltas, applyDeltas, buildEffectContext } from './world-effects.js';
-import { buildNowInner, loadNarrationRules, generateChengSelfNarration, realWorldTime, appendNarration, clearNarration } from './world-narration.js';
+import { buildNowInner, loadNarrationRules, generateChengSelfNarration, realWorldTime, appendNarration, clearNarration, formatNaturalLocation, formatUserStatus } from './world-narration.js';
 import { workdayTick, clearWorkMarks, forceWorkOp, endOvertime, scheduleOvertimeEnd, setOffWorkHandler, setEveningStarter, setLunchHandler, setAfternoonHandler } from './world-workday.js';
 import { collectWorldThoughts, recordWakeInjectionScan, getSurfacingDebug } from './world-thoughts.js';
+import { getNightState, devTriggerNightInterruption, resolveNightChoice, advanceNightDirectRound, nightOnUserReply, setNightWakeHandler } from './world-night.js';
 
 const CC_CONFIG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cc-runtime.json');
 
@@ -725,6 +726,187 @@ ${opts}
 想挑哪个？[WORLD_CHOICE:编号]${todoLine}${msgLine}`;
 }
 
+function pickNightPhrase(phrases, stat, value, fallback) {
+  const v = Number(value);
+  const matches = (phrases || []).filter(p =>
+    p.enabled !== false
+    && p.stat === stat
+    && Number.isFinite(v)
+    && v >= Number(p.min_value)
+    && v <= Number(p.max_value)
+    && String(p.phrase || '').trim()
+  );
+  if (!matches.length) return fallback;
+  return matches[Math.floor(Math.random() * matches.length)].phrase.trim();
+}
+
+function fallbackSleepinessPhrase(v) {
+  const n = Number(v) || 0;
+  if (n >= 80) return '我醒了一下，脑子还陷在半梦半醒里。';
+  if (n >= 60) return '我醒了一下，睡意还压着脑子。';
+  if (n >= 40) return '我醒了一下，意识还有点发沉。';
+  if (n >= 20) return '我醒了一下，人还有点困。';
+  return '我醒了一下，人已经清醒了些。';
+}
+
+function fallbackArousalPhrase(v) {
+  const n = Number(v) || 0;
+  if (n >= 80) return '身体反应强烈得很难忽略。';
+  if (n >= 60) return '身体反应很明显。';
+  if (n >= 40) return '身体反应还明明白白地留着。';
+  if (n >= 20) return '身体里还剩一点醒后的余温。';
+  return '身体反应已经慢慢平复。';
+}
+
+function buildNightBodyParts(row, rules) {
+  const phrases = rules?.phrases || [];
+  const sleepLine = pickNightPhrase(phrases, 'night_sleepiness', row?.sleepiness_value, fallbackSleepinessPhrase(row?.sleepiness_value));
+  const arousalLine = pickNightPhrase(phrases, 'night_arousal', row?.arousal_value, fallbackArousalPhrase(row?.arousal_value));
+  return { sleepiness: sleepLine, arousal: arousalLine };
+}
+
+function pickNightWakeTemplate(rules) {
+  const templates = (rules?.templates || []).filter(t => (t.kind || 'normal') === 'night_wake' && t.template);
+  if (templates.length) return templates[Math.floor(Math.random() * templates.length)].template;
+  return `现在是 {date} {time}{weather_line}。
+我在{location_natural}。{sleepiness}
+{arousal}
+
+{moli_status}`;
+}
+
+function fillNightTemplate(template, vars) {
+  let out = String(template || '');
+  for (const [k, v] of Object.entries(vars)) out = out.replace(new RegExp(`\\{${k}\\}`, 'g'), v == null ? '' : String(v));
+  return out
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/，。/g, '。')
+    .trim();
+}
+
+function buildNightNowText(status, env, userStatus, rules, row) {
+  const date = env?.date || '';
+  const time = row?.triggered_world_time || row?.scheduled_world_time || realWorldTime();
+  const weather = formatWeather(env || {});
+  const loc = formatNaturalLocation(status?.location);
+  const moliStatus = `小茉莉${formatUserStatus(userStatus, status)}`;
+  const body = buildNightBodyParts(row, rules);
+  return fillNightTemplate(pickNightWakeTemplate(rules), {
+    date,
+    time,
+    weather,
+    weather_line: weather ? `，${weather}` : '',
+    location_natural: loc,
+    sleepiness: body.sleepiness,
+    arousal: body.arousal,
+    moli: formatUserStatus(userStatus, status),
+    moli_status: moliStatus,
+  });
+}
+
+function buildNightWakePrompt(row, nightText) {
+  const dreamBlock = row?.recalled_content
+    ? `\n\n<梦境残留>\n${row.recalled_content}\n</梦境残留>`
+    : '';
+  return `【夜间醒来】
+${nightText}${dreamBlock}
+
+挑一个？这轮结尾用一个结果标记：
+[NIGHT_CHOICE:cuddle_sleep]
+[NIGHT_CHOICE:self_relief]
+[NIGHT_CHOICE:direct]
+
+以上三个都用 [WORLD_MESSAGE]：跟小茉莉在同一个屋用 [WORLD_MESSAGE:face]，不在一起用 [WORLD_MESSAGE:phone]`;
+}
+
+async function scheduleNightWakePromptRetry(nightInterruptionId, reason = 'cc_busy') {
+  if (!nightInterruptionId) return;
+  try {
+    await supabase.from('pending_wake_cheng').insert({
+      wake_type: 'night_wake_prompt',
+      reason,
+      status: 'queued',
+      scheduled_at: new Date(Date.now() + 60 * 1000).toISOString(),
+      world_time: realWorldTime(),
+      payload: { night_interruption_id: nightInterruptionId },
+      attempts: 0,
+    });
+    console.log(`[NIGHT] 夜间唤醒包排队重试：${reason}`);
+  } catch (e) { console.warn('[NIGHT] 夜间唤醒包重试排队失败:', e.message); }
+}
+
+async function readNightInterruptionRow(id) {
+  if (!id) return null;
+  try {
+    const { data, error } = await supabase.from('world_night_interruptions_cheng').select('*').eq('id', id).limit(1);
+    if (error) throw error;
+    return data?.[0] || null;
+  } catch (e) {
+    console.warn('[NIGHT] 读取夜间醒来记录失败:', e.message);
+    return null;
+  }
+}
+
+async function buildNightNowBlock(row) {
+  const [cs, us, env, rules] = await Promise.all([
+    supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1),
+    supabase.from('user_status_cheng').select('presence, location, activity, custom_note').eq('name', 'user').limit(1),
+    supabase.from('world_environment_cheng').select('date, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1),
+    loadNarrationRules(),
+  ]);
+  const status = cs.data?.[0] || {};
+  const userStatus = us.data?.[0] || {
+    presence: row?.user_presence_snapshot?.presence || '在家',
+    location: row?.user_location_snapshot || '家 · 客厅',
+    activity: row?.user_presence_snapshot?.activity || '休息',
+  };
+  const e = env.data?.[0] || {};
+  return {
+    status,
+    userStatus,
+    rules,
+    nowBlock: buildNightNowText(status, e, userStatus, rules, row),
+  };
+}
+
+async function triggerNightWakePrompt(row, { fromPending = false } = {}) {
+  if (!row?.id || row.status !== 'triggered') return { fired: false, reason: 'no_active_night_row' };
+  if (!cc.isRunning() || activeTurn || pendingBuffer || cc.isBusy?.()) {
+    if (!fromPending) await scheduleNightWakePromptRetry(row.id, 'cc_busy');
+    return { fired: false, reason: 'cc_busy' };
+  }
+  let built;
+  try { built = await buildNightNowBlock(row); }
+  catch (e) {
+    console.warn('[NIGHT] 生成夜间 <此刻> 失败:', e.message);
+    built = { status: {}, userStatus: {}, rules: { phrases: [] }, nowBlock: '' };
+  }
+  const prompt = buildNightWakePrompt(row, built.nowBlock);
+  recordWakeInjectionScan(prompt);
+  activeTurn = {
+    ws: null, conversationId: null, silent: true,
+    settings: null, tools: [],
+    nightWake: true,
+    nightRow: row,
+    userStatus: built.userStatus,
+    worldForce: true,
+  };
+  try {
+    cc.send(prompt);
+    if (Array.isArray(built.status?.pending_narration) && built.status.pending_narration.length) clearNarration();
+    console.log('[NIGHT] 已发夜间醒来包');
+    return { fired: true };
+  } catch (e) {
+    activeTurn = null;
+    if (!fromPending) await scheduleNightWakePromptRetry(row.id, e.message || 'send_failed');
+    console.error('[NIGHT] 夜间醒来包发送失败:', e.message);
+    return { fired: false, reason: e.message };
+  }
+}
+
+setNightWakeHandler((row) => triggerNightWakePrompt(row));
+
 // 触发一次世界唤醒。
 //   force         = 手动测试按钮：绕过冷却。
 //   pendingContext= pending_wake 续集：绕过冷却（是上次"先忍着"的延续，不是新自动检测，补充1）+ 在原因后加上下文。
@@ -744,19 +926,6 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
 
   // 待办急切度提醒（也在 check-and-set 之前）。line 进 prompt；remindedTodoId 等唤醒真发出后再更新时间。
   const todoHint = skipTodoHint ? { line: '', remindedTodoId: null } : await getTodoHint();
-
-  // 12A：env(现实 date + 粗天气) + 自述规则 → 统一 <此刻>（澄第一人称身体自述 + 小茉莉第三人称）。
-  // 与聊天 md 的 <此刻> 共用 world-narration.js#buildNowInner。不暴露城市/数字/感受字段。
-  let nowBlock = '';
-  try {
-    let envForNarr = {};
-    const { data: envRow } = await supabase
-      .from('world_environment_cheng')
-      .select('date, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
-    if (envRow && envRow[0]) envForNarr = { date: envRow[0].date, weather: formatWeather(envRow[0]) };
-    const rules = await loadNarrationRules();
-    nowBlock = buildNowInner(status, envForNarr, userStatus, rules);
-  } catch (e) { console.warn('[WORLD] 生成 <此刻> 失败:', e.message); }
 
   // 唤醒原因变体抽取（await 必须在 check-and-set activeTurn 之前，保住原子性）。
   const reasonText = await pickWakeReason(event.key, event.reason);
@@ -779,6 +948,35 @@ async function triggerWorldWake(event, status, { force = false, pendingContext =
     reason: reasonText,
     options: (typeof event.optionsFor === 'function') ? event.optionsFor(status) : event.options,
   };
+
+  // 12A：env(现实 date + 粗天气) + 自述规则 → 统一 <此刻>（澄第一人称身体自述 + 小茉莉第三人称）。
+  // 与聊天 md 的 <此刻> 共用 world-narration.js#buildNowInner。不暴露城市/数字/感受字段。
+  // 脉时序：必须先 pulseOnEvent 写入事件身体反应并重算 vitals，再取快照生成 <此刻>，本次唤醒才看得到心跳变化。
+  // 放在 busy/冷却检查之后——确定这次真要发才改状态，避免唤醒作废时留下脏 spike。
+  let nowBlock = '';
+  try {
+    let envForNarr = {}, weatherText = '', temperature = null;
+    const { data: envRow } = await supabase
+      .from('world_environment_cheng')
+      .select('date, weather_text, temperature, humidity, wind').eq('name', 'default').limit(1);
+    if (envRow && envRow[0]) {
+      envForNarr = { date: envRow[0].date, weather: formatWeather(envRow[0]) };
+      weatherText = envRow[0].weather_text || '';
+      temperature = envRow[0].temperature;
+    }
+    // 脉：事件瞬间反应（spike + 情绪 + 重算），必须在取快照之前
+    if (eventForTurn.pulse_hint) {
+      try { const { pulseOnEvent } = await import('./pulse-linkage.js'); pulseOnEvent(eventForTurn.pulse_hint, { activity: status?.activity, weatherText, temperature }); } catch {}
+    }
+    const rules = await loadNarrationRules();
+    let physiology = null;
+    try {
+      const { getPhysiologySnapshot } = await import('./pulse-linkage.js');
+      physiology = getPhysiologySnapshot();
+    } catch {}
+    nowBlock = buildNowInner(status, envForNarr, userStatus, rules, physiology);
+  } catch (e) { console.warn('[WORLD] 生成 <此刻> 失败:', e.message); }
+
   // 14B-1：消费梦境残留（到这已过 cc-busy/冷却检查、确定要发，才消费——避免 CC 忙时白白标 surfaced 丢内容）。
   let dreamResidue = '';
   try { dreamResidue = (await consumeDreamResidue()) || ''; } catch (e) { console.warn('[WORLD] 梦境残留消费失败:', e.message); }
@@ -1296,6 +1494,7 @@ async function fireRoutineEngage(engageType, routineName, idx, opts) {
       const event = {
         key: kind === '雪' ? 'morning_commute_snow' : 'morning_commute_rain',
         reason: `出门时发现外面在下${kind}，去公司怎么走？`, options, wmHint: false,
+        pulse_hint: { emotion: 'nervous', intensity: 0.3 },
       };
       const r = await triggerWorldWake(event, status, { force: true });
       return !!(r && r.fired);
@@ -1332,7 +1531,7 @@ async function firePendingWake(row) {
     ];
     if (userAtCompany) options.push({ id: options.length + 1, label: '约小茉莉一起午休', effects_hint: [{ stat: 'mood', direction: 'up', strength: 'tiny' }], target_activity: '等小茉莉', meet_request: true });
     options.push({ id: options.length + 1, label: '去茶水间随便吃点', start_routine: 'lunch', routine_opts: { method: 'tearoom' } });
-    const event = { key: 'lunch_choice', reason: '到午休时间了，午饭怎么解决？', options, wmHint: false };
+    const event = { key: 'lunch_choice', reason: '到午休时间了，午饭怎么解决？', options, wmHint: false, pulse_hint: { emotion: 'happy', intensity: 0.2 } };
     return await triggerWorldWake(event, status, { force: true });
   }
   // 自己点外卖二级包：从外卖表随机 3 个 → 选了走 takeout_solo 链（下单扣 1 份钱→等送达→吃）。
@@ -1397,6 +1596,7 @@ async function firePendingWake(row) {
       key: 'afternoon_choice',
       reason: snoozed ? '午休已经延长十分钟了，该去上班了' : '午休快结束了，准备上班吗？',
       options, wmHint: false,
+      pulse_hint: { emotion: 'tired', intensity: 0.3 },
     };
     return await triggerWorldWake(event, status, { force: true });
   }
@@ -1543,6 +1743,7 @@ async function firePendingWake(row) {
       key: kind === '雪' ? 'offwork_choice_snow' : kind === '雨' ? 'offwork_choice_rain' : 'offwork_choice',
       reason: kind ? `到点下班了，外面正下着${kind}` : '到点下班了，收拾收拾回家吧',
       options, wmHint: false,
+      pulse_hint: kind ? { emotion: 'nervous', intensity: 0.3 } : { emotion: 'happy', intensity: 0.4 },
     };
     return await triggerWorldWake(event, status, { force: true });
   }
@@ -1565,10 +1766,11 @@ async function firePendingWake(row) {
       event = {
         key: 'morning_wakeup',
         reason: '一直赖床，现在马上要上班迟到了',
+        pulse_hint: { emotion: 'nervous', intensity: 0.6, spike: 8 },
         options: [
-          { id: 1, label: '起床坐地铁去公司（会迟到，扣¥45）', effects: { wallet_balance: -45 }, start_routine: 'morning', routine_opts: { cm: 'subway', rush: true } },
-          { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
-          { id: 3, label: '起床打车去公司（不迟到）', start_routine: 'morning', routine_opts: { cm: 'taxi', rush: true } },
+          { id: 1, label: '起床坐地铁去公司（会迟到，扣¥45）', effects: { wallet_balance: -45 }, start_routine: 'morning', routine_opts: { cm: 'subway', rush: true }, pulse_hint: { emotion: 'nervous', intensity: 0.5 } },
+          { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家', pulse_hint: { emotion: 'calm', intensity: 0.3 } },
+          { id: 3, label: '起床打车去公司（不迟到）', start_routine: 'morning', routine_opts: { cm: 'taxi', rush: true }, pulse_hint: { emotion: 'nervous', intensity: 0.4 } },
         ],
         wmHint: false,
       };
@@ -1586,13 +1788,14 @@ async function firePendingWake(row) {
       event = {
         key: 'morning_wakeup',
         reason: '闹钟响了，该起床准备上班了',
+        pulse_hint: { emotion: 'tired', intensity: 0.4 },
         // 顺序有讲究（6/12）：解析失败兜底=最后一项，所以「起床」垫底当安全默认（原来垫底的是翘班，会误扣120）。
         options: [
           cuddle
-            ? { id: 1, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: snoozePending }
-            : { id: 1, label: '再睡 10 分钟', effects: {}, pending: snoozePending },
-          { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家' },
-          { id: 3, label: '起床，开始准备上班', start_routine: 'morning' },
+            ? { id: 1, label: '抱着小茉莉贴贴 10 分钟', effects: {}, pending: snoozePending, pulse_hint: { emotion: 'intimate', intensity: 0.4 } }
+            : { id: 1, label: '再睡 10 分钟', effects: {}, pending: snoozePending, pulse_hint: { emotion: 'calm', intensity: 0.3 } },
+          { id: 2, label: '翘班，今天不去了', effects: { wallet_balance: -120 }, target_activity: '翘班在家', pulse_hint: { emotion: 'calm', intensity: 0.3 } },
+          { id: 3, label: '起床，开始准备上班', start_routine: 'morning', pulse_hint: { emotion: 'tired', intensity: 0.3 } },
         ],
         wmHint: false,
       };
@@ -1660,6 +1863,18 @@ async function firePendingWake(row) {
     } catch (e) { console.warn('[PREP] prep_done 失败:', e.message); }
     return { fired: true, system: true };
   }
+  // 14B-2：直接做但小茉莉未醒的 4-6 轮短流程。这里先只推进后台数值，不发夜间唤醒包。
+  if (row.wake_type === 'night_direct_round') {
+    const r = await advanceNightDirectRound(row.payload?.night_interruption_id);
+    if (!r?.ok) return { fired: false, reason: r?.reason || 'night_direct_round_failed' };
+    return { fired: true, system: true };
+  }
+  // 14B-2：夜间醒来包发送失败/CC 忙时的重试。
+  if (row.wake_type === 'night_wake_prompt') {
+    const night = await readNightInterruptionRow(row.payload?.night_interruption_id);
+    if (!night || night.status !== 'triggered') return { fired: true, system: true };
+    return await triggerNightWakePrompt(night, { fromPending: true });
+  }
   const def = WORLD_EVENTS[row.wake_type];
   if (!def) return { fired: false, reason: 'unknown_event:' + row.wake_type };
   const { data: rows, error } = await supabase
@@ -1689,7 +1904,8 @@ setOffWorkHandler(async (row, { overtime }) => {
   if (overtime) {
     const event = {
       key: 'overtime_notice', reason: '老板发话，今天的活得收个尾才能走',
-      options: [{ id: 1, label: '知道了，继续干', effects: {} }], wmHint: false,
+      options: [{ id: 1, label: '知道了，继续干', effects: {}, pulse_hint: { emotion: 'nervous', intensity: 0.4 } }], wmHint: false,
+      pulse_hint: { emotion: 'nervous', intensity: 0.5, spike: 6 },
     };
     return await triggerWorldWake(event, row, { force: true });
   }
@@ -1783,6 +1999,11 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     }
   } catch (e) {
     console.error('[WORLD] 结算状态失败:', e.message);
+  }
+
+  // 脉：选项结算后的情绪（覆盖事件触发时的瞬间反应），带上当前 activity 让重算更准
+  if (option.pulse_hint) {
+    try { const { pulseOnEvent } = await import('./pulse-linkage.js'); pulseOnEvent(option.pulse_hint, { activity: updatedStatus?.activity }); } catch {}
   }
 
   const wt = realWorldTime(); // ③：行程/pending 时间戳统一盖现实 +8，不再用 tick 累加的存库值
@@ -1917,40 +2138,7 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
     }
   }
 
-  // WORLD_MESSAGE：澄对小茉莉说话的正式出口。phone=手机消息（Bark+messages+广播）；face=同地点面对面（只记 timeline、不推送）。
-  // 不影响 WORLD_CHOICE 结算；没标签就什么都不做。处理异常不连累主流程。
-  // 解析所有 [WORLD_MESSAGE]（不止第一个）——她多写的也花了 token，全给小茉莉看，别扔。
-  try {
-    const chengLoc = updatedStatus ? updatedStatus.location : (turn.worldEvent.location || '');
-    const userLoc = turn.userStatus ? turn.userStatus.location : '';
-    const wmRe = /\[WORLD_MESSAGE:(phone|face)\]([\s\S]*?)\[\/WORLD_MESSAGE\]/gi;
-    let wm;
-    while ((wm = wmRe.exec(clean || '')) !== null) {
-      const wmType = wm[1].toLowerCase();
-      const wmContent = (wm[2] || '').trim();
-      if (!wmContent) continue;
-      const canFace = wmType === 'face' && canFaceToFace(chengLoc, userLoc);
-
-      if (canFace) {
-        // 真面对面：不推 Bark，记 daily_timeline
-        try {
-          await supabase.from('daily_timeline_cheng').insert({
-            world_time: wt, location: chengLoc,
-            action: '澄对小茉莉说话',
-            detail: { message: wmContent, message_type: 'face' },
-            source: 'claude',
-          });
-          console.log(`[WORLD] face 消息（同地点 ${chengLoc}）: ${wmContent.slice(0, 40)}`);
-        } catch (e) { console.warn('[WORLD] face 消息写 timeline 失败:', e.message); }
-      } else {
-        // phone（含 face 不满足同地点 → 降级）：消息总是存聊天+广播；限频只压"要不要震手机(Bark)"。
-        if (wmType === 'face') console.warn(`[WORLD] face 不满足同地点（澄:${chengLoc}/小茉莉:${userLoc}），降级 phone`);
-        const barkOk = turn.worldForce || (Date.now() - lastWorldPhoneAt >= WORLD_PHONE_RATE_MS);
-        await sendWorldPhoneMessage(wmContent, { bark: barkOk, thinking });
-        if (barkOk) lastWorldPhoneAt = Date.now(); // 只有真推了 Bark 才更新限频时钟（一轮多条只第一条震）
-      }
-    }
-  } catch (e) { console.warn('[WORLD] WORLD_MESSAGE 处理异常（不连累主流程）:', e.message); }
+  await processWorldMessageTags(clean, thinking, turn, updatedStatus, wt);
 
   // 9.5 步：[TODO] → 写待办（世界唤醒 + 聊天共用 processTodoTags）。
   await processTodoTags(clean);
@@ -1978,6 +2166,93 @@ async function handleWorldWakeTurnDone(turn, clean, thinking) {
   }
 
   console.log(`[WORLD] 澄选了「${option.label}」${reason ? '：' + reason.slice(0, 40) : ''}${parseFailed ? '（解析失败默认）' : ''}`);
+}
+
+async function handleNightWakeTurnDone(turn, clean, thinking) {
+  const m = /\[NIGHT_CHOICE:\s*(cuddle_sleep|self_relief|direct)\s*\]/i.exec(clean || '');
+  if (!m) {
+    console.warn(`[NIGHT] NIGHT_CHOICE 解析失败，原文: ${(clean || '').slice(0, 120)}`);
+    await scheduleNightWakePromptRetry(turn.nightRow?.id, 'night_choice_missing');
+    return;
+  }
+  const decision = m[1].toLowerCase();
+  if (!/\[WORLD_MESSAGE:(?:phone|face)\][\s\S]*?\[\/WORLD_MESSAGE\]/i.test(clean || '')) {
+    console.warn(`[NIGHT] ${decision} 缺少 WORLD_MESSAGE，仍按选择结算`);
+  }
+  let statusForLocation = null;
+  try {
+    const { data } = await supabase.from('character_status_cheng').select('*').eq('name', '澄').limit(1);
+    statusForLocation = data?.[0] || null;
+  } catch {}
+  await processWorldMessageTags(clean, thinking, turn, statusForLocation, realWorldTime());
+  const r = await resolveNightChoice(decision);
+  if (!r?.ok) console.warn('[NIGHT] 选择结算失败:', r?.reason || 'unknown');
+  else console.log(`[NIGHT] 选择结算完成: ${decision}`);
+}
+
+// WORLD_MESSAGE：澄对小茉莉说话的正式出口。phone=手机消息（Bark+messages+广播）；face=面对面白气泡（messages+广播，不震手机）。
+// 不影响 WORLD_CHOICE/NIGHT_CHOICE 结算；没标签就什么都不做。处理异常不连累主流程。
+async function processWorldMessageTags(clean, thinking, turn, statusForLocation = null, wt = realWorldTime()) {
+  try {
+    const chengLoc = statusForLocation?.location || turn.worldEvent?.location || turn.nightRow?.cheng_location_snapshot || '';
+    const userLoc = turn.userStatus?.location || turn.nightRow?.user_location_snapshot || '';
+    const wmRe = /\[WORLD_MESSAGE:(phone|face)\]([\s\S]*?)\[\/WORLD_MESSAGE\]/gi;
+    let wm;
+    while ((wm = wmRe.exec(clean || '')) !== null) {
+      const wmType = wm[1].toLowerCase();
+      const wmContent = (wm[2] || '').trim();
+      if (!wmContent) continue;
+      const canFace = wmType === 'face' && canFaceToFace(chengLoc, userLoc);
+
+      if (canFace) {
+        try {
+          await supabase.from('daily_timeline_cheng').insert({
+            world_time: wt, location: chengLoc,
+            action: '澄对小茉莉说话',
+            detail: { message: wmContent, message_type: 'face' },
+            source: 'claude',
+          });
+          await sendWorldFaceMessage(wmContent, { thinking });
+          console.log(`[WORLD] face 消息（同地点 ${chengLoc}）: ${wmContent.slice(0, 40)}`);
+        } catch (e) { console.warn('[WORLD] face 消息写入失败:', e.message); }
+      } else {
+        if (wmType === 'face') console.warn(`[WORLD] face 不满足同地点（澄:${chengLoc}/小茉莉:${userLoc}），降级 phone`);
+        const barkOk = turn.worldForce || (Date.now() - lastWorldPhoneAt >= WORLD_PHONE_RATE_MS);
+        await sendWorldPhoneMessage(wmContent, { bark: barkOk, thinking });
+        if (barkOk) lastWorldPhoneAt = Date.now();
+      }
+    }
+  } catch (e) { console.warn('[WORLD] WORLD_MESSAGE 处理异常（不连累主流程）:', e.message); }
+}
+
+// 世界唤醒面对面消息：写进聊天 Web 的普通白气泡，不加手机前缀、不推 Bark。
+async function sendWorldFaceMessage(content, { thinking = null } = {}) {
+  if (!lastActiveConvId) {
+    console.warn('[WORLD] 无 lastActiveConvId，face 未存聊天');
+    return;
+  }
+  try {
+    const { data: row } = await supabase.from('messages').insert({
+      conversation_id: lastActiveConvId,
+      role: 'assistant',
+      content,
+      thinking: thinking || null,
+      event: 'world_face',
+    }).select('id, created_at').single();
+    broadcast({
+      type: 'bark_msg',
+      conversation_id: lastActiveConvId,
+      message: {
+        id: row?.id || 'wf-' + Date.now(),
+        role: 'assistant',
+        content,
+        thinking: thinking || null,
+        event: 'world_face',
+        created_at: row?.created_at || new Date().toISOString(),
+      },
+    });
+    console.log(`[WORLD] face 消息已发: ${content.slice(0, 40)}`);
+  } catch (e) { console.warn('[WORLD] face 消息存/广播失败:', e.message); }
 }
 
 // 世界唤醒手机消息：复用 bark 主动消息管线。消息总是存 messages(event=world_message)+广播聊天 Web；
@@ -2177,8 +2452,8 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
         console.log(`💾 记忆: [${m.layer}] ${m.content.slice(0, 50)}`);
       } catch (e) { console.error('写记忆失败:', e); }
     }
-    // [BARK:...] 入库；barkFire/diceFire/worldWake 轮内禁止再排程，避免循环/串台
-    if (!turn.barkFire && !turn.diceFire && !turn.worldWake) {
+    // [BARK:...] 入库；barkFire/diceFire/worldWake/nightWake 轮内禁止再排程，避免循环/串台
+    if (!turn.barkFire && !turn.diceFire && !turn.worldWake && !turn.nightWake) {
       const barkTags = parseBarkTags(text);
       if (barkTags.length) {
         try { await saveBarkSchedules(barkTags, cc.sessionId); }
@@ -2255,6 +2530,14 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
     return;
   }
 
+  if (turn.nightWake) {
+    await handleNightWakeTurnDone(turn, clean, thinking);
+    maybeFireSummary();
+    flushOrGrace();
+    tryFireBark();
+    return;
+  }
+
   // 聊天轮也支持 [TODO_DONE]（她在聊天里说做完了某条待办，照样能划掉）：先标记完成，再从展示文本剥掉标签，
   // 免得标签漏进对话框给小茉莉看到。[OPEN_TODOS] 是世界专属、聊天不做，但若误出现也剥掉防泄漏。silent 轮(上下文加载)不处理。
   if (!turn.silent) {
@@ -2270,6 +2553,33 @@ cc.on('turn_done', async ({ text, thinking, usage, usageCalls, contextTokens, sy
       .replace(/\[SLEEP(?:_BOTH)?:[^\]]*\]/gi, '')                // 14A：睡眠标签写完剥掉，别漏给小茉莉看
       .replace(/\[WAKE\]/gi, '')
       .trim();
+  }
+
+  // 脉：澄回复亲密扫描（双向确认 + 自动推进）
+  if (!turn.silent && clean) {
+    try {
+      const { pulseIntimateAssistantScan } = await import('./pulse-linkage.js');
+      let energy = 50;
+      try {
+        const { data: cs } = await supabase.from('character_status_cheng')
+          .select('energy').eq('name', '澄').limit(1);
+        energy = cs?.[0]?.energy ?? 50;
+      } catch {}
+      const intimateResult = await pulseIntimateAssistantScan(clean, energy);
+      if (intimateResult.entered) console.log('[PULSE] 亲密模式自动进入');
+      if (intimateResult.advanced) console.log('[PULSE] 亲密推进:', JSON.stringify(intimateResult.advanceResult));
+      if (intimateResult.exitResult) {
+        const drain = intimateResult.exitResult.energyDrain || 0;
+        try {
+          const { data: cs } = await supabase.from('character_status_cheng')
+            .select('energy').eq('name', '澄').limit(1);
+          const cur = cs?.[0]?.energy ?? 50;
+          await supabase.from('character_status_cheng')
+            .update({ energy: Math.max(0, cur - drain) }).eq('name', '澄');
+          console.log('[PULSE] 亲密结束, energy -' + drain);
+        } catch (e) { console.error('[PULSE] energy drain failed:', e.message); }
+      }
+    } catch (e) { console.error('[PULSE] intimate scan failed:', e.message); }
   }
 
   // 普通聊天回复的"当前互动通道"：澄和小茉莉同地点=face（普通气泡），异地=phone（手机气泡）。
@@ -2642,13 +2952,23 @@ const CC_JSONL_DIR = '/home/claude-user/.claude/projects/-home-claude-user-chat-
 
 // forge 之前用 CC 静默轮生成"被截掉部分"的总结。CC 自己看得到完整上下文，
 // 让它自判要保留什么。silent:true 让 main turn_done 不持久化到 messages 表。
-async function generateForgeSummary({ summaryLength }) {
+async function generateForgeSummary({ summaryLength } = {}) {
   if (activeTurn) throw new Error('CC 正在回复，请等它说完再切换模型');
   if (!cc.isRunning()) throw new Error('CC 进程未运行');
-  const target = Math.max(200, Math.min(2000, parseInt(summaryLength) || 500));
+  // 摘要长度区间来自 config.json（前端「摘要长度」改的就是它）；旧的单值 summaryLength 作兜底。
+  let lo = 1000, hi = 1100;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(FORGE_CONFIG_PATH, 'utf-8'));
+    if (Number.isFinite(Number(cfg.summary_min))) lo = Math.round(Number(cfg.summary_min));
+    if (Number.isFinite(Number(cfg.summary_max))) hi = Math.round(Number(cfg.summary_max));
+  } catch {}
+  if (lo > hi) [lo, hi] = [hi, lo];
+  if (summaryLength && (!lo || !hi)) { lo = hi = Math.max(200, Math.min(2000, parseInt(summaryLength) || 500)); }
+  lo = Math.max(100, Math.min(5000, lo));
+  hi = Math.max(lo, Math.min(5000, hi));
   const prompt = `【系统任务·forge 总结】\n` +
     `我即将对当前 session 做 forge：截掉最早的对话部分，只保留最近的 retain_tokens。\n` +
-    `请用约 ${target} 字写一段中文总结，概括将被截掉的早期部分：\n` +
+    `请用 ${lo}–${hi} 字之间写一段中文总结，概括将被截掉的早期部分：\n` +
     `- 我们聊过的关键内容 / 话题脉络\n` +
     `- 重要决定、承诺、约定\n` +
     `- 情感状态变化的节点\n` +
@@ -3454,6 +3774,8 @@ app.get('/api/forge/config', (req, res) => {
       retain_tokens: cfg.retain_tokens,
       trigger_threshold: cfg.trigger_threshold,
       thinking_keep_ratio: cfg.thinking_keep_ratio ?? 0.5,
+      summary_min: cfg.summary_min ?? 1000,
+      summary_max: cfg.summary_max ?? 1100,
     });
   } catch (e) {
     res.status(500).json({ error: 'read forge config: ' + e.message });
@@ -3481,6 +3803,21 @@ app.put('/api/forge/config', (req, res) => {
       }
       patch.thinking_keep_ratio = Math.round(v * 100) / 100;
     }
+    // 摘要长度区间 summary_min / summary_max（手动 forge 生成总结的目标字数）
+    for (const k of ['summary_min', 'summary_max']) {
+      if (req.body && Object.prototype.hasOwnProperty.call(req.body, k)) {
+        const v = Number(req.body[k]);
+        if (!Number.isFinite(v) || v < 100 || v > 5000) {
+          return res.status(400).json({ error: `${k} 必须在 100~5000 之间` });
+        }
+        patch[k] = Math.round(v);
+      }
+    }
+    const sMin = patch.summary_min ?? cfg.summary_min ?? 1000;
+    const sMax = patch.summary_max ?? cfg.summary_max ?? 1100;
+    if (sMin > sMax) {
+      return res.status(400).json({ error: '摘要长度下限不能大于上限' });
+    }
     if (!Object.keys(patch).length) {
       return res.status(400).json({ error: '没有可更新字段' });
     }
@@ -3491,6 +3828,8 @@ app.put('/api/forge/config', (req, res) => {
       retain_tokens: next.retain_tokens,
       trigger_threshold: next.trigger_threshold,
       thinking_keep_ratio: next.thinking_keep_ratio ?? 0.5,
+      summary_min: next.summary_min ?? 1000,
+      summary_max: next.summary_max ?? 1100,
     });
   } catch (e) {
     res.status(500).json({ error: 'write forge config: ' + e.message });
@@ -3530,15 +3869,15 @@ app.put('/api/dice/config', (req, res) => {
     }
     if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'dice_interval_min')) {
       const v = Number(req.body.dice_interval_min);
-      if (!Number.isFinite(v) || v < 5 || v > 120) {
-        return res.status(400).json({ error: 'dice_interval_min 必须在 5~120 之间' });
+      if (!Number.isFinite(v) || v < 5 || v > 1440) {
+        return res.status(400).json({ error: 'dice_interval_min 必须在 5~1440 之间' });
       }
       patch.dice_interval_min = Math.round(v);
     }
     if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'dice_interval_max')) {
       const v = Number(req.body.dice_interval_max);
-      if (!Number.isFinite(v) || v < 5 || v > 120) {
-        return res.status(400).json({ error: 'dice_interval_max 必须在 5~120 之间' });
+      if (!Number.isFinite(v) || v < 5 || v > 1440) {
+        return res.status(400).json({ error: 'dice_interval_max 必须在 5~1440 之间' });
       }
       patch.dice_interval_max = Math.round(v);
     }
@@ -3722,6 +4061,38 @@ app.post('/api/world/dream/dev/recall', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── 14B-2 夜间醒来/晨间身体反应开发测试 ───────────────────
+app.get('/api/world/night/state', async (req, res) => {
+  try { res.json({ ok: true, ...(await getNightState()) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/night/dev/trigger', async (req, res) => {
+  try {
+    const type = String(req.body?.type || 'morning_erection');
+    const dreamType = req.body?.dream_type ? String(req.body.dream_type) : null;
+    if (!['dream_wake', 'morning_erection'].includes(type)) return res.status(400).json({ error: 'type 须为 dream_wake / morning_erection' });
+    const r = await devTriggerNightInterruption(type, dreamType);
+    if (!r.ok) return res.status(409).json(r);
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/night/dev/choice', async (req, res) => {
+  try {
+    const decision = String(req.body?.decision || '');
+    if (!['cuddle_sleep', 'self_relief', 'direct'].includes(decision)) return res.status(400).json({ error: 'decision 须为 cuddle_sleep / self_relief / direct' });
+    const r = await resolveNightChoice(decision);
+    if (!r.ok) return res.status(409).json(r);
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/world/night/dev/advance-direct', async (req, res) => {
+  try {
+    const r = await advanceNightDirectRound(req.body?.night_interruption_id);
+    if (!r.ok) return res.status(409).json(r);
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // 读当前世界配置
 app.get('/api/world/config', (req, res) => {
   res.json(readWorldConfig());
@@ -3901,8 +4272,19 @@ app.delete('/api/world/narration/action/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+function normalizeNarrationPhrasePayload(body = {}) {
+  const out = { ...body };
+  if (out.stat === 'body_temp') {
+    for (const key of ['min_value', 'max_value']) {
+      if (out[key] == null || out[key] === '') continue;
+      const v = Number(out[key]);
+      if (Number.isFinite(v)) out[key] = v > 100 ? Math.round(v) : Math.round(v * 10);
+    }
+  }
+  return out;
+}
 app.post('/api/world/narration/phrase', async (req, res) => {
-  const { stat, min_value, max_value, phrase, tone, enabled } = req.body || {};
+  const { stat, min_value, max_value, phrase, tone, enabled } = normalizeNarrationPhrasePayload(req.body || {});
   if (!stat || phrase == null) return res.status(400).json({ error: '缺少 stat/phrase' });
   try {
     const { data, error } = await supabase.from('world_self_narration_phrases')
@@ -3913,26 +4295,39 @@ app.post('/api/world/narration/phrase', async (req, res) => {
 });
 app.patch('/api/world/narration/phrase/:id', async (req, res) => {
   try {
+    const patch = normalizeNarrationPhrasePayload(req.body || {});
     const { data, error } = await supabase.from('world_self_narration_phrases')
-      .update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+      .update({ ...patch, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
     if (error) throw error;
     res.json({ ok: true, phrase: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+app.delete('/api/world/narration/phrase/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('world_self_narration_phrases').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+function normalizeNarrationTemplateKind(kind) {
+  return ['normal', 'action', 'night_wake'].includes(kind) ? kind : 'normal';
+}
 app.post('/api/world/narration/template', async (req, res) => {
   const { template, enabled, kind } = req.body || {};
   if (!template) return res.status(400).json({ error: '缺少 template' });
   try {
     const { data, error } = await supabase.from('world_self_narration_templates')
-      .insert({ template, enabled: enabled !== false, kind: kind === 'action' ? 'action' : 'normal' }).select().single();
+      .insert({ template, enabled: enabled !== false, kind: normalizeNarrationTemplateKind(kind) }).select().single();
     if (error) throw error;
     res.json({ ok: true, template: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.patch('/api/world/narration/template/:id', async (req, res) => {
   try {
+    const patch = { ...req.body };
+    if (patch.kind != null) patch.kind = normalizeNarrationTemplateKind(patch.kind);
     const { data, error } = await supabase.from('world_self_narration_templates')
-      .update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+      .update({ ...patch, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
     if (error) throw error;
     res.json({ ok: true, template: data });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -3974,7 +4369,7 @@ app.delete('/api/world/wake-reasons/:id', async (req, res) => {
 });
 
 // 12A：预览当前澄自述。复用真实生成函数 generateChengSelfNarration（预览=实际，不另写一套）。
-// 可选 query energy/satiety/cleanliness/health 临时覆盖（只预览，不写库）。规则实时读表，改完即生效。
+// 可选 query 覆盖身体/Pulse 生理值（只预览，不写库）。规则实时读表，改完即生效。
 app.get('/api/world/self-narration/preview', async (req, res) => {
   try {
     const [cs, env, rules] = await Promise.all([
@@ -3986,10 +4381,112 @@ app.get('/api/world/self-narration/preview', async (req, res) => {
     for (const k of ['energy', 'satiety', 'cleanliness', 'health']) {
       if (req.query[k] != null && req.query[k] !== '') status[k] = Number(req.query[k]);
     }
+    let physiology = null;
+    try {
+      const { getPhysiologySnapshot } = await import('./pulse-linkage.js');
+      const snap = getPhysiologySnapshot();
+      physiology = { ...snap, senses: { ...(snap.senses || {}) } };
+    } catch {}
+    if (physiology) {
+      const qn = (k) => (req.query[k] != null && req.query[k] !== '' ? Number(req.query[k]) : null);
+      const hr = qn('heart_rate');
+      if (Number.isFinite(hr)) physiology.heartRate = hr;
+      const temp = qn('body_temp');
+      if (Number.isFinite(temp)) physiology.bodyTemp = temp > 100 ? temp / 10 : temp;
+      const breath = qn('breath');
+      if (Number.isFinite(breath)) physiology.breathRate = breath;
+      for (const [qk, sk] of [['sense_touch', 'touch'], ['sense_smell', 'smell'], ['sense_taste', 'taste'], ['sense_sound', 'sound']]) {
+        const v = qn(qk);
+        if (Number.isFinite(v)) physiology.senses[sk] = Math.max(0, Math.min(1, v > 1 ? v / 100 : v));
+      }
+    }
     const e = (env.data && env.data[0]) || {};
-    const narration = generateChengSelfNarration(status, { date: e.date, weather: formatWeather(e) }, rules);
+    const narration = generateChengSelfNarration(status, { date: e.date, weather: formatWeather(e) }, rules, physiology);
     res.json({ narration });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ⑨ 脉环境系统：查询进化/圣地状态 + 生理快照
+app.get('/api/pulse/env', async (req, res) => {
+  try {
+    const { listEnvState } = await import('./pulse-linkage.js');
+    res.json(listEnvState());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/pulse/snapshot', async (req, res) => {
+  try {
+    const { getPhysiologySnapshot } = await import('./pulse-linkage.js');
+    const snap = getPhysiologySnapshot();
+    res.json(snap || { error: 'not_initialized' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ⑩ 亲密系统 CRUD + 控制 API
+app.post('/api/pulse/intimate/enter', async (req, res) => {
+  try { const { enterIntimate } = await import('./pulse-linkage.js'); res.json(enterIntimate(req.body?.energy)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/pulse/intimate/advance', async (req, res) => {
+  try { const { advanceIntimate } = await import('./pulse-linkage.js'); res.json(await advanceIntimate(req.body?.stim)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/pulse/intimate/exit', async (req, res) => {
+  try {
+    const { exitIntimate, flushScheduledPulsePersist } = await import('./pulse-linkage.js');
+    const result = exitIntimate();
+    await flushScheduledPulsePersist();
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/pulse/intimate/state', async (req, res) => {
+  try { const { getIntimateState } = await import('./pulse-linkage.js'); res.json(getIntimateState()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/pulse/intimate/overrides', async (req, res) => {
+  try { const { getIntimateOverrides } = await import('./pulse-linkage.js'); res.json(getIntimateOverrides() || { active: false }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/pulse/intimate/toys', async (req, res) => {
+  try {
+    const { setActiveToys, flushScheduledPulsePersist } = await import('./pulse-linkage.js');
+    await setActiveToys(req.body?.toys || []);
+    await flushScheduledPulsePersist();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/pulse/intimate/position', async (req, res) => {
+  try {
+    const { setActivePosition, flushScheduledPulsePersist } = await import('./pulse-linkage.js');
+    await setActivePosition(req.body?.position);
+    await flushScheduledPulsePersist();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// CRUD: 道具
+app.get('/api/pulse/toys', async (req, res) => {
+  try { const { listToys } = await import('./pulse-linkage.js'); res.json(await listToys()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/pulse/toys', async (req, res) => {
+  try { const { upsertToy } = await import('./pulse-linkage.js'); res.json(await upsertToy(req.body)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/pulse/toys/:key', async (req, res) => {
+  try { const { deleteToy } = await import('./pulse-linkage.js'); await deleteToy(req.params.key); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// CRUD: 体位
+app.get('/api/pulse/positions', async (req, res) => {
+  try { const { listPositions } = await import('./pulse-linkage.js'); res.json(await listPositions()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/pulse/positions', async (req, res) => {
+  try { const { upsertPosition } = await import('./pulse-linkage.js'); res.json(await upsertPosition(req.body)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/pulse/positions/:key', async (req, res) => {
+  try { const { deletePosition } = await import('./pulse-linkage.js'); await deletePosition(req.params.key); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// CRUD: 组合技
+app.get('/api/pulse/combos', async (req, res) => {
+  try { const { listCombos } = await import('./pulse-linkage.js'); res.json(await listCombos()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/pulse/combos', async (req, res) => {
+  try { const { upsertCombo } = await import('./pulse-linkage.js'); res.json(await upsertCombo(req.body)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/pulse/combos/:toyKey/:posKey', async (req, res) => {
+  try { const { deleteCombo } = await import('./pulse-linkage.js'); await deleteCombo(req.params.toyKey, req.params.posKey); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 12B-1：念头池（shadow mode，只读/收集/dismiss；【不喂 Claude】）。
@@ -4804,6 +5301,29 @@ async function flushPendingToCC(ws, items) {
     // [时间标记] 前缀已停用（2026-06-12 用户要求）：<此刻> 每条都带现算时间，这行和它重复。
     // 想恢复（或改成"距澄最后回复"计时）→ 换回 maybeTimePrefix(combinedText, conversation_id)。
     const prefixed = combinedText;
+    // 脉：用户消息触发情绪检测 + 五感 + 生理重算（只扫用户消息，澄回复不参与）
+    try {
+      const { pulseOnChat } = await import('./pulse-linkage.js');
+      let pulseActivity = '', pulseWeather = '', pulseTemp = null;
+      try {
+        const { data: cs } = await supabase.from('character_status_cheng')
+          .select('activity').eq('name', '澄').limit(1);
+        pulseActivity = cs?.[0]?.activity || '';
+        const { data: env } = await supabase.from('world_environment_cheng')
+          .select('weather_text, temperature').eq('name', 'default').limit(1);
+        pulseWeather = env?.[0]?.weather_text || '';
+        pulseTemp = env?.[0]?.temperature;
+      } catch {}
+      await pulseOnChat(combinedText, null, pulseActivity, pulseWeather, pulseTemp);
+      // 亲密双向扫描：用户侧
+      const { pulseIntimateUserScan } = await import('./pulse-linkage.js');
+      pulseIntimateUserScan(combinedText);
+    } catch (e) { console.error('[PULSE] chat pulse failed:', e.message); }
+
+    // 14B-2：如果夜间短流程在等小茉莉回应，用户一发消息就切回正常亲密/聊天链。
+    try { await nightOnUserReply(combinedText); }
+    catch (e) { console.warn('[NIGHT] 用户回应扫描失败:', e.message); }
+
     // 浮现：tmux 交互模式折进消息（长驻会话不重读 CLAUDE.md）；stream-json 仍写 CLAUDE.md。
     let textForCC = prefixed;
     if (USE_TMUX) {
@@ -4843,6 +5363,8 @@ server.listen(PORT, '127.0.0.1', () => {
   diceDaemon.start();
   worldTickDaemon.start();
   pendingWakeDaemon.start();
+  // 脉：启动时恢复内存生理状态
+  import('./pulse-linkage.js').then(m => m.initPulseState()).catch(e => console.error('[PULSE] init failed:', e.message));
   // 12B-1：念头池 collector 周期触发（每 15 分钟现实时间，独立于世界时钟；shadow mode 只收集不喂 Claude）。
   setInterval(() => { collectWorldThoughts(); }, 15 * 60 * 1000);
 });
@@ -4851,11 +5373,26 @@ server.listen(PORT, '127.0.0.1', () => {
 // stream-json 驱动没有 detach，退回 stop()（杀子进程，原行为）。需要彻底杀 CC 用 amnesia/restart 或手动 kill-session。
 // once + await：detach 是同步、stop 是异步（stream-json），等清理跑完再 exit；exiting 防重入。
 let _exiting = false;
+async function flushPulseBeforeExit() {
+  try {
+    const { flushScheduledPulsePersist } = await import('./pulse-linkage.js');
+    let timer = null;
+    await Promise.race([
+      flushScheduledPulsePersist({ forceHistory: true }),
+      new Promise(resolve => { timer = setTimeout(resolve, 3000); }),
+    ]);
+    if (timer) clearTimeout(timer);
+  } catch (e) {
+    console.warn('[PULSE] exit flush failed:', e.message);
+  }
+}
 const onExit = async () => {
   if (_exiting) return;
   _exiting = true;
-  try { await (cc.detach ? cc.detach() : cc.stop()); }
-  finally { process.exit(0); }
+  try {
+    await flushPulseBeforeExit();
+    await (cc.detach ? cc.detach() : cc.stop());
+  } finally { process.exit(0); }
 };
 process.once('SIGTERM', onExit);
 process.once('SIGINT', onExit);

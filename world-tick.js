@@ -5,6 +5,7 @@ import { supabase } from './memory.js';
 import { realWorldTime } from './world-narration.js';
 import { evaluateHealth } from './world-health.js';
 import { evaluateSleepTick, readSleepState, isChengSleeping, SLEEP_ENERGY_GAIN } from './world-sleep.js';
+import { decayNightArousal } from './world-night.js';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -147,9 +148,26 @@ async function _advanceOneTick() {
   try { await evaluateSleepTick(tickId); }
   catch (e) { console.error('[WORLD] 睡眠结算异常:', e.message); }
 
+  // 14B-2：夜间身体反应余温衰减。直接做短流程进行中由 pending 自己推进，这里只管普通回落。
+  try { await decayNightArousal({ sleeping }); }
+  catch (e) { console.error('[WORLD] 夜间身体状态衰减异常:', e.message); }
+
   // 13B：健康联动结算（用衰减后的 updated 身体值；幂等靠 tickId）。失败不连累 tick 主流程。
   try { await evaluateHealth(updated, tickId); }
   catch (e) { console.error('[WORLD] 健康联动异常:', e.message); }
+
+  // 脉：生理系统 tick 更新（心率/体温/呼吸/五感衰减/联动）。失败不连累 tick 主流程。
+  try {
+    const { pulseTickUpdate } = await import('./pulse-linkage.js');
+    let weatherText = '', temperature = null;
+    try {
+      const { data: envData } = await supabase
+        .from('world_environment_cheng')
+        .select('weather_text, temperature').eq('name', 'default').limit(1);
+      if (envData?.[0]) { weatherText = envData[0].weather_text; temperature = envData[0].temperature; }
+    } catch {}
+    await pulseTickUpdate(tickId, updated.world_time, updated.activity, weatherText, temperature, sleeping, updated.location);
+  } catch (e) { console.error('[WORLD] 脉 tick 异常:', e.message); }
 
   return updated;
 }
